@@ -8,17 +8,23 @@ function loadRuntimeConfig() {
     scoringModel: String(settings.SCORING_MODEL || 'gemini-2.5-flash'),
     scoringParallelRequests: _normalizePositiveInteger(settings.SCORING_PARALLEL_REQUESTS || 3, 3, 20),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
-    promptVersion: 'v1',
+    promptVersion: 'v2',
     targetProfile: String(
       settings.TARGET_PROFILE ||
       _defaultTargetProfile()
     ),
     notifyEmail: String(settings.NOTIFY_EMAIL || '').trim(),
     forceRescore: String(settings.FORCE_RESCORE || 'FALSE').toUpperCase() === 'TRUE',
+    runIntervalHours: _normalizePositiveInteger(settings.RUN_INTERVAL_HOURS || 4, 4, 12),
+    quietStartHour: _parseHourSetting(settings.QUIET_START_HOUR, 19),
+    quietEndHour: _parseHourSetting(settings.QUIET_END_HOUR, 5),
     apifyPollIntervalMs: 5000,
     apifyRunWaitSeconds: 240,
+    executionSoftLimitMs: 330000,
+    executionYieldBufferMs: 45000,
+    executionDeadlineMs: Date.now() + 330000,
+    apifyToken: String(settings.APIFY_TOKEN || properties.getProperty('APIFY_TOKEN') || '').trim(),
     apifyTaskIds: _splitCsv(settings.APIFY_TASK_IDS || properties.getProperty('APIFY_TASK_IDS')),
-    apifyToken: properties.getProperty('APIFY_TOKEN'),
     vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
     geminiApiKey: properties.getProperty('GEMINI_API_KEY'),
@@ -27,8 +33,11 @@ function loadRuntimeConfig() {
 }
 
 function validateRuntimeConfig(config) {
-  if (!config.apifyToken) {
-    throw new Error('Missing APIFY_TOKEN in Script Properties.');
+  var options = arguments[1] || {};
+  var requireApify = options.requireApify !== false;
+
+  if (requireApify && !config.apifyToken) {
+    throw new Error('Missing APIFY_TOKEN in the Settings sheet or Script Properties.');
   }
 
   if (config.geminiApiRoute !== 'developer' && config.geminiApiRoute !== 'vertex') {
@@ -43,7 +52,7 @@ function validateRuntimeConfig(config) {
     throw new Error('VERTEX_PROJECT_ID is required in the Settings sheet for vertex route.');
   }
 
-  if ((!config.activeRunState || !config.activeRunState.sources || !config.activeRunState.sources.length) && !config.apifyTaskIds.length) {
+  if (requireApify && (!config.activeRunState || !config.activeRunState.sources || !config.activeRunState.sources.length) && !config.apifyTaskIds.length) {
     throw new Error('APIFY_TASK_IDS is required in the Settings sheet.');
   }
 }
@@ -59,9 +68,9 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
   var duplicateJobsCount = 0;
   var importFailedJobsCount = 0;
   var rowsToWriteWithoutScoring = [];
-  var handledCanonicalKeysMap = _buildLookup(activeRunState.handledCanonicalKeys || []);
+  var handledJobIdsMap = _buildLookup(activeRunState.handledJobIds || []);
   var handledThisExecution = [];
-  var newAJobCanonicalKeys = [];
+  var newTopPriorityJobIds = [];
   var maxJobsPerExecution = _getMaxJobsPerExecution(config);
   var scoreableJobsForThisExecution = [];
   var executionNewJobsCount = 0;
@@ -84,23 +93,23 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     }
   });
 
-  var canonicalClusters = _clusterJobsByCanonicalRole(normalizedJobs);
-  duplicateJobsCount = normalizedJobs.length - canonicalClusters.length;
+  var uniqueJobs = _dedupeJobsByJobId(normalizedJobs);
+  duplicateJobsCount = normalizedJobs.length - uniqueJobs.length;
   activeRunState.rawScrapedCount = activeRunState.rawScrapedCount || sourceItems.length;
-  activeRunState.totalJobsCount = activeRunState.totalJobsCount || canonicalClusters.length;
+  activeRunState.totalJobsCount = activeRunState.totalJobsCount || uniqueJobs.length;
 
-  canonicalClusters.forEach(function(cluster) {
-    if (handledCanonicalKeysMap[cluster.canonicalRoleKey]) {
+  uniqueJobs.forEach(function(normalizedJob) {
+    if (handledJobIdsMap[normalizedJob.jobId]) {
       return;
     }
 
-    var existing = _findExistingCanonicalRecord(cluster, existingIndex);
-    var job = _buildCanonicalCandidateJob(cluster, existing);
+    var existing = existingIndex.byJobId[normalizedJob.jobId];
+    var job = _buildCandidateJob(normalizedJob, existing);
 
     if (existing && !config.forceRescore) {
       rowsToWriteWithoutScoring.push(job);
-      handledThisExecution.push(cluster.canonicalRoleKey);
-      handledCanonicalKeysMap[cluster.canonicalRoleKey] = true;
+      handledThisExecution.push(job.jobId);
+      handledJobIdsMap[job.jobId] = true;
       return;
     }
 
@@ -122,40 +131,40 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
 
   _emitProgress(progressCallback, {
     status: 'Scoring jobs',
-    processed: (activeRunState.handledCanonicalKeys.length + rowsToWriteWithoutScoring.length) + ' / ' + activeRunState.totalJobsCount
+    processed: (activeRunState.handledJobIds.length + rowsToWriteWithoutScoring.length) + ' / ' + activeRunState.totalJobsCount
   });
 
   if (scoreableJobsForThisExecution.length) {
-    var scoringResult = _scoreJobsInBatches(scoreableJobsForThisExecution, config, progressCallback, activeRunState.totalJobsCount, activeRunState.handledCanonicalKeys.length + rowsToWriteWithoutScoring.length);
+    var scoringResult = _scoreJobsInBatches(scoreableJobsForThisExecution, config, progressCallback, activeRunState.totalJobsCount, activeRunState.handledJobIds.length + rowsToWriteWithoutScoring.length);
     rows = rows.concat(scoringResult.rows);
     executionScoredJobsCount += scoringResult.scoredJobsCount;
     executionFailedJobsCount += scoringResult.failedJobsCount;
     errors = errors.concat(scoringResult.errors);
     handledThisExecution = handledThisExecution
-      .concat(scoringResult.rows.map(function(job) { return job.canonicalRoleKey; }))
-      .concat(scoringResult.failedCanonicalKeys || []);
+      .concat(scoringResult.rows.map(function(job) { return job.jobId; }))
+      .concat(scoringResult.failedJobIds || []);
     executionNewJobsCount += scoringResult.rows.filter(function(job) {
       return !job.existingRowNumber;
     }).length;
     executionAJobsCount += scoringResult.rows.filter(function(job) {
-      return !job.existingRowNumber && job.priority === 'A';
+      return !job.existingRowNumber && _isTopPriority(job.priority);
     }).length;
-    newAJobCanonicalKeys = scoringResult.rows.filter(function(job) {
-      return !job.existingRowNumber && job.priority === 'A';
+    newTopPriorityJobIds = scoringResult.rows.filter(function(job) {
+      return !job.existingRowNumber && _isTopPriority(job.priority);
     }).map(function(job) {
-      return job.canonicalRoleKey;
+      return job.jobId;
     });
   }
 
-  activeRunState.handledCanonicalKeys = _appendUniqueStrings(activeRunState.handledCanonicalKeys || [], handledThisExecution);
-  activeRunState.newAJobCanonicalKeys = _appendUniqueStrings(activeRunState.newAJobCanonicalKeys || [], newAJobCanonicalKeys);
+  activeRunState.handledJobIds = _appendUniqueStrings(activeRunState.handledJobIds || [], handledThisExecution);
+  activeRunState.newTopPriorityJobIds = _appendUniqueStrings(activeRunState.newTopPriorityJobIds || [], newTopPriorityJobIds);
   activeRunState.newJobsCount = Number(activeRunState.newJobsCount || 0) + executionNewJobsCount;
   activeRunState.aJobsCount = Number(activeRunState.aJobsCount || 0) + executionAJobsCount;
   activeRunState.scoredJobsCount = Number(activeRunState.scoredJobsCount || 0) + executionScoredJobsCount;
   activeRunState.failedJobsCount = Number(activeRunState.failedJobsCount || 0) + executionFailedJobsCount + importFailedJobsCount;
   activeRunState.importFailedJobsCount = Number(activeRunState.importFailedJobsCount || 0) + importFailedJobsCount;
   activeRunState.errors = _appendErrors(activeRunState.errors || [], errors);
-  activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledCanonicalKeys.length);
+  activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
   activeRunState.updatedAt = new Date().toISOString();
 
   return {
@@ -174,20 +183,155 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     errors: activeRunState.errors || [],
     hasMore: activeRunState.processedCount < activeRunState.totalJobsCount,
     activeRunState: activeRunState,
-    newAJobCanonicalKeys: activeRunState.newAJobCanonicalKeys || []
+    newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
   };
 }
 
-function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, initialProcessedCount) {
+function reevaluateExistingJobs(config, existingIndex, progressCallback) {
+  var activeRunState = config.activeRunState || {};
+  var targetJobIds = activeRunState.targetJobIds || [];
+  var handledJobIdsMap = _buildLookup(activeRunState.handledJobIds || []);
+  var rows = [];
+  var errors = [];
+  var jobsToScore = [];
+  var handledThisExecution = [];
+  var skippedThisExecution = [];
+  var newTopPriorityJobIds = [];
+  var executionTopPriorityCount = 0;
+  var executionScoredJobsCount = 0;
+  var executionFailedJobsCount = 0;
+  var maxJobsPerExecution = _getMaxJobsPerExecution(config);
+
+  activeRunState.totalJobsCount = Number(activeRunState.totalJobsCount || targetJobIds.length || 0);
+
+  _emitProgress(progressCallback, {
+    status: 'Reevaluating jobs',
+    processed: '',
+    uniqueRolesCount: activeRunState.totalJobsCount,
+    toScoreCount: activeRunState.totalScoreableCount || 0
+  });
+
+  targetJobIds.forEach(function(jobId) {
+    if (handledJobIdsMap[jobId]) {
+      return;
+    }
+
+    var existing = existingIndex.byJobId[jobId];
+    var fingerprint = '';
+    var reevaluateJob;
+
+    if (!existing) {
+      skippedThisExecution.push(jobId);
+      handledJobIdsMap[jobId] = true;
+      return;
+    }
+
+    if (!_stringifyField(existing.jobDescription)) {
+      skippedThisExecution.push(jobId);
+      handledJobIdsMap[jobId] = true;
+      return;
+    }
+
+    fingerprint = _buildScoringFingerprint(existing, config);
+    if (_stringifyField(existing.scoringFingerprint) === fingerprint && _hasScoringPayload(existing)) {
+      skippedThisExecution.push(jobId);
+      handledJobIdsMap[jobId] = true;
+      return;
+    }
+
+    reevaluateJob = _refreshStoredJobForReevaluation(existing);
+    reevaluateJob.existingRowNumber = existing.rowNumber;
+    reevaluateJob.scoringFingerprint = fingerprint;
+    jobsToScore.push(reevaluateJob);
+  });
+
+  if (!activeRunState.totalScoreableCount && activeRunState.totalScoreableCount !== 0) {
+    activeRunState.totalScoreableCount = jobsToScore.length;
+  }
+
+  _emitProgress(progressCallback, {
+    status: 'Reevaluating jobs',
+    processed: (activeRunState.handledJobIds.length + skippedThisExecution.length) + ' / ' + activeRunState.totalJobsCount,
+    uniqueRolesCount: activeRunState.totalJobsCount,
+    toScoreCount: activeRunState.totalScoreableCount
+  });
+
+  if (jobsToScore.length) {
+    var scoringResult = _scoreJobsInBatches(
+      jobsToScore.slice(0, maxJobsPerExecution),
+      config,
+      progressCallback,
+      activeRunState.totalJobsCount,
+      activeRunState.handledJobIds.length + skippedThisExecution.length,
+      'Reevaluating jobs'
+    );
+
+    rows = rows.concat(scoringResult.rows);
+    executionScoredJobsCount += scoringResult.scoredJobsCount;
+    executionFailedJobsCount += scoringResult.failedJobsCount;
+    errors = errors.concat(scoringResult.errors);
+    handledThisExecution = handledThisExecution
+      .concat(scoringResult.rows.map(function(job) { return job.jobId; }))
+      .concat(scoringResult.failedJobIds || []);
+    executionTopPriorityCount += scoringResult.rows.filter(function(job) {
+      return _isTopPriority(job.priority);
+    }).length;
+    newTopPriorityJobIds = scoringResult.rows.filter(function(job) {
+      return _isTopPriority(job.priority);
+    }).map(function(job) {
+      return job.jobId;
+    });
+  }
+
+  activeRunState.handledJobIds = _appendUniqueStrings(
+    activeRunState.handledJobIds || [],
+    skippedThisExecution.concat(handledThisExecution)
+  );
+  activeRunState.newTopPriorityJobIds = _appendUniqueStrings(activeRunState.newTopPriorityJobIds || [], newTopPriorityJobIds);
+  activeRunState.aJobsCount = Number(activeRunState.aJobsCount || 0) + executionTopPriorityCount;
+  activeRunState.scoredJobsCount = Number(activeRunState.scoredJobsCount || 0) + executionScoredJobsCount;
+  activeRunState.failedJobsCount = Number(activeRunState.failedJobsCount || 0) + executionFailedJobsCount;
+  activeRunState.errors = _appendErrors(activeRunState.errors || [], errors);
+  activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
+  activeRunState.updatedAt = new Date().toISOString();
+
+  return {
+    rows: rows,
+    newJobsCount: '',
+    aJobsCount: activeRunState.aJobsCount,
+    duplicateJobsCount: 0,
+    scoredJobsCount: activeRunState.scoredJobsCount,
+    failedJobsCount: activeRunState.failedJobsCount,
+    importFailedJobsCount: 0,
+    processedCount: activeRunState.processedCount,
+    rawScrapedCount: '',
+    uniqueRolesCount: activeRunState.totalJobsCount,
+    totalScoreableCount: activeRunState.totalScoreableCount,
+    totalJobsCount: activeRunState.totalJobsCount,
+    errors: activeRunState.errors || [],
+    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount,
+    activeRunState: activeRunState,
+    newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
+  };
+}
+
+function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, initialProcessedCount, statusLabel) {
   var rows = [];
   var errors = [];
   var scoredJobsCount = 0;
   var failedJobsCount = 0;
   var processedCount = 0;
-  var failedCanonicalKeys = [];
+  var failedJobIds = [];
   var batchSize = config.scoringParallelRequests;
+  var resolvedStatusLabel = statusLabel || 'Scoring jobs';
+  var hitExecutionBudget = false;
 
   for (var start = 0; start < jobs.length; start += batchSize) {
+    if (start > 0 && _shouldYieldExecution(config)) {
+      hitExecutionBudget = true;
+      break;
+    }
+
     var batch = jobs.slice(start, start + batchSize);
     var requests = batch.map(function(job) {
       return _buildScoreRequest(job, config);
@@ -200,16 +344,20 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
         job.score = scoreResult.score;
         job.priority = scoreResult.priority;
         job.usVisaSponsorshipPotential = scoreResult.usVisaSponsorshipPotential;
+        job.usVisaReason = scoreResult.usVisaReason;
         job.summary = scoreResult.summary;
         job.why = scoreResult.why;
         job.angle = scoreResult.angle;
+        job.titleLevel = scoreResult.titleLevel;
+        job.jdImpliedLevel = scoreResult.jdImpliedLevel;
         job.scoredAt = new Date();
+        job.scoringFingerprint = job.scoringFingerprint || _buildScoringFingerprint(job, config);
 
         rows.push(job);
         scoredJobsCount += 1;
       } catch (scoreError) {
         failedJobsCount += 1;
-        failedCanonicalKeys.push(job.canonicalRoleKey);
+        failedJobIds.push(job.jobId);
         errors.push(_truncate('AI scoring failed for ' + (job.title || job.jobId) + ': ' + scoreError.message, 300));
         Logger.log(scoreError);
       }
@@ -217,9 +365,14 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
 
     processedCount += batch.length;
     _emitProgress(progressCallback, {
-      status: 'Scoring jobs',
+      status: resolvedStatusLabel,
       processed: (initialProcessedCount + processedCount) + ' / ' + totalJobsCount
     });
+
+    if (_shouldYieldExecution(config) && (start + batch.length) < jobs.length) {
+      hitExecutionBudget = true;
+      break;
+    }
   }
 
   return {
@@ -228,7 +381,8 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
     failedJobsCount: failedJobsCount,
     processedCount: processedCount,
     errors: errors,
-    failedCanonicalKeys: failedCanonicalKeys
+    failedJobIds: failedJobIds,
+    hitExecutionBudget: hitExecutionBudget
   };
 }
 
@@ -348,8 +502,8 @@ function _getOrCreateActiveRunState(config, progressCallback) {
     failedJobsCount: 0,
     scoredJobsCount: 0,
     importFailedJobsCount: 0,
-    handledCanonicalKeys: [],
-    newAJobCanonicalKeys: [],
+    handledJobIds: [],
+    newTopPriorityJobIds: [],
     errors: []
   };
 }
@@ -393,6 +547,17 @@ function _appendErrors(existingErrors, nextErrors) {
 
 function _getMaxJobsPerExecution(config) {
   return Math.max(1, Math.min(20, Number(config.maxJobsPerExecution || 20)));
+}
+
+function _shouldYieldExecution(config) {
+  var bufferMs = Number((config && config.executionYieldBufferMs) || 45000);
+  var deadlineMs = Number((config && config.executionDeadlineMs) || 0);
+
+  if (!deadlineMs) {
+    return false;
+  }
+
+  return (Date.now() + bufferMs) >= deadlineMs;
 }
 
 function _startTaskRun(taskId, config) {
@@ -529,7 +694,8 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
     'applicants'
   ]));
   var rawJobLink = _stringifyField(_pickFirstValue(item, ['jobUrl', 'applyUrl', 'url', 'link', 'postingUrl']));
-  var jobLink = _buildCanonicalLinkedInJobUrl(_pickFirstValue(item, ['linkedinJobId', 'jobId', 'jobPostingId']), rawJobLink) || rawJobLink;
+  var jobId = _resolveJobId(item, rawJobLink);
+  var jobLink = _buildLinkedInJobUrlFromJobId(jobId) || rawJobLink;
   var searchString = _stringifyField(_pickFirstValue(item, ['searchString', 'searchQuery', 'query']));
   var contractType = _stringifyField(_pickFirstValue(item, ['contractType', 'employmentType']));
   var experienceLevel = _stringifyField(_pickFirstValue(item, ['experienceLevel', 'seniorityLevel']));
@@ -538,7 +704,7 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
   var importedAt = runStartedAt ? new Date(runStartedAt.getTime()) : new Date();
 
   return {
-    jobId: _resolveJobId(item, company, title, location, description, jobLink),
+    jobId: jobId,
     company: company,
     title: title,
     location: location,
@@ -549,6 +715,8 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
     summary: '',
     why: '',
     angle: '',
+    titleLevel: '',
+    jdImpliedLevel: '',
     priority: '',
     score: '',
     status: 'New',
@@ -557,10 +725,8 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
     scoredAt: '',
     sourceTask: searchString || sourceLabel || '',
     postedSort: postedDate || '',
-    rawRef: _truncate(JSON.stringify(item), 40000),
+    rawRef: _serializeRawRef(item),
     jobDescription: description,
-    otherLocations: '',
-    canonicalRoleKey: _buildCanonicalRoleKey(company, title, description),
     contractType: contractType,
     experienceLevel: experienceLevel,
     workType: workType,
@@ -568,21 +734,25 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
   };
 }
 
-function _resolveJobId(item, company, title, location, description, jobLink) {
-  var directJobId = _pickFirstValue(item, ['linkedinJobId', 'jobId', 'jobPostingId']);
+function _resolveJobId(item, rawJobLink) {
+  var directJobId = _extractLinkedInJobId(_pickFirstValue(item, ['linkedinJobId', 'jobId', 'jobPostingId']));
   if (directJobId) {
-    return 'linkedin_' + String(directJobId);
+    return directJobId;
   }
 
-  if (jobLink) {
-    return 'url_' + _sha1(jobLink);
+  if (rawJobLink) {
+    directJobId = _extractLinkedInJobId(rawJobLink);
+    if (directJobId) {
+      return directJobId;
+    }
+    return 'url_' + _sha1(rawJobLink);
   }
 
-  return 'hash_' + _sha1([company, title, location, description.slice(0, 500)].join('|'));
+  return 'hash_' + _sha1(JSON.stringify(item || {}));
 }
 
-function _buildCanonicalLinkedInJobUrl(jobId, fallbackUrl) {
-  var resolvedJobId = _extractLinkedInJobId(jobId) || _extractLinkedInJobId(fallbackUrl);
+function _buildLinkedInJobUrlFromJobId(jobId) {
+  var resolvedJobId = _extractLinkedInJobId(jobId);
   if (!resolvedJobId) {
     return '';
   }
@@ -862,10 +1032,23 @@ function _normalizeScorePayload(parsedContent) {
     score: _normalizeScore(parsedContent.score),
     priority: _normalizePriority(parsedContent.priority),
     usVisaSponsorshipPotential: _normalizeVisaSponsorshipPotential(parsedContent.us_visa_sponsorship_potential),
+    usVisaReason: _truncate(_stringifyField(parsedContent.us_visa_reason), 220),
     summary: _truncate(_stringifyField(parsedContent.summary), 200),
     why: _truncate(_stringifyField(parsedContent.why), 300),
-    angle: _truncate(_stringifyField(parsedContent.angle), 250)
+    angle: _truncate(_stringifyField(parsedContent.angle), 250),
+    titleLevel: _normalizeJobLevel(parsedContent.title_level),
+    jdImpliedLevel: _normalizeJobLevel(parsedContent.jd_implied_level)
   };
+}
+
+function _buildScoringFingerprint(job, config) {
+  return _sha1([
+    config.aiProvider || '',
+    config.geminiApiRoute || '',
+    config.scoringModel || '',
+    config.promptVersion || '',
+    _buildScoringPrompt(job, config)
+  ].join('|'));
 }
 
 function _getScoreResponseSchema() {
@@ -881,13 +1064,17 @@ function _getScoreResponseSchema() {
       },
       priority: {
         type: 'string',
-        enum: ['A', 'B', 'C', 'Skip'],
+        enum: ['P01', 'P02', 'P03', 'P04', 'P05', 'P06', 'P07', 'P08', 'P09', 'P10'],
         description: 'Priority bucket.'
       },
       us_visa_sponsorship_potential: {
         type: 'string',
         enum: ['Likely', 'Possible', 'Unclear', 'Unlikely', 'No'],
         description: 'Estimated US visa sponsorship potential.'
+      },
+      us_visa_reason: {
+        type: 'string',
+        description: 'One short sentence explaining the evidence for the visa label.'
       },
       summary: {
         type: 'string',
@@ -900,9 +1087,19 @@ function _getScoreResponseSchema() {
       angle: {
         type: 'string',
         description: 'One short sentence describing how to position the candidate.'
+      },
+      title_level: {
+        type: 'string',
+        enum: ['APM', 'PM', 'Senior-PM', 'Staff-PM', 'Principal-PM', 'Manager', 'Senior-Manager', 'Group-PM', 'Director', 'Senior-Director', 'VP', 'Head-of-Product', 'Founding-PM', 'Unknown'],
+        description: 'Seniority level extracted from the job title string only — do not read the JD body for this field.'
+      },
+      jd_implied_level: {
+        type: 'string',
+        enum: ['APM', 'PM', 'Senior-PM', 'Staff-PM', 'Principal-PM', 'Manager', 'Senior-Manager', 'Group-PM', 'Director', 'Senior-Director', 'VP', 'Head-of-Product', 'Founding-PM', 'Unknown'],
+        description: 'Actual seniority implied by the JD body — ignore the job title for this field.'
       }
     },
-    required: ['score', 'priority', 'us_visa_sponsorship_potential', 'summary', 'why', 'angle']
+    required: ['score', 'priority', 'us_visa_sponsorship_potential', 'us_visa_reason', 'summary', 'why', 'angle', 'title_level', 'jd_implied_level']
   };
 }
 
@@ -917,6 +1114,21 @@ function _extractGeminiText(parts) {
     })
     .join('\n')
     .trim();
+}
+
+function _parseHourSetting(value, defaultValue) {
+  var parsed = Math.floor(Number(value));
+  return (isNaN(parsed) || parsed < 0 || parsed > 23) ? defaultValue : parsed;
+}
+
+function _isInQuietHours(quietStartHour, quietEndHour) {
+  if (quietStartHour === quietEndHour) return false;
+  var currentHour = Number(Utilities.formatDate(new Date(), 'America/Los_Angeles', 'H'));
+  if (quietStartHour > quietEndHour) {
+    // window wraps midnight: e.g. 19 → 5 means quiet if hour >= 19 OR hour < 5
+    return currentHour >= quietStartHour || currentHour < quietEndHour;
+  }
+  return currentHour >= quietStartHour && currentHour < quietEndHour;
 }
 
 function _normalizePositiveInteger(value, defaultValue, maxValue) {
@@ -946,86 +1158,112 @@ function _resolveDefaultableSetting(value, defaultFn) {
 
 function _defaultScoringInstructions() {
   return [
-    'Act as the hiring manager for this exact role and as a pragmatic PM job-screening analyst for an international product manager candidate.',
+    'Act as the hiring manager for this exact role and as a pragmatic PM job-screening analyst.',
     '',
-    'Score the job against the target profile for role fit and practical pursuit priority.',
+    'Objective:',
+    'Score interview-conversion priority: how likely this candidate’s truthful, tailored resume is to earn an interview for this exact job.',
     '',
-    'Important judgment rule:',
-    'Judge the actual position, not just the employer. Responsibilities, required qualifications, product area, customer/user type, and success criteria matter more than company industry or brand. Do not assume a role is a fintech fit just because the employer is in finance.',
+    'Use only the real job title, company, metadata, and raw JD. Ignore prior AI summaries, prior scores, or generated angles.',
     '',
-    'Return strict JSON only with exactly these keys: score, priority, us_visa_sponsorship_potential, summary, why, angle.',
+    'Return strict JSON only with exactly these keys:',
+    'score, priority, us_visa_sponsorship_potential, us_visa_reason, summary, why, angle.',
     '',
     'Rules:',
     '- score: integer 0-100',
-    '- priority: A, B, C, or Skip',
+    '- priority: P01, P02, P03, P04, P05, P06, P07, P08, P09, or P10',
     '- us_visa_sponsorship_potential: Likely, Possible, Unclear, Unlikely, or No',
+    '- us_visa_reason: one short sentence explaining the evidence for the visa label',
     '- summary, why, and angle: one short sentence each',
+    '- No markdown, no extra keys, no extra commentary.',
     '',
-    'First infer:',
-    '1. what domain or problem area the role actually owns',
-    '2. what the person will do day to day',
-    '3. what the hiring team will screen for',
-    '4. whether the target profile shows direct, adjacent, or weak evidence',
+    'Evaluate mainly on:',
+    '1. proof/evidence match',
+    '2. domain advantage',
+    '3. seniority fit',
+    '4. product ownership/scope',
+    '5. practical pursuit value',
     '',
-    'Then score based on:',
-    '- actual role domain fit',
-    '- product scope',
-    '- match to must-have requirements',
-    '- seniority fit',
-    '- company quality',
-    '- realistic chance of being considered',
-    '- location fit',
-    '- posting urgency',
-    '- whether the role creates a credible path toward stronger PM roles',
+    'Choose priority bucket first, then score inside that bucket.',
     '',
-    'Do not use visa sponsorship, work authorization uncertainty, or immigration friction to increase or decrease score or priority.',
+    'Strong proof means the JD maps directly to 2+ candidate proof points: identity/fraud/KYC verification, biometric/liveness authentication, payment authentication, API verification scaling, bank/fintech client product work, risk decisioning, conversion/fraud tradeoffs, integration friction reduction, product expansion/revenue growth, platform standardization, or Lumi-style AI workflow product.',
     '',
-    'Priority:',
-    '- A = apply first',
-    '- B = review/apply soon',
-    '- C = backup',
-    '- Skip = do not apply',
+    'Direct domain means fintech infrastructure, banking tech, payments, fraud/risk, identity verification, authentication, biometric/liveness, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification, or regulated financial workflows.',
     '',
-    'Bands:',
-    '- 90-100: A',
-    '- 80-89: A or B',
-    '- 65-79: B',
-    '- 45-64: C',
-    '- 0-44: Skip',
+    'Adjacent domain means AI workflow, agentic AI, API/developer platform, technical platform PM, B2B SaaS, data product, security/governance, enterprise workflow, or regulated non-financial workflow.',
     '',
-    'Calibration:',
-    '- Product Manager and Senior Product Manager roles are the primary target range.',
-    '- Lead, Staff, Senior Staff, Principal, Director, and higher product roles should usually be treated as stretch roles and lower practical priority unless fit and likelihood are unusually strong.',
-    '- Product-adjacent roles can score well if they include product ownership, roadmap influence, customer discovery, requirements, technical solutioning, implementation strategy, or a credible PM path.',
-    '- Do not over-score pure sales, account management, support, admin coordination, or generic operations.',
-    '- Consumer media, ads, and gaming PM roles usually default to C unless PM scope, company quality, or bridge value is clearly strong.',
-    '- Do not give A just because the company is famous or in finance.',
+    'Weak domain means generic AI, generic SaaS, internal tools, cloud support, procurement/supply-chain, healthcare clinical systems, logistics, staffing/marketplaces, consumer growth, media, ads, gaming, investment product, operations, strategy, product marketing, pure engineering, sales, or support.',
     '',
-    'After deciding score and priority, classify visa separately.',
+    'Priority buckets:',
+    '- P01: rare bullseye; direct domain + strong proof + PM/Senior PM fit + clear ownership + reliable JD. Score 95-100.',
+    '- P02: very strong fit; direct domain + strong proof with one minor gap. Score 90-94.',
+    '- P03: strong fit with one meaningful gap; direct domain with moderate proof or adjacent domain with unusually strong proof. Score 85-89.',
+    '- P04: good adjacent PM fit, not top wedge. Score 80-84.',
+    '- P05: adjacent but credible, weaker domain or proof. Score 75-79.',
+    '- P06: possible backup. Score 70-74.',
+    '- P07: low interview-conversion fit, generic PM or weak domain. Score 60-69.',
+    '- P08: poor fit or wrong product area. Score 50-59.',
+    '- P09: clear mismatch. Score 35-49.',
+    '- P10: hard skip: entry-level, internship, new-grad, pure engineering, pure sales/support/admin, or obvious non-target. Score 0-34.',
+    '',
+    'Caps:',
+    '- P01/P02 require both direct domain and strong proof.',
+    '- If proof is weak, max P07.',
+    '- If proof is moderate, max P04 unless domain is direct.',
+    '- If domain is only adjacent, max P03 and usually P04-P06.',
+    '- Generic AI/platform/SaaS/data/cloud-support roles max P04 unless strongly mapped to fintech/payments/fraud/identity/authentication/API verification or Lumi-style AI workflow.',
+    '- Famous company alone max P05.',
+    '- Financial-institution customer segment does not make the product fintech.',
+    '- Staff/Principal/Group/Director/VP+ max P04 unless direct-domain, IC/product-scope heavy, and unusually strong.',
+    '- Recruiter/hiring-network/generic/duplicated/unclear-employer JD max P05 unless direct-domain proof is clear.',
+    '- Pure strategy, product marketing, sales, support, account management, admin, or operations max P07 unless clear product ownership exists.',
+    '',
+    'Batch calibration:',
+    'For ~1,000 scraped PM jobs, P01 should be rare, P02 selective, P03 strong but not bullseye, most decent jobs should fall into P04-P06, and weak/non-target jobs should fall into P07-P10.',
     '',
     'Visa:',
     '- visa output is informational only',
     '- do not use visa to increase or decrease score or priority',
     '- Likely = sponsorship is explicit or strongly supported by employer and role context',
     '- Possible = sponsorship is not explicit, but still plausibly available',
-    '- Unclear = the posting gives no reliable sponsorship signal',
+    '- Unclear = no reliable sponsorship signal',
     '- Unlikely = sponsorship is not stated and role or employer context makes it less likely',
-    '- No = the posting explicitly says no sponsorship, no current or future sponsorship, or explicitly requires unrestricted US work authorization',
-    '- Do not treat wording like "US applicants only", US location eligibility, or US pay-transparency language by itself as No. If sponsorship is not explicitly ruled out, use Unclear instead.',
+    '- No = posting explicitly says no sponsorship, no current/future sponsorship, or unrestricted US work authorization required',
+    '- Do not treat "US applicants only", US location eligibility, or US pay-transparency language by itself as No.',
     '',
-    'Return only valid JSON with no extra text.'
+    'Level classification:',
+    'title_level: Read the job title string only — ignore the JD body. Map to one of: APM, PM, Senior-PM, Staff-PM, Principal-PM, Manager, Senior-Manager, Group-PM, Director, Senior-Director, VP, Head-of-Product, Founding-PM, Unknown.',
+    'jd_implied_level: Read the JD body only — ignore the job title. Infer the actual scope and seniority from content signals:',
+    '- "first PM", "build from scratch", "wear many hats", seed/Series A stage → Founding-PM',
+    '- Manages 5+ PMs, owns org-wide roadmap, sets product strategy across groups → Group-PM or Director',
+    '- Explicit "manage a team of PMs" or "manage PMs" → Manager or Senior-Manager',
+    '- Cross-functional leadership, no direct reports, sets technical/product direction → Staff-PM or Principal-PM',
+    '- Mentors ICs, leads initiatives, owns a significant product surface → Senior-PM',
+    '- Clear IC scope, defined product area, execution-focused → PM',
+    '- Entry-level signals, "associate", rotational, new-grad → APM',
+    '- Cannot determine from JD content → Unknown',
+    '',
+    'Return only valid JSON.'
   ].join('\n');
 }
 
 function _defaultTargetProfile() {
   return [
-    'Product manager and product leader with 10+ years of experience, most recently at Senior Product Manager / Associate Product Director level, with graduate business training from Yale SOM and NUS MBA.',
-    'Strongest domains include fintech, banking, payments, identity verification, fraud detection, risk decisioning, authentication, eKYC/KYC, trust and safety, AI/ML-enabled products, API platforms, SDKs, enterprise SaaS, and regulated financial-institution workflows.',
-    'Experience includes scaling API-based identity and fraud products, launching biometric payment authentication, defining ML model requirements, improving verification and authentication conversion, reducing integration friction, and supporting portfolio growth across APAC and LATAM.',
-    'Strengths include product strategy, 0-to-1 launch, technical and platform/API product management, customer discovery, enterprise problem solving, fraud-versus-conversion tradeoff management, roadmap prioritization, and cross-functional leadership.',
-    'Prioritize Product Manager and Senior Product Manager roles as the primary target, especially in fintech, payments, fraud/risk, identity, trust and safety, AI/ML platforms, developer/API platforms, enterprise SaaS, and AI workflow products.',
-    'PM-adjacent bridge roles can still be attractive when they offer real product scope and strong US-market value.',
-    'Lead, Staff, Senior Staff, Principal, Director, and higher product roles should usually be treated as stretch opportunities and lower practical priority unless the fit is unusually strong and the likelihood of consideration is clearly high.'
+    'Candidate target profile:',
+    '',
+    'Experienced product manager / product leader with 10+ years of experience, most recently Senior Product Manager / Associate Product Director level, with Yale SOM and NUS MBA training.',
+    '',
+    'Primary interview wedge:',
+    'fintech infrastructure, banking technology, payments, fraud/risk, identity verification, authentication, biometric/liveness verification, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification platforms, and regulated financial workflows for banks/fintechs.',
+    '',
+    'Strong proof points:',
+    'scaled API-based identity/risk verification from ~500K to ~2M daily verifications across cloud and on-prem; launched biometric payment authentication across 9 tier-1 banks; owned fraud/risk, KYC, liveness, authentication, and API verification products; improved verification/authentication conversion; reduced integration friction; defined ML product/model requirements; supported ~40% YoY ARR/API growth; standardized platform deployments across markets.',
+    '',
+    'Secondary/adjacent fit:',
+    'AI workflow, agentic AI, API/developer platforms, technical platform PM, B2B SaaS, data products, security/governance, and enterprise workflow. Lumi supports AI workflow and product-building evidence, but should not be treated as equivalent to large-scale enterprise AI platform PM experience.',
+    '',
+    'Direct fit requires the role itself to own payments, fraud/risk, identity, authentication, KYC, onboarding, risk decisioning, API verification, or financial infrastructure. Do not treat a financial-services customer segment or famous employer as direct domain fit.',
+    '',
+    'Prioritize PM and Senior PM roles. Treat Staff, Principal, Director, VP+, entry-level, pure engineering, pure strategy, product marketing, sales, account management, support, operations, healthcare clinical systems, procurement, supply chain, ads, gaming, marketplace operations, and investment-product roles as lower priority unless the JD has unusually strong product ownership and proof mapping.'
   ].join(' ');
 }
 
@@ -1070,23 +1308,56 @@ function _normalizeScore(value) {
 }
 
 function _normalizePriority(value) {
+  var priority = _stringifyField(value).toUpperCase();
   var allowed = {
-    A: true,
-    B: true,
-    C: true,
-    Skip: true
+    P01: true,
+    P02: true,
+    P03: true,
+    P04: true,
+    P05: true,
+    P06: true,
+    P07: true,
+    P08: true,
+    P09: true,
+    P10: true
   };
-  var priority = _stringifyField(value);
+  var legacyMap = {
+    A: 'P01',
+    B: 'P05',
+    C: 'P07',
+    SKIP: 'P10'
+  };
 
   if (allowed[priority]) {
     return priority;
   }
 
-  if (priority.toLowerCase() === 'skip') {
-    return 'Skip';
+  if (legacyMap[priority]) {
+    return legacyMap[priority];
   }
 
-  return 'C';
+  return 'P07';
+}
+
+function _isTopPriority(value) {
+  return _normalizePriority(value) === 'P01';
+}
+
+function _normalizeJobLevel(value) {
+  var VALID_LEVELS = {
+    'APM': true, 'PM': true, 'Senior-PM': true, 'Staff-PM': true,
+    'Principal-PM': true, 'Manager': true, 'Senior-Manager': true,
+    'Group-PM': true, 'Director': true, 'Senior-Director': true,
+    'VP': true, 'Head-of-Product': true, 'Founding-PM': true, 'Unknown': true
+  };
+  var text = _stringifyField(value);
+  if (VALID_LEVELS[text]) return text;
+  var keys = Object.keys(VALID_LEVELS);
+  var lower = text.toLowerCase();
+  for (var i = 0; i < keys.length; i += 1) {
+    if (keys[i].toLowerCase() === lower) return keys[i];
+  }
+  return 'Unknown';
 }
 
 function _normalizeVisaSponsorshipPotential(value) {
@@ -1101,98 +1372,128 @@ function _normalizeVisaSponsorshipPotential(value) {
   return allowed[potential] ? potential : 'Unclear';
 }
 
-function _buildCanonicalRoleKey(company, title, description) {
-  return [
-    _normalizeCanonicalText(company),
-    _normalizeCanonicalText(title),
-    _sha1(_cleanJobDescription(description || ''))
-  ].join('|');
-}
-
-function _normalizeCanonicalText(value) {
-  return _stringifyField(value)
-    .toLowerCase()
-    .replace(/\s+/g, ' ');
-}
-
-function _clusterJobsByCanonicalRole(jobs) {
-  var clusters = {};
+function _dedupeJobsByJobId(jobs) {
   var seenJobIds = {};
+  var dedupedJobs = [];
 
-  jobs.forEach(function(job) {
-    var canonicalRoleKey = job.canonicalRoleKey || _buildCanonicalRoleKey(job.company, job.title, job.jobDescription);
+  (jobs || []).forEach(function(job) {
+    var jobId = _stringifyField(job && job.jobId);
 
-    if (seenJobIds[job.jobId]) {
+    if (!jobId || seenJobIds[jobId]) {
       return;
     }
 
-    seenJobIds[job.jobId] = true;
-
-    if (!clusters[canonicalRoleKey]) {
-      clusters[canonicalRoleKey] = {
-        canonicalRoleKey: canonicalRoleKey,
-        jobs: []
-      };
-    }
-
-    clusters[canonicalRoleKey].jobs.push(job);
+    seenJobIds[jobId] = true;
+    dedupedJobs.push(job);
   });
 
-  return Object.keys(clusters).map(function(canonicalRoleKey) {
-    var cluster = clusters[canonicalRoleKey];
-    cluster.primaryJob = cluster.jobs.slice().sort(_compareJobRecencyDesc)[0];
-    return cluster;
-  });
+  return dedupedJobs;
 }
 
-function _findExistingCanonicalRecord(cluster, existingIndex) {
-  var existing = existingIndex.byCanonicalRoleKey[cluster.canonicalRoleKey];
+function _buildCandidateJob(job, existing) {
+  var candidate = _cloneJobRecord(job);
+  var preservedJobId = '';
 
-  if (existing) {
-    return existing;
+  if (!existing) {
+    return candidate;
   }
 
-  for (var i = 0; i < cluster.jobs.length; i += 1) {
-    existing = existingIndex.byJobId[cluster.jobs[i].jobId];
-    if (existing) {
-      return existing;
-    }
-  }
+  preservedJobId = _extractLinkedInJobId(candidate.jobId) ||
+    _extractLinkedInJobId(existing.jobId) ||
+    _stringifyField(candidate.jobId) ||
+    _stringifyField(existing.jobId);
 
-  return null;
+  candidate.existingRowNumber = existing.rowNumber;
+  candidate.jobId = preservedJobId || '';
+  candidate.jobLink = _buildLinkedInJobUrlFromJobId(candidate.jobId) ||
+    _stringifyField(candidate.jobLink) ||
+    _buildLinkedInJobUrlFromJobId(existing.jobId) ||
+    _stringifyField(existing.jobLink) ||
+    _stringifyField(existing.sourceUrl) ||
+    '';
+  candidate.sourceUrl = _stringifyField(candidate.sourceUrl) || _stringifyField(existing.sourceUrl) || '';
+  candidate.sourceTask = _stringifyField(candidate.sourceTask) || _stringifyField(existing.sourceTask) || '';
+  candidate.jobDescription = _stringifyField(candidate.jobDescription) || _stringifyField(existing.jobDescription) || '';
+  candidate.rawRef = _stringifyField(candidate.rawRef) || _stringifyField(existing.rawRef) || '';
+  candidate.company = _stringifyField(candidate.company) || _stringifyField(existing.company) || '';
+  candidate.title = _stringifyField(candidate.title) || _stringifyField(existing.title) || '';
+  candidate.location = _stringifyField(candidate.location) || _stringifyField(existing.location) || '';
+  candidate.posted = _stringifyField(candidate.posted) || _stringifyField(existing.posted) || '';
+  candidate.applicants = _stringifyField(candidate.applicants) || _stringifyField(existing.applicants) || '';
+  candidate.contractType = _stringifyField(candidate.contractType) || _stringifyField(existing.contractType) || '';
+  candidate.experienceLevel = _stringifyField(candidate.experienceLevel) || _stringifyField(existing.experienceLevel) || '';
+  candidate.workType = _stringifyField(candidate.workType) || _stringifyField(existing.workType) || '';
+  candidate.publishedAt = _stringifyField(candidate.publishedAt) || _stringifyField(existing.publishedAt) || '';
+  candidate.postedSort = candidate.postedSort || existing.postedSort || '';
+  candidate.status = existing.status || 'New';
+  candidate.notes = existing.notes || '';
+  candidate.importedAt = existing.importedAt || candidate.importedAt;
+  candidate.scoredAt = existing.scoredAt || '';
+  candidate.score = existing.score === undefined ? '' : existing.score;
+  candidate.priority = existing.priority || '';
+  candidate.usVisaSponsorshipPotential = existing.usVisaSponsorshipPotential || '';
+  candidate.usVisaReason = existing.usVisaReason || '';
+  candidate.summary = existing.summary || '';
+  candidate.why = existing.why || '';
+  candidate.angle = existing.angle || '';
+  candidate.titleLevel = existing.titleLevel || '';
+  candidate.jdImpliedLevel = existing.jdImpliedLevel || '';
+  candidate.scoringFingerprint = existing.scoringFingerprint || '';
+
+  return candidate;
 }
 
-function _buildCanonicalCandidateJob(cluster, existing) {
-  var primaryJob = _cloneJobRecord(cluster.primaryJob);
-  var locationParts = [];
+function _refreshStoredJobForReevaluation(existing) {
+  var refreshed = _cloneJobRecord(existing);
+  var rawRefData = _parseRawRefObject(existing.rawRef);
+  var recoveredDescription = _extractJobDescriptionFromRawRef(existing.rawRef);
+  var recoveredJobId = _extractLinkedInJobId(_pickFirstValue(rawRefData, ['linkedinJobId', 'jobId', 'jobPostingId'])) ||
+    _extractLinkedInJobId(existing.jobId);
+  var recoveredSourceUrl = _stringifyField(_pickFirstValue(rawRefData, ['jobUrl', 'applyUrl', 'url', 'link', 'postingUrl'])) ||
+    _stringifyField(existing.sourceUrl);
+  var recoveredPublishedAt = _stringifyField(_pickFirstValue(rawRefData, ['publishedAt', 'postedAt', 'createdAt', 'listedAt']));
+  var recoveredApplicants = _normalizeApplicantsCount(_pickFirstValue(rawRefData, [
+    'applicantsCount',
+    'applicantCount',
+    'applicationsCount',
+    'applicants'
+  ]));
+  var publishedDate = recoveredPublishedAt ? new Date(recoveredPublishedAt) : null;
 
-  cluster.jobs.forEach(function(job) {
-    locationParts.push(job.location);
-  });
+  refreshed.jobId = recoveredJobId || refreshed.jobId || '';
+  refreshed.jobLink = _buildLinkedInJobUrlFromJobId(refreshed.jobId) || recoveredSourceUrl || refreshed.jobLink || '';
+  refreshed.sourceUrl = recoveredSourceUrl || refreshed.sourceUrl || '';
+  refreshed.company = _stringifyField(_pickFirstValue(rawRefData, ['companyName', 'company', 'organizationName'])) || refreshed.company || '';
+  refreshed.title = _stringifyField(_pickFirstValue(rawRefData, ['jobTitle', 'title', 'positionName'])) || refreshed.title || '';
+  refreshed.location = _stringifyField(_pickFirstValue(rawRefData, ['location', 'jobLocation', 'formattedLocation'])) || refreshed.location || '';
+  refreshed.contractType = _stringifyField(_pickFirstValue(rawRefData, ['contractType', 'employmentType'])) || refreshed.contractType || '';
+  refreshed.experienceLevel = _stringifyField(_pickFirstValue(rawRefData, ['experienceLevel', 'seniorityLevel'])) || refreshed.experienceLevel || '';
+  refreshed.workType = _stringifyField(_pickFirstValue(rawRefData, ['workType', 'functionArea'])) || refreshed.workType || '';
+  refreshed.jobDescription = recoveredDescription || refreshed.jobDescription || '';
+  refreshed.publishedAt = recoveredPublishedAt || refreshed.publishedAt || '';
+  refreshed.applicants = recoveredApplicants || refreshed.applicants || '';
 
-  if (existing) {
-    _collectJobLocations(existing).forEach(function(location) {
-      locationParts.push(location);
-    });
-
-    primaryJob.existingRowNumber = existing.rowNumber;
-    primaryJob.location = existing.location || primaryJob.location;
-    primaryJob.status = existing.status || 'New';
-    primaryJob.notes = existing.notes || '';
-    primaryJob.importedAt = existing.importedAt || primaryJob.importedAt;
-    primaryJob.scoredAt = existing.scoredAt || '';
-    primaryJob.score = existing.score === undefined ? '' : existing.score;
-    primaryJob.priority = existing.priority || '';
-    primaryJob.usVisaSponsorshipPotential = existing.usVisaSponsorshipPotential || '';
-    primaryJob.summary = existing.summary || '';
-    primaryJob.why = existing.why || '';
-    primaryJob.angle = existing.angle || '';
+  if ((!refreshed.postedSort || refreshed.postedSort === '') && publishedDate && !isNaN(publishedDate.getTime())) {
+    refreshed.postedSort = publishedDate;
   }
 
-  primaryJob.otherLocations = _formatOtherLocations(locationParts, primaryJob.location);
-  primaryJob.canonicalRoleKey = cluster.canonicalRoleKey;
+  if ((!refreshed.posted || refreshed.posted === '') && publishedDate && !isNaN(publishedDate.getTime())) {
+    refreshed.posted = _formatDateTimeForDisplay(publishedDate);
+  }
 
-  return primaryJob;
+  return refreshed;
+}
+
+function _parseRawRefObject(rawRef) {
+  if (!_stringifyField(rawRef)) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(String(rawRef));
+  } catch (error) {
+    return {};
+  }
 }
 
 function _compareJobRecencyDesc(left, right) {
@@ -1278,6 +1579,48 @@ function _cleanJobDescription(value) {
     .trim();
 }
 
+function _serializeRawRef(item) {
+  var full = JSON.stringify(item || {});
+  var compact;
+  var description;
+
+  if (full.length <= 40000) {
+    return full;
+  }
+
+  description = _truncate(_cleanJobDescription(_pickFirstValue(item || {}, [
+    'jobDescription',
+    'descriptionText',
+    'description',
+    'job_description',
+    'details'
+  ])), 12000);
+
+  compact = JSON.stringify({
+    linkedinJobId: _pickFirstValue(item || {}, ['linkedinJobId', 'jobId', 'jobPostingId']),
+    companyName: _pickFirstValue(item || {}, ['companyName', 'company', 'organizationName']),
+    jobTitle: _pickFirstValue(item || {}, ['jobTitle', 'title', 'positionName']),
+    location: _pickFirstValue(item || {}, ['location', 'jobLocation', 'formattedLocation']),
+    jobUrl: _pickFirstValue(item || {}, ['jobUrl', 'applyUrl', 'url', 'link', 'postingUrl']),
+    publishedAt: _pickFirstValue(item || {}, ['publishedAt', 'postedAt', 'createdAt', 'listedAt']),
+    jobDescription: description
+  });
+
+  if (compact.length <= 40000) {
+    return compact;
+  }
+
+  return JSON.stringify({
+    linkedinJobId: _pickFirstValue(item || {}, ['linkedinJobId', 'jobId', 'jobPostingId']),
+    companyName: _pickFirstValue(item || {}, ['companyName', 'company', 'organizationName']),
+    jobTitle: _pickFirstValue(item || {}, ['jobTitle', 'title', 'positionName']),
+    location: _pickFirstValue(item || {}, ['location', 'jobLocation', 'formattedLocation']),
+    jobUrl: _pickFirstValue(item || {}, ['jobUrl', 'applyUrl', 'url', 'link', 'postingUrl']),
+    publishedAt: _pickFirstValue(item || {}, ['publishedAt', 'postedAt', 'createdAt', 'listedAt']),
+    jobDescriptionExcerpt: _truncate(description, 4000)
+  });
+}
+
 function _normalizeApplicantsCount(value) {
   var text = _stringifyField(value);
   var lower;
@@ -1325,4 +1668,90 @@ function _sha1(value) {
     var hex = normalized.toString(16);
     return hex.length === 1 ? '0' + hex : hex;
   }).join('');
+}
+
+// --- JD content similarity ---
+
+function _normalizeJdText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _buildWordBigrams(text) {
+  var words = _normalizeJdText(text).split(' ').filter(function(w) { return w.length > 1; });
+  var bigrams = {};
+  for (var i = 0; i < words.length - 1; i += 1) {
+    bigrams[words[i] + ' ' + words[i + 1]] = true;
+  }
+  return bigrams;
+}
+
+function _jdContentHash(text) {
+  return _sha1(_normalizeJdText(text));
+}
+
+function _canReachJaccardThreshold(countA, countB, threshold) {
+  if (!countA || !countB) return false;
+  return Math.min(countA, countB) / Math.max(countA, countB) >= threshold;
+}
+
+function _buildBigramSketch(bigrams) {
+  return Object.keys(bigrams).sort().slice(0, 30);
+}
+
+function _sketchOverlapRatio(sketchA, sketchB) {
+  var setB = {};
+  sketchB.forEach(function(b) { setB[b] = true; });
+  var shared = sketchA.filter(function(a) { return setB[a]; }).length;
+  return shared / Math.max(sketchA.length, sketchB.length, 1);
+}
+
+function _jaccardBigramSimilarity(bigramsA, bigramsB) {
+  var keysA = Object.keys(bigramsA);
+  var keysB = Object.keys(bigramsB);
+  if (!keysA.length && !keysB.length) return 1.0;
+  if (!keysA.length || !keysB.length) return 0.0;
+  var intersection = 0;
+  keysA.forEach(function(k) { if (bigramsB[k]) intersection += 1; });
+  return intersection / (keysA.length + keysB.length - intersection);
+}
+
+function _precomputeJdFingerprints(records) {
+  records.forEach(function(record) {
+    var jd = _stringifyField(record.jobDescription);
+    var bigrams = _buildWordBigrams(jd);
+    record._jdHash = _jdContentHash(jd);
+    record._bigrams = bigrams;
+    record._bigramCount = Object.keys(bigrams).length;
+    record._bigramSketch = _buildBigramSketch(bigrams);
+  });
+}
+
+function _areLikelySameJd(recordA, recordB, threshold) {
+  // Stage 1: exact normalized hash
+  if (recordA._jdHash && recordA._jdHash === recordB._jdHash) return true;
+
+  // No content to compare
+  if (!recordA._bigramCount || !recordB._bigramCount) return false;
+
+  // Stage 2: length ratio — mathematical bound: if Jaccard >= T then min/max >= T
+  if (!_canReachJaccardThreshold(recordA._bigramCount, recordB._bigramCount, threshold)) return false;
+
+  // Stage 3: sketch overlap — cheap soft gate before full Jaccard
+  if (_sketchOverlapRatio(recordA._bigramSketch, recordB._bigramSketch) < 0.25) return false;
+
+  // Stage 4: full Jaccard
+  return _jaccardBigramSimilarity(recordA._bigrams, recordB._bigrams) >= threshold;
+}
+
+function _titlesSanityCheck(titleA, titleB) {
+  // At least one significant word (>3 chars) must be shared between titles
+  var wordsA = _normalizeJdText(titleA).split(' ').filter(function(w) { return w.length > 3; });
+  var wordsB = _normalizeJdText(titleB).split(' ').filter(function(w) { return w.length > 3; });
+  var setB = {};
+  wordsB.forEach(function(w) { setB[w] = true; });
+  return wordsA.some(function(w) { return setB[w]; });
 }

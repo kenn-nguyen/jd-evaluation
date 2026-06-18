@@ -2,6 +2,7 @@ var JOB_PRIORITY_SHEET_NAME = 'Job_Priority';
 var SETTINGS_SHEET_NAME = 'Settings';
 var HELP_SHEET_NAME = 'Help';
 var DEDUP_ARCHIVE_SHEET_NAME = 'Dedup_Archive';
+var RAW_DATA_SHEET_NAME = 'Raw_Data';
 var JOB_PRIORITY_HEADER_ROW = 6;
 var JOB_PRIORITY_DATA_START_ROW = 7;
 var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Opened', 'Tailoring', 'Applied', 'Skip'];
@@ -19,6 +20,8 @@ var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'us_visa',
   'company',
   'title',
+  'title_level',
+  'jd_implied_level',
   'status',
   'location',
   'posted',
@@ -26,23 +29,24 @@ var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'job_link',
   'summary',
   'why',
+  'us_visa_reason',
   'angle',
-  'notes',
-  'source_jd'
+  'notes'
 ];
 var JOB_PRIORITY_HIDDEN_COLUMNS = [
+  'source_jd',
   'job_id',
   'imported_at',
   'scored_at',
   'source_task',
   'posted_sort',
   'source_url',
-  'other_locations',
-  'canonical_role_key',
+  'scoring_fingerprint',
   'raw_ref'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
-var DEDUP_ARCHIVE_COLUMNS = ['deduped_at', 'canonical_role_key'].concat(JOB_PRIORITY_COLUMNS);
+var DEDUP_ARCHIVE_COLUMNS = ['deduped_at'].concat(JOB_PRIORITY_COLUMNS);
+var RAW_DATA_COLUMNS = ['job_id', 'source_jd', 'source_task', 'source_url', 'raw_ref', 'updated_at'];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
   var map = {};
   for (var i = 0; i < JOB_PRIORITY_COLUMNS.length; i += 1) {
@@ -52,40 +56,48 @@ var JOB_PRIORITY_COLUMN_INDEX = (function() {
 })();
 var SETTINGS_DEFAULT_ROWS = [
   ['setting_key', 'setting_value', 'notes'],
+  ['APIFY_TOKEN', '', 'Apify API token. You can paste it here directly, or still use Script Properties as a fallback.'],
   ['GEMINI_API_ROUTE', 'developer', 'developer uses Gemini Developer API. vertex uses your linked Google Cloud project and Vertex billing.'],
   ['VERTEX_PROJECT_ID', '', 'Required only when GEMINI_API_ROUTE=vertex. Use your standard Google Cloud project id.'],
   ['VERTEX_LOCATION', 'global', 'Usually keep global for Gemini models on Vertex'],
   ['SCORING_MODEL', 'gemini-2.5-flash', 'Editable model name used for scoring'],
   ['SCORING_PARALLEL_REQUESTS', '3', 'How many AI scoring requests to send in parallel per batch'],
-  ['TARGET_PROFILE', 'Product manager and product leader with 10+ years of experience, most recently at Senior Product Manager / Associate Product Director level, with graduate business training from Yale SOM and NUS MBA. Strongest domains include fintech, banking, payments, identity verification, fraud detection, risk decisioning, authentication, eKYC/KYC, trust and safety, AI/ML-enabled products, API platforms, SDKs, enterprise SaaS, and regulated financial-institution workflows. Experience includes scaling API-based identity and fraud products, launching biometric payment authentication, defining ML model requirements, improving verification and authentication conversion, reducing integration friction, and supporting portfolio growth across APAC and LATAM. Strengths include product strategy, 0-to-1 launch, technical and platform/API product management, customer discovery, enterprise problem solving, fraud-versus-conversion tradeoff management, roadmap prioritization, and cross-functional leadership. Prioritize Product Manager and Senior Product Manager roles as the primary target, especially in fintech, payments, fraud/risk, identity, trust and safety, AI/ML platforms, developer/API platforms, enterprise SaaS, and AI workflow products. PM-adjacent bridge roles can still be attractive when they offer real product scope and strong US-market value. Lead, Staff, Senior Staff, Principal, Director, and higher product roles should usually be treated as stretch opportunities and lower practical priority unless the fit is unusually strong and the likelihood of consideration is clearly high.', 'Editable scoring context. Replace this with your own resume-derived profile text as needed.'],
-  ['SCORING_INSTRUCTIONS', 'default', 'Use default to keep the built-in scoring prompt, or replace with your own instruction block. The built-in prompt scores role fit first and evaluates visa separately at the end.'],
-  ['NOTIFY_EMAIL', '', 'Optional. Email address for A-priority alerts and critical failure alerts'],
+  ['TARGET_PROFILE', 'Candidate target profile:\n\nExperienced product manager / product leader with 10+ years of experience, most recently Senior Product Manager / Associate Product Director level, with Yale SOM and NUS MBA training.\n\nPrimary interview wedge:\nfintech infrastructure, banking technology, payments, fraud/risk, identity verification, authentication, biometric/liveness verification, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification platforms, and regulated financial workflows for banks/fintechs.\n\nStrong proof points:\nscaled API-based identity/risk verification from ~500K to ~2M daily verifications across cloud and on-prem; launched biometric payment authentication across 9 tier-1 banks; owned fraud/risk, KYC, liveness, authentication, and API verification products; improved verification/authentication conversion; reduced integration friction; defined ML product/model requirements; supported ~40% YoY ARR/API growth; standardized platform deployments across markets.\n\nSecondary/adjacent fit:\nAI workflow, agentic AI, API/developer platforms, technical platform PM, B2B SaaS, data products, security/governance, and enterprise workflow. Lumi supports AI workflow and product-building evidence, but should not be treated as equivalent to large-scale enterprise AI platform PM experience.\n\nDirect fit requires the role itself to own payments, fraud/risk, identity, authentication, KYC, onboarding, risk decisioning, API verification, or financial infrastructure. Do not treat a financial-services customer segment or famous employer as direct domain fit.\n\nPrioritize PM and Senior PM roles. Treat Staff, Principal, Director, VP+, entry-level, pure engineering, pure strategy, product marketing, sales, account management, support, operations, healthcare clinical systems, procurement, supply chain, ads, gaming, marketplace operations, and investment-product roles as lower priority unless the JD has unusually strong product ownership and proof mapping.', 'Editable scoring context. Replace this with your own resume-derived profile text as needed.'],
+  ['SCORING_INSTRUCTIONS', 'default', 'Use default to keep the built-in scoring prompt, or replace with your own instruction block. The built-in prompt scores interview-conversion priority and evaluates visa separately at the end.'],
+  ['NOTIFY_EMAIL', '', 'Optional. Email address for P01-priority alerts and critical failure alerts'],
   ['FORCE_RESCORE', 'FALSE', 'TRUE rescoring existing jobs in the current fetch'],
-  ['APIFY_TASK_IDS', '', 'Your Apify task id, for example masterabctech~linkedin-job-scraper-task']
+  ['APIFY_TASK_IDS', '', 'Your Apify task id, for example masterabctech~linkedin-job-scraper-task'],
+  ['RUN_INTERVAL_HOURS', '4', 'How often the pipeline runs (hours). Supported values: 1, 2, 4, 6, 8, 12.'],
+  ['QUIET_START_HOUR', '19', 'Hour to stop running, 0-23 Pacific Time. Default 19 = 7pm PT.'],
+  ['QUIET_END_HOUR', '5', 'Hour to resume running, 0-23 Pacific Time. Default 5 = 5am PT. Set both to 0 to disable quiet hours.']
 ];
 var HELP_ROWS = [
   ['Job Priority Help', ''],
   ['What Run Now does', 'Starts your Apify task, waits for it to finish, fetches that batch of jobs, scores new jobs, and writes ranked results into Job_Priority.'],
-  ['Step 1', 'Open Apps Script Project Settings and add Script Property APIFY_TOKEN.'],
+  ['Step 1', 'Open the Settings sheet and paste APIFY_TOKEN there. Script Properties still work as a fallback, but the sheet is now supported directly.'],
   ['Step 2', 'If using Gemini Developer API, also add Script Property GEMINI_API_KEY and leave GEMINI_API_ROUTE as developer.'],
   ['Step 3', 'If using Vertex billing, switch this Apps Script project to a standard Google Cloud project, enable Vertex AI API there, and set GEMINI_API_ROUTE to vertex.'],
   ['Step 4', 'If GEMINI_API_ROUTE is vertex, fill in VERTEX_PROJECT_ID and usually leave VERTEX_LOCATION as global.'],
-  ['Step 5', 'Open the Settings sheet and fill in APIFY_TASK_IDS with your task id.'],
+  ['Step 5', 'In the same Settings sheet, fill in APIFY_TASK_IDS with your task id.'],
   ['Step 6', 'Edit TARGET_PROFILE directly with your current resume-derived summary or job-targeting profile.'],
-  ['Step 7', 'Optional: set NOTIFY_EMAIL if you want email alerts for new A jobs and critical failures.'],
+  ['Step 7', 'Optional: set NOTIFY_EMAIL if you want email alerts for new P01 jobs and critical failures.'],
   ['Step 8', 'Leave SCORING_INSTRUCTIONS as default to use the built-in prompt, or replace it with your own prompt rules.'],
   ['Step 9', 'Leave SCORING_MODEL as gemini-2.5-flash unless you want another Gemini model.'],
   ['Step 10', 'Use Jobs Pipeline > Validate Config, then Jobs Pipeline > Run Now.'],
   ['Import old Apify run', 'Use Jobs Pipeline > Import Apify Run ID... to score a finished Apify run again from its saved dataset without scraping a new batch.'],
   ['Retry failed Apify run', 'Use Jobs Pipeline > Retry Apify Run ID... to rerun a finished or failed Apify run in Apify, wait for completion, then import and score that rerun.'],
+  ['Repair job links', 'Use Jobs Pipeline > Repair Job Links from Raw Ref to rebuild missing LinkedIn job links as https://www.linkedin.com/jobs/view/<job_id>/ using the job ID stored in raw_ref.'],
+  ['Migrate raw data', 'Use Jobs Pipeline > Migrate Raw Data to move source_jd, source_task, source_url, and raw_ref out of Job_Priority into the Raw_Data sheet keyed by job_id.'],
+  ['Reevaluate active backlog', 'Use Jobs Pipeline > Reevaluate Active Backlog to rescore current New, Opened, and Tailoring rows using the latest prompt/profile. Applied and Skip rows are ignored.'],
+  ['Reevaluate selected rows', 'Use Jobs Pipeline > Reevaluate Selected Rows to rescore only the currently selected job rows. Applied and Skip rows are ignored.'],
   ['Large runs', 'Large scoring runs now continue automatically in chunks. If the batch is too large for one Apps Script execution, the script writes partial results, updates Processed, and schedules the next continuation automatically.'],
   ['Resetting prompt default', 'If you want the built-in scoring prompt again, just type default into SCORING_INSTRUCTIONS. You do not need to run setupJobPriorityWorkbook() for that reset.'],
-  ['Deduplicate Existing Jobs', 'Use Jobs Pipeline > Deduplicate Existing Jobs to merge existing duplicate rows by canonical company + title + job-description fingerprint and archive removed rows into Dedup_Archive.'],
-  ['When you change Apify account', 'Usually only APIFY_TOKEN and APIFY_TASK_IDS need to change.'],
+  ['Deduplicate Existing Jobs', 'Use Jobs Pipeline > Deduplicate Existing Jobs to merge existing duplicate rows by job_id and archive removed rows into Dedup_Archive.'],
+  ['When you change Apify account', 'Usually only APIFY_TOKEN and APIFY_TASK_IDS in the Settings sheet need to change.'],
   ['Task id example', 'masterabctech~linkedin-job-scraper-task'],
   ['Parallel AI requests', 'SCORING_PARALLEL_REQUESTS controls how many jobs are scored in parallel per batch. 3 is a safe default.'],
   ['Notification email', 'If NOTIFY_EMAIL is blank, no email notifications are sent.'],
-  ['A job alert email', 'Sent when the run finds at least one new A-priority job. The email includes summary, visa signal, why, and job link.'],
+  ['P01 job alert email', 'Sent when the run finds at least one new P01-priority job. The email includes summary, visa signal, why, and job link.'],
   ['Critical failure email', 'Sent when the whole run fails or when a large share of jobs in the run fail to import or score.'],
   ['If AI output is invalid', 'The script retries that job one time. If it still fails, the job is marked failed for that run and the rest continue.'],
   ['Vertex route', 'Vertex route uses the Vertex AI REST endpoint and Apps Script OAuth against your linked standard Google Cloud project, so usage is billed to that project.']
@@ -97,11 +109,49 @@ function setupJobPriorityWorkbook() {
   var settingsSheet = _getOrCreateSheet(spreadsheet, SETTINGS_SHEET_NAME);
   var helpSheet = _getOrCreateSheet(spreadsheet, HELP_SHEET_NAME);
   var dedupArchiveSheet = _getOrCreateSheet(spreadsheet, DEDUP_ARCHIVE_SHEET_NAME);
+  var rawDataSheet = _getOrCreateSheet(spreadsheet, RAW_DATA_SHEET_NAME);
 
   _setupJobPrioritySheet(jobSheet);
   _setupSettingsSheet(settingsSheet);
   _setupHelpSheet(helpSheet);
   _setupDedupArchiveSheet(dedupArchiveSheet);
+  _setupRawDataSheet(rawDataSheet);
+}
+
+function ensureWorkbookReadyForRuntime() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var jobSheet = spreadsheet.getSheetByName(JOB_PRIORITY_SHEET_NAME);
+  var settingsSheet = spreadsheet.getSheetByName(SETTINGS_SHEET_NAME);
+  var helpSheet = spreadsheet.getSheetByName(HELP_SHEET_NAME);
+  var dedupArchiveSheet = spreadsheet.getSheetByName(DEDUP_ARCHIVE_SHEET_NAME);
+  var rawDataSheet = spreadsheet.getSheetByName(RAW_DATA_SHEET_NAME);
+  var existingHeaders = [];
+
+  if (!jobSheet || !settingsSheet || !helpSheet || !dedupArchiveSheet || !rawDataSheet) {
+    setupJobPriorityWorkbook();
+    return;
+  }
+
+  if (jobSheet.getMaxRows() < JOB_PRIORITY_DATA_START_ROW) {
+    setupJobPriorityWorkbook();
+    return;
+  }
+
+  if (jobSheet.getLastRow() < JOB_PRIORITY_HEADER_ROW) {
+    _setupJobPrioritySheet(jobSheet);
+    return;
+  }
+
+  existingHeaders = jobSheet.getRange(JOB_PRIORITY_HEADER_ROW, 1, 1, JOB_PRIORITY_COLUMNS.length).getValues()[0] || [];
+  if (jobSheet.getMaxColumns() < JOB_PRIORITY_COLUMNS.length || !_headerMatches(existingHeaders, JOB_PRIORITY_COLUMNS)) {
+    _syncJobPrioritySchemaForRuntime(jobSheet);
+  }
+
+  if (rawDataSheet.getMaxColumns() < RAW_DATA_COLUMNS.length ||
+      rawDataSheet.getLastRow() < 1 ||
+      !_headerMatches(rawDataSheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).getValues()[0], RAW_DATA_COLUMNS)) {
+    _setupRawDataSheet(rawDataSheet);
+  }
 }
 
 function getSettingsMap() {
@@ -125,37 +175,32 @@ function getSettingsMap() {
 
 function getExistingJobIndex() {
   var records = getExistingJobRecords();
-  var groupedByCanonical = {};
-  var sheet = _getJobPrioritySheet();
   var byJobId = {};
-  var byCanonicalRoleKey = {};
+  var groupedByJobId = {};
 
   records.forEach(function(record) {
     if (record.jobId) {
-      byJobId[String(record.jobId)] = record;
-    }
-    if (record.canonicalRoleKey) {
-      if (!groupedByCanonical[record.canonicalRoleKey]) {
-        groupedByCanonical[record.canonicalRoleKey] = [];
+      if (!groupedByJobId[record.jobId]) {
+        groupedByJobId[record.jobId] = [];
       }
-      groupedByCanonical[record.canonicalRoleKey].push(record);
+      groupedByJobId[record.jobId].push(record);
     }
   });
 
-  Object.keys(groupedByCanonical).forEach(function(canonicalRoleKey) {
-    byCanonicalRoleKey[canonicalRoleKey] = _mergeDuplicateJobRecords(groupedByCanonical[canonicalRoleKey]);
+  Object.keys(groupedByJobId).forEach(function(jobId) {
+    byJobId[jobId] = _mergeDuplicateJobRecordsByJobId(groupedByJobId[jobId]);
   });
 
   return {
     records: records,
-    byJobId: byJobId,
-    byCanonicalRoleKey: byCanonicalRoleKey
+    byJobId: byJobId
   };
 }
 
 function getExistingJobRecords() {
   var sheet = _getJobPrioritySheet();
   var lastRow = sheet.getLastRow();
+  var rawDataIndex = getRawDataIndex();
 
   if (lastRow < JOB_PRIORITY_DATA_START_ROW) {
     return [];
@@ -176,7 +221,7 @@ function getExistingJobRecords() {
   ).getFormulas();
 
   return values.reduce(function(records, row, rowOffset) {
-    var record = _sheetRowToJobRecord(row, formulas[rowOffset], JOB_PRIORITY_DATA_START_ROW + rowOffset);
+    var record = _sheetRowToJobRecord(row, formulas[rowOffset], JOB_PRIORITY_DATA_START_ROW + rowOffset, rawDataIndex.byJobId);
 
     if (record) {
       records.push(record);
@@ -192,6 +237,7 @@ function writeJobs(rows) {
   }
 
   var sheet = _getJobPrioritySheet();
+  _upsertRawDataRows(rows);
   var updates = [];
   var appends = [];
 
@@ -219,10 +265,153 @@ function writeJobs(rows) {
   _applyStatusValidation(sheet);
 }
 
+function getRawDataIndex() {
+  var sheet = _getRawDataSheet();
+  var lastRow = sheet ? sheet.getLastRow() : 0;
+  var byJobId = {};
+
+  if (!sheet || lastRow < 2) {
+    return {
+      byJobId: byJobId
+    };
+  }
+
+  var values = sheet.getRange(2, 1, lastRow - 1, RAW_DATA_COLUMNS.length).getValues();
+
+  values.forEach(function(row, offset) {
+    var jobId = _extractLinkedInJobId(row[0]) || _stringifyField(row[0]);
+    if (!jobId) {
+      return;
+    }
+
+    byJobId[jobId] = {
+      rowNumber: offset + 2,
+      jobId: jobId,
+      sourceJd: row[1] || '',
+      sourceTask: row[2] || '',
+      sourceUrl: row[3] || '',
+      rawRef: row[4] || '',
+      updatedAt: row[5] || ''
+    };
+  });
+
+  return {
+    byJobId: byJobId
+  };
+}
+
+function repairJobLinksFromRawRefRows() {
+  var sheet = _getJobPrioritySheet();
+  var records = getExistingJobRecords();
+  var updates = [];
+  var checkedCount = 0;
+  var updatedCount = 0;
+  var recoveredJobIdCount = 0;
+  var missingRawRefCount = 0;
+  var missingJobIdCount = 0;
+  var sampleErrors = [];
+
+  records.forEach(function(record) {
+    var extractedJobId = '';
+    var canonicalLink = '';
+    var currentLink = _extractUrlFromHyperlinkFormula(record.jobLinkFormula) || _stringifyField(record.jobLinkCellValue);
+
+    checkedCount += 1;
+
+    extractedJobId = _extractLinkedInJobId(record.jobId) || _extractLinkedInJobIdFromRawRef(record.rawRef);
+    canonicalLink = _buildLinkedInJobUrlFromJobId(extractedJobId);
+
+    if (!canonicalLink) {
+      if (!_stringifyField(record.rawRef)) {
+        missingRawRefCount += 1;
+      }
+      missingJobIdCount += 1;
+      if (sampleErrors.length < 5) {
+        sampleErrors.push((record.company || '(unknown company)') + ' — ' + (record.title || '(unknown title)'));
+      }
+      return;
+    }
+
+    if (_stringifyField(record.jobId) === extractedJobId && currentLink === canonicalLink) {
+      return;
+    }
+
+    updates.push({
+      rowNumber: record.rowNumber,
+      jobId: extractedJobId || '',
+      jobLink: canonicalLink
+    });
+  });
+
+  updates.forEach(function(update) {
+    sheet.getRange(update.rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_id).setValue(update.jobId);
+    sheet.getRange(update.rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_link).setFormula(_buildJobLinkFormula(update.jobLink));
+    recoveredJobIdCount += 1;
+    updatedCount += 1;
+  });
+
+  return {
+    checkedCount: checkedCount,
+    updatedCount: updatedCount,
+    recoveredJobIdCount: recoveredJobIdCount,
+    missingRawRefCount: missingRawRefCount,
+    missingJobIdCount: missingJobIdCount,
+    sampleErrors: sampleErrors
+  };
+}
+
+function migrateRawDataToDedicatedSheet() {
+  var sheet = _getJobPrioritySheet();
+  var records = getExistingJobRecords();
+  var migratedCount = 0;
+  var skippedCount = 0;
+  var missingJobIdCount = 0;
+  var lastRow = sheet.getLastRow();
+
+  if (!records.length) {
+    return {
+      checkedCount: 0,
+      migratedCount: 0,
+      skippedCount: 0,
+      missingJobIdCount: 0
+    };
+  }
+
+  migratedCount = _upsertRawDataRows(records);
+
+  records.forEach(function(record) {
+    if (!record.jobId) {
+      missingJobIdCount += 1;
+      return;
+    }
+
+    if (_hasAnyRawPayload(record)) {
+      return;
+    }
+
+    skippedCount += 1;
+  });
+
+  if (lastRow >= JOB_PRIORITY_DATA_START_ROW) {
+    _clearMainSheetRawPayloadColumns(sheet, lastRow - JOB_PRIORITY_DATA_START_ROW + 1);
+  }
+
+  return {
+    checkedCount: records.length,
+    migratedCount: migratedCount,
+    skippedCount: skippedCount,
+    missingJobIdCount: missingJobIdCount
+  };
+}
+
 function replaceAllJobs(rows) {
   var sheet = _getJobPrioritySheet();
   var existingLastRow = sheet.getLastRow();
   var clearRowCount = Math.max(existingLastRow - JOB_PRIORITY_DATA_START_ROW + 1, 0);
+
+  if (rows && rows.length) {
+    _upsertRawDataRows(rows);
+  }
 
   if (clearRowCount > 0) {
     sheet.getRange(
@@ -248,11 +437,11 @@ function replaceAllJobs(rows) {
 
 function deduplicateExistingJobRows() {
   var records = getExistingJobRecords();
-  var groupedByCanonical = _groupJobRecordsByCanonicalRole(records);
-  var groupedEntries = Object.keys(groupedByCanonical).map(function(canonicalRoleKey) {
-    var groupRecords = groupedByCanonical[canonicalRoleKey];
+  var groupedByJobId = _groupJobRecordsByJobId(records);
+  var groupedEntries = Object.keys(groupedByJobId).map(function(jobId) {
+    var groupRecords = groupedByJobId[jobId];
     return {
-      canonicalRoleKey: canonicalRoleKey,
+      jobId: jobId,
       records: groupRecords,
       firstRowNumber: groupRecords.reduce(function(minRowNumber, record) {
         return Math.min(minRowNumber, Number(record.rowNumber || 0) || JOB_PRIORITY_DATA_START_ROW);
@@ -278,13 +467,12 @@ function deduplicateExistingJobRows() {
     removedRowCount += entry.records.length - 1;
 
     var metadataWinner = entry.records.slice().sort(_compareJobRecencyDesc)[0];
-    var mergedRecord = _mergeDuplicateJobRecords(entry.records);
+    var mergedRecord = _mergeDuplicateJobRecordsByJobId(entry.records);
 
     entry.records.forEach(function(record) {
       if (record.rowNumber !== metadataWinner.rowNumber) {
         var archivedRecord = _cloneJobRecord(record);
         archivedRecord.dedupedAt = dedupedAt;
-        archivedRecord.canonicalRoleKey = entry.canonicalRoleKey;
         archiveRows.push(archivedRecord);
       }
     });
@@ -304,6 +492,201 @@ function deduplicateExistingJobRows() {
     archivedRowCount: archiveRows.length,
     finalRowCount: mergedRecords.length || records.length
   };
+}
+
+function pruneExpiredJobRows() {
+  var EXPIRY_DAYS = 45;
+  var now = new Date();
+  var expiryMs = EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+  var records = getExistingJobRecords();
+  var keepRecords = [];
+  var archiveRows = [];
+  var prunedAt = new Date();
+
+  records.forEach(function(record) {
+    if (record.status === 'Applied') {
+      keepRecords.push(record);
+      return;
+    }
+
+    var ageRef = record.postedSort || record.importedAt;
+    var ageTime = _toComparableTime(ageRef);
+
+    if (!ageTime || (now.getTime() - ageTime) <= expiryMs) {
+      keepRecords.push(record);
+      return;
+    }
+
+    var archived = _cloneJobRecord(record);
+    archived.dedupedAt = prunedAt;
+    archiveRows.push(archived);
+  });
+
+  if (archiveRows.length) {
+    _appendDedupArchiveRows(archiveRows);
+    replaceAllJobs(keepRecords);
+    sortAndRankJobs();
+  }
+
+  return {
+    checkedCount: records.length,
+    prunedCount: archiveRows.length,
+    remainingCount: keepRecords.length
+  };
+}
+
+function deduplicateSimilarJdRows() {
+  var JD_SIMILARITY_THRESHOLD = 0.80;
+  var records = getExistingJobRecords();
+
+  if (!records.length) {
+    return { duplicateGroupCount: 0, removedRowCount: 0, archivedRowCount: 0, finalRowCount: 0 };
+  }
+
+  _precomputeJdFingerprints(records);
+
+  var byCompany = {};
+  var noJdRecords = [];
+
+  records.forEach(function(record) {
+    var companyKey = _normalizeJdText(record.company || '');
+    if (!record._bigramCount || !companyKey) {
+      noJdRecords.push(record);
+      return;
+    }
+    if (!byCompany[companyKey]) {
+      byCompany[companyKey] = [];
+    }
+    byCompany[companyKey].push(record);
+  });
+
+  var mergedRecords = noJdRecords.slice();
+  var archiveRows = [];
+  var duplicateGroupCount = 0;
+  var removedRowCount = 0;
+  var dedupedAt = new Date();
+
+  Object.keys(byCompany).forEach(function(companyKey) {
+    var groups = _clusterSimilarJdRecords(byCompany[companyKey], JD_SIMILARITY_THRESHOLD);
+
+    groups.forEach(function(group) {
+      if (group.length === 1) {
+        mergedRecords.push(group[0]);
+        return;
+      }
+
+      duplicateGroupCount += 1;
+      removedRowCount += group.length - 1;
+
+      var merged = _mergeSimilarJdGroup(group);
+
+      group.forEach(function(record) {
+        if (record.rowNumber !== merged.rowNumber) {
+          var archived = _cloneJobRecord(record);
+          archived.dedupedAt = dedupedAt;
+          archiveRows.push(archived);
+        }
+      });
+
+      mergedRecords.push(merged);
+    });
+  });
+
+  if (archiveRows.length) {
+    _appendDedupArchiveRows(archiveRows);
+    replaceAllJobs(mergedRecords);
+    sortAndRankJobs();
+  }
+
+  return {
+    duplicateGroupCount: duplicateGroupCount,
+    removedRowCount: removedRowCount,
+    archivedRowCount: archiveRows.length,
+    finalRowCount: mergedRecords.length
+  };
+}
+
+function _clusterSimilarJdRecords(records, threshold) {
+  var groups = [];
+  var assigned = {};
+
+  records.forEach(function(record, i) {
+    if (assigned[i]) return;
+
+    var group = [record];
+    assigned[i] = true;
+
+    for (var j = i + 1; j < records.length; j += 1) {
+      if (assigned[j]) continue;
+      if (!_titlesSanityCheck(record.title, records[j].title)) continue;
+      if (_areLikelySameJd(record, records[j], threshold)) {
+        group.push(records[j]);
+        assigned[j] = true;
+      }
+    }
+
+    groups.push(group);
+  });
+
+  return groups;
+}
+
+function _mergeSimilarJdGroup(records) {
+  // Newest posting wins for job ID / link / metadata (live posting)
+  var newestRecord = records.slice().sort(_compareJobRecencyDesc)[0];
+  // Richest manual state wins for status / notes
+  var manualWinner = _pickRichestManualJobRecord(records);
+  // Most recently scored record wins for AI fields
+  var scoredRecords = records.filter(function(r) {
+    return r.score !== '' && r.score !== undefined && r.score !== null;
+  });
+  var scoringWinner = scoredRecords.length
+    ? scoredRecords.slice().sort(function(a, b) {
+        return _toComparableTime(b.scoredAt) - _toComparableTime(a.scoredAt);
+      })[0]
+    : null;
+
+  var merged = _cloneJobRecord(newestRecord);
+
+  if (scoringWinner) {
+    merged.score = scoringWinner.score;
+    merged.priority = scoringWinner.priority;
+    merged.usVisaSponsorshipPotential = scoringWinner.usVisaSponsorshipPotential;
+    merged.usVisaReason = scoringWinner.usVisaReason;
+    merged.summary = scoringWinner.summary;
+    merged.why = scoringWinner.why;
+    merged.angle = scoringWinner.angle;
+    merged.scoringFingerprint = scoringWinner.scoringFingerprint;
+    merged.scoredAt = scoringWinner.scoredAt;
+  }
+
+  merged.status = manualWinner.status || merged.status || 'New';
+  merged.notes = manualWinner.notes || merged.notes || '';
+
+  // Concatenate all unique locations across the group
+  var seenLocations = {};
+  var locations = [];
+  records.forEach(function(record) {
+    var loc = _stringifyField(record.location).trim();
+    if (loc && !seenLocations[loc.toLowerCase()]) {
+      seenLocations[loc.toLowerCase()] = true;
+      locations.push(loc);
+    }
+  });
+  if (locations.length > 1) {
+    merged.location = locations.join(' | ');
+  }
+
+  // Earliest importedAt across the group
+  var earliestImport = records.reduce(function(earliest, record) {
+    var t = _toComparableTime(record.importedAt);
+    return t && (!earliest || t < _toComparableTime(earliest)) ? record.importedAt : earliest;
+  }, null);
+  if (earliestImport) {
+    merged.importedAt = earliestImport;
+  }
+
+  return merged;
 }
 
 function sortAndRankJobs() {
@@ -371,7 +754,13 @@ function _getDedupArchiveSheet() {
   return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEDUP_ARCHIVE_SHEET_NAME);
 }
 
+function _getRawDataSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RAW_DATA_SHEET_NAME);
+}
+
 function _setupJobPrioritySheet(sheet) {
+  var existingColumnWidths = _captureJobPriorityColumnWidths(sheet);
+
   _ensureSheetDimensions(sheet, JOB_PRIORITY_COLUMNS.length, JOB_PRIORITY_DATA_START_ROW);
   _remapJobPriorityDataIfNeeded(sheet);
 
@@ -384,12 +773,12 @@ function _setupJobPrioritySheet(sheet) {
   sheet.getRange('L1').setValue('');
   sheet.getRange('E2').setValue('Scraped');
   sheet.getRange('F2:G2').merge().setValue('');
-  sheet.getRange('H2').setValue('Unique roles');
+  sheet.getRange('H2').setValue('Unique jobs');
   sheet.getRange('I2:J2').merge().setValue('');
   sheet.getRange('K2').setValue('To score');
   sheet.getRange('L2').setValue('');
   sheet.getRange('E3').setValue('New jobs');
-  sheet.getRange('G3').setValue('A jobs');
+  sheet.getRange('G3').setValue('P01 jobs');
   sheet.getRange('I3').setValue('Failed');
   sheet.getRange('K3:L3').clearContent();
   sheet.getRange('E4').setValue('Errors');
@@ -422,7 +811,7 @@ function _setupJobPrioritySheet(sheet) {
   ).setNumberFormat('0');
 
   _applyStatusValidation(sheet);
-  _applyColumnWidths(sheet);
+  _applyColumnWidths(sheet, existingColumnWidths);
   _applyWrappedColumns(sheet);
   _applyStatusFormattingRules(sheet);
 }
@@ -434,6 +823,30 @@ function _setupDedupArchiveSheet(sheet) {
     .setFontWeight('bold')
     .setBackground('#f4cccc');
   sheet.setFrozenRows(1);
+}
+
+function _setupRawDataSheet(sheet) {
+  _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
+  sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
+  sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length)
+    .setFontWeight('bold')
+    .setBackground('#d0e0e3');
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(1, 120);
+  sheet.setColumnWidth(2, 180);
+  sheet.setColumnWidth(3, 140);
+  sheet.setColumnWidth(4, 160);
+  sheet.setColumnWidth(5, 180);
+  sheet.setColumnWidth(6, 140);
+  sheet.hideColumns(2, RAW_DATA_COLUMNS.length - 1);
+}
+
+function _syncJobPrioritySchemaForRuntime(sheet) {
+  _ensureSheetDimensions(sheet, JOB_PRIORITY_COLUMNS.length, JOB_PRIORITY_DATA_START_ROW);
+  _remapJobPriorityDataIfNeeded(sheet);
+  sheet.getRange(JOB_PRIORITY_HEADER_ROW, 1, 1, JOB_PRIORITY_COLUMNS.length).setValues([JOB_PRIORITY_COLUMNS]);
+  sheet.hideColumns(JOB_PRIORITY_VISIBLE_COLUMNS.length + 1, JOB_PRIORITY_HIDDEN_COLUMNS.length);
+  _applyStatusValidation(sheet);
 }
 
 function _remapJobPriorityDataIfNeeded(sheet) {
@@ -596,28 +1009,56 @@ function _applyStatusFormattingRules(sheet) {
   sheet.setConditionalFormatRules(filteredRules);
 }
 
-function _applyColumnWidths(sheet) {
-  var widths = {
-    1: 60,
-    2: 70,
-    3: 70,
-    4: 90,
-    5: 170,
-    6: 240,
-    7: 110,
-    8: 150,
-    9: 110,
-    10: 95,
-    11: 90,
-    12: 260,
-    13: 300,
-    14: 280,
-    15: 240,
-    16: 130
+function _captureJobPriorityColumnWidths(sheet) {
+  var widthByHeader = {};
+  var maxColumns = sheet.getMaxColumns();
+
+  if (maxColumns < 1 || sheet.getMaxRows() < JOB_PRIORITY_HEADER_ROW) {
+    return widthByHeader;
+  }
+
+  var existingHeaders = sheet.getRange(JOB_PRIORITY_HEADER_ROW, 1, 1, maxColumns).getValues()[0] || [];
+
+  existingHeaders.forEach(function(header, index) {
+    var key = _stringifyField(header);
+    if (!key) {
+      return;
+    }
+    widthByHeader[key] = sheet.getColumnWidth(index + 1);
+  });
+
+  return widthByHeader;
+}
+
+function _applyColumnWidths(sheet, existingColumnWidths) {
+  var widthByColumnName = {
+    rank: 60,
+    priority: 70,
+    score: 70,
+    us_visa: 90,
+    company: 170,
+    title: 240,
+    title_level: 110,
+    jd_implied_level: 130,
+    status: 110,
+    location: 150,
+    posted: 110,
+    applicants: 95,
+    job_link: 90,
+    summary: 260,
+    why: 300,
+    angle: 280,
+    notes: 240,
+    source_jd: 130,
+    us_visa_reason: 200
   };
 
-  Object.keys(widths).forEach(function(columnIndex) {
-    sheet.setColumnWidth(Number(columnIndex), widths[columnIndex]);
+  Object.keys(widthByColumnName).forEach(function(columnName) {
+    var columnIndex = JOB_PRIORITY_COLUMN_INDEX[columnName];
+    var width = existingColumnWidths && existingColumnWidths[columnName]
+      ? existingColumnWidths[columnName]
+      : widthByColumnName[columnName];
+    sheet.setColumnWidth(columnIndex, width);
   });
 }
 
@@ -638,9 +1079,20 @@ function _applyWrappedColumns(sheet) {
     Math.max(sheet.getMaxRows() - JOB_PRIORITY_DATA_START_ROW + 1, 1),
     1
   ).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+
+  sheet.getRange(
+    JOB_PRIORITY_DATA_START_ROW,
+    JOB_PRIORITY_COLUMN_INDEX.us_visa_reason,
+    Math.max(sheet.getMaxRows() - JOB_PRIORITY_DATA_START_ROW + 1, 1),
+    1
+  ).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 }
 
-function _toSheetRow(job) {
+function _toSheetRow(job, options) {
+  options = options || {};
+  var includeRawData = options.includeRawData === true;
+  var jobUrl = _buildLinkedInJobUrlFromJobId(job.jobId) || job.jobLink || job.sourceUrl || '';
+
   return [
     '',
     job.priority || '',
@@ -648,25 +1100,27 @@ function _toSheetRow(job) {
     job.usVisaSponsorshipPotential || '',
     job.company || '',
     job.title || '',
+    job.titleLevel || '',
+    job.jdImpliedLevel || '',
     job.status || 'New',
     job.location || '',
     job.posted || '',
     job.applicants || '',
-    _buildJobLinkFormula(job.jobLink),
+    _buildJobLinkFormula(jobUrl),
     job.summary || '',
     job.why || '',
+    job.usVisaReason || '',
     job.angle || '',
     job.notes || '',
-    job.jobDescription || '',
+    includeRawData ? (job.jobDescription || '') : '',
     job.jobId || '',
     job.importedAt || '',
     job.scoredAt || '',
-    job.sourceTask || '',
+    includeRawData ? (job.sourceTask || '') : '',
     job.postedSort || '',
-    job.sourceUrl || '',
-    job.otherLocations || '',
-    job.canonicalRoleKey || _buildCanonicalRoleKey(job.company, job.title, job.jobDescription || ''),
-    job.rawRef || ''
+    includeRawData ? (job.sourceUrl || '') : '',
+    job.scoringFingerprint || '',
+    includeRawData ? (job.rawRef || '') : ''
   ];
 }
 
@@ -717,19 +1171,29 @@ function _statusSortRank(status) {
 }
 
 function _prioritySortRank(priority) {
-  var normalized = _stringifyField(priority);
+  var normalized = _stringifyField(priority).toUpperCase();
   var order = {
+    P01: 0,
+    P02: 1,
+    P03: 2,
+    P04: 3,
+    P05: 4,
+    P06: 5,
+    P07: 6,
+    P08: 7,
+    P09: 8,
+    P10: 9,
     A: 0,
-    B: 1,
-    C: 2,
-    Skip: 3
+    B: 4,
+    C: 6,
+    SKIP: 9
   };
 
   if (order.hasOwnProperty(normalized)) {
     return order[normalized];
   }
 
-  return 4;
+  return 10;
 }
 
 function _columnToLetter(columnNumber) {
@@ -745,8 +1209,12 @@ function _columnToLetter(columnNumber) {
   return letter;
 }
 
-function _sheetRowToJobRecord(row, formulas, rowNumber) {
-  var jobId = row[JOB_PRIORITY_COLUMN_INDEX.job_id - 1];
+function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
+  var rowRawRef = row[JOB_PRIORITY_COLUMN_INDEX.raw_ref - 1] || '';
+  var rawJobId = _stringifyField(row[JOB_PRIORITY_COLUMN_INDEX.job_id - 1]);
+  var jobId = _extractLinkedInJobId(rawJobId) || rawJobId || _extractLinkedInJobIdFromRawRef(rowRawRef);
+  var rawData = rawDataByJobId && jobId ? rawDataByJobId[jobId] : null;
+  var rawRef = rawData && _stringifyField(rawData.rawRef) ? rawData.rawRef : rowRawRef;
   var company = row[JOB_PRIORITY_COLUMN_INDEX.company - 1];
   var title = row[JOB_PRIORITY_COLUMN_INDEX.title - 1];
 
@@ -754,11 +1222,12 @@ function _sheetRowToJobRecord(row, formulas, rowNumber) {
     return null;
   }
 
-  var sourceUrl = row[JOB_PRIORITY_COLUMN_INDEX.source_url - 1] || '';
+  var sourceUrl = (rawData && rawData.sourceUrl) || row[JOB_PRIORITY_COLUMN_INDEX.source_url - 1] || '';
   var jobLinkFormula = formulas[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
-  var jobLink = _extractUrlFromHyperlinkFormula(jobLinkFormula) || _buildCanonicalLinkedInJobUrl(jobId, sourceUrl) || sourceUrl;
-  var jobDescription = row[JOB_PRIORITY_COLUMN_INDEX.source_jd - 1] || '';
-  var canonicalRoleKey = row[JOB_PRIORITY_COLUMN_INDEX.canonical_role_key - 1] || _buildCanonicalRoleKey(company, title, jobDescription);
+  var jobLinkCellValue = row[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
+  var jobLink = _extractUrlFromHyperlinkFormula(jobLinkFormula) || _buildLinkedInJobUrlFromJobId(jobId) || sourceUrl;
+  var jobDescription = (rawData && rawData.sourceJd) || row[JOB_PRIORITY_COLUMN_INDEX.source_jd - 1] || '';
+  var sourceTask = (rawData && rawData.sourceTask) || row[JOB_PRIORITY_COLUMN_INDEX.source_task - 1] || '';
 
   return {
     rowNumber: rowNumber,
@@ -773,20 +1242,24 @@ function _sheetRowToJobRecord(row, formulas, rowNumber) {
     posted: row[JOB_PRIORITY_COLUMN_INDEX.posted - 1] || '',
     applicants: row[JOB_PRIORITY_COLUMN_INDEX.applicants - 1] || '',
     jobLink: jobLink || '',
+    jobLinkFormula: jobLinkFormula,
+    jobLinkCellValue: jobLinkCellValue,
+    titleLevel: row[JOB_PRIORITY_COLUMN_INDEX.title_level - 1] || '',
+    jdImpliedLevel: row[JOB_PRIORITY_COLUMN_INDEX.jd_implied_level - 1] || '',
     summary: row[JOB_PRIORITY_COLUMN_INDEX.summary - 1] || '',
     why: row[JOB_PRIORITY_COLUMN_INDEX.why - 1] || '',
     angle: row[JOB_PRIORITY_COLUMN_INDEX.angle - 1] || '',
     notes: row[JOB_PRIORITY_COLUMN_INDEX.notes - 1] || '',
     jobDescription: jobDescription,
+    usVisaReason: row[JOB_PRIORITY_COLUMN_INDEX.us_visa_reason - 1] || '',
     jobId: jobId || '',
     importedAt: row[JOB_PRIORITY_COLUMN_INDEX.imported_at - 1] || '',
     scoredAt: row[JOB_PRIORITY_COLUMN_INDEX.scored_at - 1] || '',
-    sourceTask: row[JOB_PRIORITY_COLUMN_INDEX.source_task - 1] || '',
+    sourceTask: sourceTask,
     postedSort: row[JOB_PRIORITY_COLUMN_INDEX.posted_sort - 1] || '',
     sourceUrl: sourceUrl,
-    otherLocations: row[JOB_PRIORITY_COLUMN_INDEX.other_locations - 1] || '',
-    canonicalRoleKey: canonicalRoleKey,
-    rawRef: row[JOB_PRIORITY_COLUMN_INDEX.raw_ref - 1] || ''
+    scoringFingerprint: row[JOB_PRIORITY_COLUMN_INDEX.scoring_fingerprint - 1] || '',
+    rawRef: rawRef
   };
 }
 
@@ -796,6 +1269,100 @@ function _extractUrlFromHyperlinkFormula(formula) {
   return match ? match[1] : '';
 }
 
+function _extractJobDescriptionFromRawRef(rawRef) {
+  var parsed;
+  var description = '';
+  var keys = ['jobDescription', 'descriptionText', 'description', 'job_description', 'details'];
+
+  if (!_stringifyField(rawRef)) {
+    return '';
+  }
+
+  try {
+    parsed = JSON.parse(String(rawRef));
+    description = _pickFirstValue(parsed || {}, keys);
+    description = _truncate(_cleanJobDescription(description), 12000);
+    if (description) {
+      return description;
+    }
+  } catch (error) {
+    // Fall through to a regex-based recovery attempt for older truncated rows.
+  }
+
+  for (var i = 0; i < keys.length; i += 1) {
+    description = _extractJsonStringField(rawRef, keys[i]);
+    description = _truncate(_cleanJobDescription(description), 12000);
+    if (description) {
+      return description;
+    }
+  }
+
+  return '';
+}
+
+function _extractLinkedInJobIdFromRawRef(rawRef) {
+  var parsed;
+  var directJobId = '';
+  var keys = ['linkedinJobId', 'jobId', 'jobPostingId'];
+
+  if (!_stringifyField(rawRef)) {
+    return '';
+  }
+
+  try {
+    parsed = JSON.parse(String(rawRef));
+    directJobId = _extractLinkedInJobId(_pickFirstValue(parsed || {}, keys));
+    if (directJobId) {
+      return directJobId;
+    }
+  } catch (error) {
+    // Fall through to regex extraction for older rows.
+  }
+
+  for (var i = 0; i < keys.length; i += 1) {
+    directJobId = _extractLinkedInJobId(_extractJsonScalarField(rawRef, keys[i]));
+    if (directJobId) {
+      return directJobId;
+    }
+  }
+
+  return '';
+}
+
+function _extractJsonStringField(rawText, fieldName) {
+  var pattern = new RegExp('"' + fieldName.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&') + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', 'i');
+  var match = String(rawText || '').match(pattern);
+
+  if (!match || !match[1]) {
+    return '';
+  }
+
+  try {
+    return JSON.parse('"' + match[1] + '"');
+  } catch (error) {
+    return '';
+  }
+}
+
+function _extractJsonScalarField(rawText, fieldName) {
+  var pattern = new RegExp('"' + fieldName.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&') + '"\\s*:\\s*("((?:\\\\.|[^"\\\\])*)"|[-]?\\d+)', 'i');
+  var match = String(rawText || '').match(pattern);
+
+  if (!match || !match[1]) {
+    return '';
+  }
+
+  if (match[2] !== undefined) {
+    try {
+      return JSON.parse('"' + match[2] + '"');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  return match[1];
+}
+
 function _appendDedupArchiveRows(rows) {
   if (!rows || !rows.length) {
     return;
@@ -803,30 +1370,124 @@ function _appendDedupArchiveRows(rows) {
 
   var sheet = _getDedupArchiveSheet();
   var outputRows = rows.map(function(row) {
-    return [
-      row.dedupedAt || '',
-      row.canonicalRoleKey || '',
-      _toSheetRow(row)
-    ];
-  }).map(function(row) {
-    return [row[0], row[1]].concat(row[2]);
+    return [row.dedupedAt || ''].concat(_toSheetRow(row, { includeRawData: true }));
   });
   var startRow = Math.max(sheet.getLastRow() + 1, 2);
   sheet.getRange(startRow, 1, outputRows.length, DEDUP_ARCHIVE_COLUMNS.length).setValues(outputRows);
 }
 
-function _groupJobRecordsByCanonicalRole(records) {
-  return records.reduce(function(groups, record) {
-    var canonicalRoleKey = record.canonicalRoleKey || _buildCanonicalRoleKey(record.company, record.title, record.jobDescription);
-    if (!groups[canonicalRoleKey]) {
-      groups[canonicalRoleKey] = [];
+function _upsertRawDataRows(jobs) {
+  if (!jobs || !jobs.length) {
+    return 0;
+  }
+
+  var sheet = _getRawDataSheet() || _getOrCreateSheet(SpreadsheetApp.getActiveSpreadsheet(), RAW_DATA_SHEET_NAME);
+  if (sheet.getMaxColumns() < RAW_DATA_COLUMNS.length || sheet.getLastRow() < 1) {
+    _setupRawDataSheet(sheet);
+  }
+  var rawDataIndex = getRawDataIndex().byJobId;
+  var updates = [];
+  var appends = [];
+  var writtenJobIds = {};
+  var updatedAt = new Date();
+  var writtenCount = 0;
+
+  jobs.forEach(function(job) {
+    var jobId = _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId);
+    var existing = null;
+    var payload = null;
+
+    if (!jobId || writtenJobIds[jobId]) {
+      return;
     }
-    groups[canonicalRoleKey].push(record);
+
+    existing = rawDataIndex[jobId] || null;
+    payload = _buildRawDataPayload(job, existing, updatedAt);
+
+    if (!_hasAnyRawPayload(payload)) {
+      return;
+    }
+
+    writtenJobIds[jobId] = true;
+
+    if (existing) {
+      updates.push({
+        rowNumber: existing.rowNumber,
+        values: _toRawDataRow(payload)
+      });
+    } else {
+      appends.push(_toRawDataRow(payload));
+    }
+
+    writtenCount += 1;
+  });
+
+  updates.forEach(function(update) {
+    sheet.getRange(update.rowNumber, 1, 1, RAW_DATA_COLUMNS.length).setValues([update.values]);
+  });
+
+  if (appends.length) {
+    var startRow = Math.max(sheet.getLastRow() + 1, 2);
+    sheet.getRange(startRow, 1, appends.length, RAW_DATA_COLUMNS.length).setValues(appends);
+  }
+
+  return writtenCount;
+}
+
+function _buildRawDataPayload(job, existing, updatedAt) {
+  return {
+    jobId: _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId),
+    sourceJd: _stringifyField(job && job.jobDescription) || (existing && existing.sourceJd) || '',
+    sourceTask: _stringifyField(job && job.sourceTask) || (existing && existing.sourceTask) || '',
+    sourceUrl: _stringifyField(job && job.sourceUrl) || (existing && existing.sourceUrl) || '',
+    rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || '',
+    updatedAt: updatedAt || new Date()
+  };
+}
+
+function _toRawDataRow(rawData) {
+  return [
+    rawData.jobId || '',
+    rawData.sourceJd || '',
+    rawData.sourceTask || '',
+    rawData.sourceUrl || '',
+    rawData.rawRef || '',
+    rawData.updatedAt || ''
+  ];
+}
+
+function _hasAnyRawPayload(record) {
+  return !!(
+    _stringifyField(record && record.jobDescription) ||
+    _stringifyField(record && record.sourceTask) ||
+    _stringifyField(record && record.sourceUrl) ||
+    _stringifyField(record && record.rawRef)
+  );
+}
+
+function _clearMainSheetRawPayloadColumns(sheet, rowCount) {
+  [
+    JOB_PRIORITY_COLUMN_INDEX.source_jd,
+    JOB_PRIORITY_COLUMN_INDEX.source_task,
+    JOB_PRIORITY_COLUMN_INDEX.source_url,
+    JOB_PRIORITY_COLUMN_INDEX.raw_ref
+  ].forEach(function(columnIndex) {
+    sheet.getRange(JOB_PRIORITY_DATA_START_ROW, columnIndex, Math.max(rowCount, 1), 1).clearContent();
+  });
+}
+
+function _groupJobRecordsByJobId(records) {
+  return records.reduce(function(groups, record) {
+    var jobId = _stringifyField(record.jobId) || ('row_' + String(record.rowNumber || ''));
+    if (!groups[jobId]) {
+      groups[jobId] = [];
+    }
+    groups[jobId].push(record);
     return groups;
   }, {});
 }
 
-function _mergeDuplicateJobRecords(records) {
+function _mergeDuplicateJobRecordsByJobId(records) {
   if (!records || !records.length) {
     return null;
   }
@@ -834,16 +1495,9 @@ function _mergeDuplicateJobRecords(records) {
   var metadataWinner = records.slice().sort(_compareJobRecencyDesc)[0];
   var manualWinner = _pickRichestManualJobRecord(records);
   var merged = _cloneJobRecord(metadataWinner);
-  var locationParts = [];
-
-  records.forEach(function(record) {
-    locationParts = locationParts.concat(_collectJobLocations(record));
-  });
 
   merged.status = manualWinner && manualWinner.status ? manualWinner.status : (merged.status || 'New');
   merged.notes = manualWinner && manualWinner.notes ? manualWinner.notes : (merged.notes || '');
-  merged.otherLocations = _formatOtherLocations(locationParts, merged.location);
-  merged.canonicalRoleKey = merged.canonicalRoleKey || _buildCanonicalRoleKey(merged.company, merged.title, merged.jobDescription);
 
   return merged;
 }
@@ -879,59 +1533,6 @@ function _manualWorkflowScore(record) {
   }
 
   return score;
-}
-
-function _collectJobLocations(record) {
-  var locations = [];
-
-  if (_stringifyField(record.location)) {
-    locations.push(_stringifyField(record.location));
-  }
-
-  _splitLocationList(record.otherLocations).forEach(function(location) {
-    locations.push(location);
-  });
-
-  return locations;
-}
-
-function _splitLocationList(value) {
-  if (!value) {
-    return [];
-  }
-
-  return String(value)
-    .split(/\n+/)
-    .map(function(part) {
-      return part.trim();
-    })
-    .filter(function(part) {
-      return part.length > 0;
-    });
-}
-
-function _formatOtherLocations(locations, primaryLocation) {
-  var seen = {};
-  var primaryKey = _normalizeLocationKey(primaryLocation);
-  var output = [];
-
-  locations.forEach(function(location) {
-    var normalized = _normalizeLocationKey(location);
-    var display = _stringifyField(location);
-
-    if (!display || normalized === primaryKey || seen[normalized]) {
-      return;
-    }
-
-    seen[normalized] = true;
-    output.push(display);
-  });
-
-  return output.join('\n');
-}
-
-function _normalizeLocationKey(value) {
-  return _stringifyField(value).toLowerCase().replace(/\s+/g, ' ');
 }
 
 function _cloneJobRecord(job) {

@@ -2,6 +2,7 @@ var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
 var ACTIVE_RUN_STATE_PROPERTY_KEY = 'ACTIVE_JOB_IMPORT_RUN_STATE';
 var RESUME_TRIGGER_HANDLER = 'resumeJobImportAndScoring';
+var BACKUP_RESUME_TRIGGER_DELAY_MS = 7 * 60 * 1000;
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -9,12 +10,18 @@ function onOpen() {
     .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
     .addItem('Run Now', 'runJobImportAndScoring')
     .addItem('Deduplicate Existing Jobs', 'deduplicateExistingJobs')
+    .addItem('Deduplicate Similar JDs', 'deduplicateSimilarJds')
+    .addItem('Prune Expired Jobs', 'pruneExpiredJobs')
+    .addItem('Repair Job Links from Raw Ref', 'repairJobLinksFromRawRef')
+    .addItem('Migrate Raw Data', 'migrateRawData')
+    .addItem('Reevaluate Active Backlog', 'reevaluateActiveBacklog')
+    .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
     .addSeparator()
     .addItem('Import Apify Run ID...', 'importApifyRunByIdPrompt')
     .addItem('Retry Apify Run ID...', 'resurrectApifyRunByIdPrompt')
     .addSeparator()
-    .addItem('Create Hourly Trigger', 'createHourlyTrigger')
-    .addItem('Remove Hourly Triggers', 'removeHourlyTriggers')
+    .addItem('Create Run Trigger', 'createRunTrigger')
+    .addItem('Remove Run Triggers', 'removeHourlyTriggers')
     .addSeparator()
     .addItem('Validate Config', 'validateConfiguration')
     .addToUi();
@@ -37,15 +44,35 @@ function onEdit(e) {
   if (e.range.getRow() < JOB_PRIORITY_DATA_START_ROW || e.range.getColumn() !== JOB_PRIORITY_COLUMN_INDEX.status) {
     return;
   }
-
-  sortAndRankJobs();
 }
 
 function runJobImportAndScoring() {
+  var activeRunState = _loadActiveRunState();
+
+  if (activeRunState && activeRunState.mode === 'reevaluate') {
+    return _runJobReevaluationInternal();
+  }
+
+  // Only enforce quiet hours when starting a fresh run, not when continuing one
+  if (!activeRunState) {
+    var settings = getSettingsMap();
+    var quietStart = _parseHourSetting(settings.QUIET_START_HOUR, 19);
+    var quietEnd = _parseHourSetting(settings.QUIET_END_HOUR, 5);
+    if (_isInQuietHours(quietStart, quietEnd)) {
+      Logger.log('Skipping run: quiet hours active (' + quietStart + ':00 – ' + quietEnd + ':00 PT).');
+      return;
+    }
+  }
+
   return _runJobImportAndScoringInternal();
 }
 
 function resumeJobImportAndScoring() {
+  var activeRunState = _loadActiveRunState();
+  if (activeRunState && activeRunState.mode === 'reevaluate') {
+    return _runJobReevaluationInternal();
+  }
+
   return _runJobImportAndScoringInternal();
 }
 
@@ -86,9 +113,10 @@ function resurrectApifyRunByIdPrompt() {
 function _runJobImportAndScoringInternal(initialActiveRunState) {
   var lock = LockService.getScriptLock();
   var executionStartedAt = new Date();
-  var activeRunState = initialActiveRunState || _loadActiveRunState();
+  var activeRunState = initialActiveRunState || _loadActiveRunState() || _createEmptyImportRunState(executionStartedAt);
   var scoringRunStartedAt = activeRunState && activeRunState.runStartedAt ? new Date(activeRunState.runStartedAt) : executionStartedAt;
   var config = null;
+  var resumedAfterUnexpectedStop = false;
   var progressState = {
     lastRun: executionStartedAt,
     status: 'Starting Apify task',
@@ -106,7 +134,7 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
   lock.waitLock(30000);
 
   try {
-    setupJobPriorityWorkbook();
+    ensureWorkbookReadyForRuntime();
 
     if (initialActiveRunState) {
       _clearActiveRunState();
@@ -116,8 +144,15 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
     config = loadRuntimeConfig();
     config.runStartedAt = scoringRunStartedAt;
     config.activeRunState = activeRunState;
+    resumedAfterUnexpectedStop = _markTrackedExecutionStarted(activeRunState, executionStartedAt);
+    _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
     validateRuntimeConfig(config);
     updateRunSummary(progressState);
+
+    if (resumedAfterUnexpectedStop) {
+      progressState.errorMessage = 'Previous execution stopped unexpectedly, likely due to an Apps Script timeout. Resuming from saved progress.';
+      updateRunSummary(progressState);
+    }
 
     var existingIndex = getExistingJobIndex();
     var result = importAndScoreJobs(config, existingIndex, function(nextState) {
@@ -157,10 +192,11 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
     sortAndRankJobs();
 
     if (result.hasMore) {
+      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
       _saveActiveRunState(result.activeRunState);
       _scheduleResumeTrigger();
 
-      progressState.status = 'Scoring jobs';
+      progressState.status = 'Continuing in next execution';
       progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
       progressState.scrapedCount = result.rawScrapedCount;
       progressState.uniqueRolesCount = result.uniqueRolesCount;
@@ -169,15 +205,35 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
       progressState.aJobsCount = result.aJobsCount;
       progressState.failedJobsCount = result.failedJobsCount;
       progressState.scoredJobsCount = result.scoredJobsCount;
-      progressState.errorMessage = result.errors.length ? _truncate(result.errors.join(' | '), 500) : '';
+      progressState.errorMessage = result.errors.length
+        ? _truncate(result.errors.join(' | '), 500)
+        : 'Continuation scheduled automatically before the Apps Script execution limit.';
       updateRunSummary(progressState);
 
       return result;
     }
 
+    _markTrackedExecutionFinished(result.activeRunState, 'completed');
     _clearActiveRunState();
     _removeResumeTriggers();
-    result.newAJobs = _getJobsByCanonicalKeys(result.newAJobCanonicalKeys || []);
+
+    try {
+      progressState.status = 'Pruning expired jobs';
+      updateRunSummary(progressState);
+      pruneExpiredJobRows();
+    } catch (pruneError) {
+      Logger.log(pruneError);
+    }
+
+    try {
+      progressState.status = 'Deduplicating similar JDs';
+      updateRunSummary(progressState);
+      deduplicateSimilarJdRows();
+    } catch (dedupError) {
+      Logger.log(dedupError);
+    }
+
+    result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
 
     progressState.status = 'Completed';
     progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
@@ -194,6 +250,8 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
 
     return result;
   } catch (error) {
+    _clearActiveRunState();
+    _removeResumeTriggers();
     progressState.status = 'Failed';
     progressState.errorMessage = _truncate(error && error.message ? error.message : String(error), 500);
     updateRunSummary(progressState);
@@ -206,12 +264,18 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
   }
 }
 
-function createHourlyTrigger() {
+function createRunTrigger() {
   removeHourlyTriggers();
+  var settings = getSettingsMap();
+  var intervalHours = _normalizePositiveInteger(settings.RUN_INTERVAL_HOURS || 4, 4, 12);
   ScriptApp.newTrigger('runJobImportAndScoring')
     .timeBased()
-    .everyHours(1)
+    .everyHours(intervalHours)
     .create();
+}
+
+function createHourlyTrigger() {
+  createRunTrigger();
 }
 
 function removeHourlyTriggers() {
@@ -223,7 +287,7 @@ function removeHourlyTriggers() {
 }
 
 function validateConfiguration() {
-  setupJobPriorityWorkbook();
+  ensureWorkbookReadyForRuntime();
 
   var config = loadRuntimeConfig();
   validateRuntimeConfig(config);
@@ -241,8 +305,42 @@ function validateConfiguration() {
   );
 }
 
+function pruneExpiredJobs() {
+  ensureWorkbookReadyForRuntime();
+
+  var result = pruneExpiredJobRows();
+  var message = result.prunedCount
+    ? (
+      'Expired job pruning completed.\n' +
+      'Jobs checked: ' + result.checkedCount + '\n' +
+      'Jobs archived and removed: ' + result.prunedCount + '\n' +
+      'Remaining jobs: ' + result.remainingCount + '\n' +
+      '\nApplied jobs are never pruned regardless of age.'
+    )
+    : 'No expired jobs found (threshold: 45 days). Applied jobs are always kept.';
+
+  SpreadsheetApp.getUi().alert(message);
+}
+
+function deduplicateSimilarJds() {
+  ensureWorkbookReadyForRuntime();
+
+  var result = deduplicateSimilarJdRows();
+  var message = result.removedRowCount
+    ? (
+      'Similar-JD deduplication completed.\n' +
+      'Duplicate groups merged: ' + result.duplicateGroupCount + '\n' +
+      'Rows archived: ' + result.archivedRowCount + '\n' +
+      'Rows removed: ' + result.removedRowCount + '\n' +
+      'Remaining job rows: ' + result.finalRowCount
+    )
+    : 'No similar-JD duplicates were found.';
+
+  SpreadsheetApp.getUi().alert(message);
+}
+
 function deduplicateExistingJobs() {
-  setupJobPriorityWorkbook();
+  ensureWorkbookReadyForRuntime();
 
   var result = deduplicateExistingJobRows();
   var message = result.removedRowCount
@@ -253,9 +351,350 @@ function deduplicateExistingJobs() {
       'Rows removed: ' + result.removedRowCount + '\n' +
       'Remaining job rows: ' + result.finalRowCount
     )
-    : 'No duplicate canonical job groups were found.';
+    : 'No duplicate job IDs were found.';
 
   SpreadsheetApp.getUi().alert(message);
+}
+
+function reevaluateActiveBacklog() {
+  ensureWorkbookReadyForRuntime();
+
+  var config = loadRuntimeConfig();
+  validateRuntimeConfig(config, { requireApify: false });
+  var existingIndex = getExistingJobIndex();
+  var activeRecords = existingIndex.records.filter(function(record) {
+    return _isReevaluationEligibleStatus(record.status);
+  });
+  var activeRunState = _buildReevaluationStateFromRecords(activeRecords, config, 'active backlog');
+
+  if (!activeRunState.targetJobIds.length) {
+    SpreadsheetApp.getUi().alert('No eligible backlog rows were found. Reevaluation only targets New, Opened, and Tailoring rows.');
+    return;
+  }
+
+  if (!Number(activeRunState.totalScoreableCount || 0)) {
+    SpreadsheetApp.getUi().alert('No active backlog rows need reevaluation. They either already match the current scoring fingerprint or are missing source_jd.');
+    return;
+  }
+
+  _runJobReevaluationInternal(activeRunState);
+}
+
+function reevaluateSelectedRows() {
+  ensureWorkbookReadyForRuntime();
+
+  var sheet = _getJobPrioritySheet();
+  var range = sheet && sheet.getActiveRange();
+  var selectedRows = {};
+  var selectedRecords = [];
+
+  if (!range) {
+    SpreadsheetApp.getUi().alert('Select one or more job rows first.');
+    return;
+  }
+
+  for (var row = range.getRow(); row < range.getRow() + range.getNumRows(); row += 1) {
+    if (row >= JOB_PRIORITY_DATA_START_ROW) {
+      selectedRows[row] = true;
+    }
+  }
+
+  var config = loadRuntimeConfig();
+  validateRuntimeConfig(config, { requireApify: false });
+  var existingIndex = getExistingJobIndex();
+  existingIndex.records.forEach(function(record) {
+    if (selectedRows[record.rowNumber] && _isReevaluationEligibleStatus(record.status)) {
+      selectedRecords.push(record);
+    }
+  });
+
+  var activeRunState = _buildReevaluationStateFromRecords(selectedRecords, config, 'selected rows');
+
+  if (!activeRunState.targetJobIds.length) {
+    SpreadsheetApp.getUi().alert('No eligible selected rows were found. Reevaluation ignores Applied and Skip rows.');
+    return;
+  }
+
+  if (!Number(activeRunState.totalScoreableCount || 0)) {
+    SpreadsheetApp.getUi().alert('No selected rows need reevaluation. They either already match the current scoring fingerprint or are missing source_jd.');
+    return;
+  }
+
+  _runJobReevaluationInternal(activeRunState);
+}
+
+function repairJobLinksFromRawRef() {
+  ensureWorkbookReadyForRuntime();
+
+  var result = repairJobLinksFromRawRefRows();
+  var message = [
+    'Job-link repair completed.',
+    'Rows checked: ' + result.checkedCount,
+    'Rows updated: ' + result.updatedCount,
+    'Job IDs recovered: ' + result.recoveredJobIdCount,
+    'Missing raw_ref: ' + result.missingRawRefCount,
+    'Missing job ID in raw_ref: ' + result.missingJobIdCount
+  ];
+
+  if (result.sampleErrors && result.sampleErrors.length) {
+    message.push('');
+    message.push('Examples:');
+    message.push(result.sampleErrors.join('\n'));
+  }
+
+  SpreadsheetApp.getUi().alert(message.join('\n'));
+}
+
+function migrateRawData() {
+  ensureWorkbookReadyForRuntime();
+
+  var result = migrateRawDataToDedicatedSheet();
+  var message = [
+    'Raw-data migration completed.',
+    'Rows checked: ' + result.checkedCount,
+    'Rows migrated: ' + result.migratedCount,
+    'Rows skipped: ' + result.skippedCount,
+    'Missing job_id: ' + result.missingJobIdCount
+  ];
+
+  SpreadsheetApp.getUi().alert(message.join('\n'));
+}
+
+function _runJobReevaluationInternal(initialActiveRunState) {
+  var lock = LockService.getScriptLock();
+  var executionStartedAt = new Date();
+  var activeRunState = initialActiveRunState || _loadActiveRunState();
+  var scoringRunStartedAt = activeRunState && activeRunState.runStartedAt ? new Date(activeRunState.runStartedAt) : executionStartedAt;
+  var config = null;
+  var resumedAfterUnexpectedStop = false;
+  var progressState = {
+    lastRun: executionStartedAt,
+    status: 'Reevaluating jobs',
+    processed: '',
+    scrapedCount: '',
+    uniqueRolesCount: activeRunState && activeRunState.totalJobsCount ? activeRunState.totalJobsCount : '',
+    toScoreCount: activeRunState && activeRunState.totalScoreableCount ? activeRunState.totalScoreableCount : '',
+    newJobsCount: '',
+    aJobsCount: activeRunState && activeRunState.aJobsCount ? activeRunState.aJobsCount : '',
+    failedJobsCount: '',
+    scoredJobsCount: '',
+    errorMessage: ''
+  };
+
+  lock.waitLock(30000);
+
+  try {
+    ensureWorkbookReadyForRuntime();
+
+    if (initialActiveRunState) {
+      _clearActiveRunState();
+      _removeResumeTriggers();
+    }
+
+    if (!activeRunState || activeRunState.mode !== 'reevaluate') {
+      throw new Error('No active reevaluation state was found.');
+    }
+
+    config = loadRuntimeConfig();
+    config.runStartedAt = scoringRunStartedAt;
+    config.activeRunState = activeRunState;
+    resumedAfterUnexpectedStop = _markTrackedExecutionStarted(activeRunState, executionStartedAt);
+    _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
+    validateRuntimeConfig(config, { requireApify: false });
+    updateRunSummary(progressState);
+
+    if (resumedAfterUnexpectedStop) {
+      progressState.errorMessage = 'Previous execution stopped unexpectedly, likely due to an Apps Script timeout. Resuming from saved progress.';
+      updateRunSummary(progressState);
+    }
+
+    var existingIndex = getExistingJobIndex();
+    var result = reevaluateExistingJobs(config, existingIndex, function(nextState) {
+      if (nextState.status) {
+        progressState.status = nextState.status;
+      }
+      if (nextState.processed !== undefined) {
+        progressState.processed = nextState.processed;
+      }
+      if (nextState.uniqueRolesCount !== undefined) {
+        progressState.uniqueRolesCount = nextState.uniqueRolesCount;
+      }
+      if (nextState.toScoreCount !== undefined) {
+        progressState.toScoreCount = nextState.toScoreCount;
+      }
+      if (nextState.errorMessage !== undefined) {
+        progressState.errorMessage = nextState.errorMessage;
+      }
+      updateRunSummary(progressState);
+    });
+
+    progressState.status = 'Writing sheet';
+    progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
+    progressState.uniqueRolesCount = result.uniqueRolesCount;
+    progressState.toScoreCount = result.totalScoreableCount;
+    progressState.aJobsCount = result.aJobsCount;
+    progressState.failedJobsCount = result.failedJobsCount;
+    progressState.scoredJobsCount = result.scoredJobsCount;
+    updateRunSummary(progressState);
+
+    writeJobs(result.rows);
+    sortAndRankJobs();
+
+    if (result.hasMore) {
+      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
+      _saveActiveRunState(result.activeRunState);
+      _scheduleResumeTrigger();
+
+      progressState.status = 'Continuing in next execution';
+      progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
+      progressState.uniqueRolesCount = result.uniqueRolesCount;
+      progressState.toScoreCount = result.totalScoreableCount;
+      progressState.aJobsCount = result.aJobsCount;
+      progressState.failedJobsCount = result.failedJobsCount;
+      progressState.scoredJobsCount = result.scoredJobsCount;
+      progressState.errorMessage = result.errors.length
+        ? _truncate(result.errors.join(' | '), 500)
+        : 'Continuation scheduled automatically before the Apps Script execution limit.';
+      updateRunSummary(progressState);
+
+      return result;
+    }
+
+    _markTrackedExecutionFinished(result.activeRunState, 'completed');
+    _clearActiveRunState();
+    _removeResumeTriggers();
+
+    progressState.status = 'Completed';
+    progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
+    progressState.uniqueRolesCount = result.uniqueRolesCount;
+    progressState.toScoreCount = result.totalScoreableCount;
+    progressState.aJobsCount = result.aJobsCount;
+    progressState.failedJobsCount = result.failedJobsCount;
+    progressState.scoredJobsCount = result.scoredJobsCount;
+    progressState.errorMessage = result.errors.length ? _truncate(result.errors.join(' | '), 500) : '';
+    updateRunSummary(progressState);
+
+    return result;
+  } catch (error) {
+    _clearActiveRunState();
+    _removeResumeTriggers();
+    progressState.status = 'Failed';
+    progressState.errorMessage = _truncate(error && error.message ? error.message : String(error), 500);
+    updateRunSummary(progressState);
+    throw error;
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
+}
+
+function _buildReevaluationStateFromRecords(records, config, modeLabel) {
+  var seen = {};
+  var targetJobIds = [];
+  var totalScoreableCount = 0;
+
+  (records || []).forEach(function(record) {
+    var jobId = _stringifyField(record.jobId);
+    var fingerprint = '';
+
+    if (!jobId || seen[jobId]) {
+      return;
+    }
+
+    seen[jobId] = true;
+    targetJobIds.push(jobId);
+
+    if (!_stringifyField(record.jobDescription)) {
+      return;
+    }
+
+    fingerprint = _buildScoringFingerprint(record, config);
+    if (!_hasScoringPayload(record) || _stringifyField(record.scoringFingerprint) !== fingerprint) {
+      totalScoreableCount += 1;
+    }
+  });
+
+  return {
+    mode: 'reevaluate',
+    modeLabel: modeLabel || 'reevaluate',
+    runStartedAt: new Date().toISOString(),
+    targetJobIds: targetJobIds,
+    totalJobsCount: targetJobIds.length,
+    totalScoreableCount: totalScoreableCount,
+    processedCount: 0,
+    newJobsCount: 0,
+    aJobsCount: 0,
+    failedJobsCount: 0,
+    scoredJobsCount: 0,
+    importFailedJobsCount: 0,
+    handledJobIds: [],
+    newTopPriorityJobIds: [],
+    errors: []
+  };
+}
+
+function _createEmptyImportRunState(runStartedAt) {
+  return {
+    version: 1,
+    runStartedAt: runStartedAt instanceof Date ? runStartedAt.toISOString() : new Date(runStartedAt || new Date()).toISOString(),
+    sources: [],
+    rawScrapedCount: 0,
+    totalJobsCount: 0,
+    totalScoreableCount: 0,
+    processedCount: 0,
+    newJobsCount: 0,
+    aJobsCount: 0,
+    failedJobsCount: 0,
+    scoredJobsCount: 0,
+    importFailedJobsCount: 0,
+    handledJobIds: [],
+    newTopPriorityJobIds: [],
+    errors: []
+  };
+}
+
+function _markTrackedExecutionStarted(activeRunState, executionStartedAt) {
+  var hadUnexpectedStop = false;
+
+  if (!activeRunState) {
+    return hadUnexpectedStop;
+  }
+
+  hadUnexpectedStop = !!(activeRunState.lastExecutionStartedAt && !activeRunState.lastExecutionFinishedAt);
+  activeRunState.lastExecutionStartedAt = executionStartedAt instanceof Date
+    ? executionStartedAt.toISOString()
+    : new Date(executionStartedAt || new Date()).toISOString();
+  activeRunState.lastExecutionFinishedAt = '';
+  activeRunState.lastExecutionOutcome = 'running';
+  activeRunState.updatedAt = new Date().toISOString();
+  _saveActiveRunState(activeRunState);
+
+  return hadUnexpectedStop;
+}
+
+function _markTrackedExecutionFinished(activeRunState, outcome) {
+  if (!activeRunState) {
+    return;
+  }
+
+  activeRunState.lastExecutionFinishedAt = new Date().toISOString();
+  activeRunState.lastExecutionOutcome = outcome || 'completed';
+  activeRunState.updatedAt = new Date().toISOString();
+}
+
+function _isReevaluationEligibleStatus(status) {
+  var normalized = _stringifyField(status) || 'New';
+  return normalized === 'New' || normalized === 'Opened' || normalized === 'Tailoring';
+}
+
+function _hasScoringPayload(record) {
+  return _stringifyField(record.priority) &&
+    _stringifyField(record.usVisaReason) &&
+    _stringifyField(record.summary) &&
+    _stringifyField(record.why) &&
+    _stringifyField(record.angle) &&
+    record.score !== '';
 }
 
 function _sendCompletionNotifications(config, result, progressState) {
@@ -269,7 +708,7 @@ function _sendCompletionNotifications(config, result, progressState) {
   }
 
   var newAJobs = result.newAJobs || result.rows.filter(function(job) {
-    return !job.existingRowNumber && job.priority === 'A';
+    return !job.existingRowNumber && _isTopPriority(job.priority);
   });
 
   if (!newAJobs.length) {
@@ -281,13 +720,24 @@ function _sendCompletionNotifications(config, result, progressState) {
 
 function _loadActiveRunState() {
   var raw = PropertiesService.getScriptProperties().getProperty(ACTIVE_RUN_STATE_PROPERTY_KEY);
+  var state = null;
 
   if (!raw) {
     return null;
   }
 
   try {
-    return JSON.parse(raw);
+    state = JSON.parse(raw);
+    if (state && state.handledCanonicalKeys && !state.handledJobIds) {
+      state.handledJobIds = state.handledCanonicalKeys.slice();
+    }
+    if (state && state.newAJobCanonicalKeys && !state.newTopPriorityJobIds) {
+      state.newTopPriorityJobIds = state.newAJobCanonicalKeys.slice();
+    }
+    if (state && state.targetCanonicalKeys && !state.targetJobIds) {
+      state.targetJobIds = state.targetCanonicalKeys.slice();
+    }
+    return state;
   } catch (error) {
     Logger.log(error);
     PropertiesService.getScriptProperties().deleteProperty(ACTIVE_RUN_STATE_PROPERTY_KEY);
@@ -314,26 +764,26 @@ function _removeResumeTriggers() {
   });
 }
 
-function _scheduleResumeTrigger() {
+function _scheduleResumeTrigger(delayMs) {
   _removeResumeTriggers();
   ScriptApp.newTrigger(RESUME_TRIGGER_HANDLER)
     .timeBased()
-    .after(1000)
+    .after(Math.max(1000, Number(delayMs || 1000)))
     .create();
 }
 
-function _getJobsByCanonicalKeys(canonicalKeys) {
+function _getJobsByJobIds(jobIds) {
   var wanted = {};
   var jobs = [];
 
-  (canonicalKeys || []).forEach(function(key) {
-    if (key) {
-      wanted[String(key)] = true;
+  (jobIds || []).forEach(function(jobId) {
+    if (jobId) {
+      wanted[String(jobId)] = true;
     }
   });
 
   getExistingJobRecords().forEach(function(record) {
-    if (record.canonicalRoleKey && wanted[record.canonicalRoleKey]) {
+    if (record.jobId && wanted[record.jobId]) {
       jobs.push(record);
     }
   });
@@ -385,8 +835,8 @@ function _buildActiveRunStateFromApifyRunId(runId, shouldResurrect) {
     failedJobsCount: 0,
     scoredJobsCount: 0,
     importFailedJobsCount: 0,
-    handledCanonicalKeys: [],
-    newAJobCanonicalKeys: [],
+    handledJobIds: [],
+    newTopPriorityJobIds: [],
     errors: []
   };
 }
@@ -467,7 +917,7 @@ function _sendNewAJobsEmail(config, jobs) {
   var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   var sheetUrl = spreadsheet ? spreadsheet.getUrl() : '';
   var subject = _buildAJobsEmailSubject(jobs);
-  var lines = [jobs.length + ' new A-priority job' + (jobs.length === 1 ? '' : 's') + ' found.', ''];
+  var lines = [jobs.length + ' new P01-priority job' + (jobs.length === 1 ? '' : 's') + ' found.', ''];
 
   jobs.forEach(function(job, index) {
     lines.push((index + 1) + '. ' + _emailSafe(job.company) + ' — ' + _emailSafe(job.title));
@@ -496,7 +946,7 @@ function _buildAJobsEmailSubject(jobs) {
     return _emailSafe(job.company) + ' (' + _emailSafe(job.score) + ')';
   }).join(', ');
 
-  return '[Job Pipeline] ' + jobs.length + ' A job' + (jobs.length === 1 ? '' : 's') + (topJobs ? ': ' + topJobs : '');
+  return '[Job Pipeline] ' + jobs.length + ' P01 job' + (jobs.length === 1 ? '' : 's') + (topJobs ? ': ' + topJobs : '');
 }
 
 function _buildAJobsHtmlEmail(jobs, sheetUrl) {
@@ -528,7 +978,7 @@ function _buildAJobsHtmlEmail(jobs, sheetUrl) {
     '<body style="margin:0;padding:24px;background:#f5f7fa;font-family:Arial,Helvetica,sans-serif;color:#111827;">',
     '  <div style="max-width:640px;margin:0 auto;">',
     '    <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;padding:24px;margin:0 0 18px 0;">',
-    '      <div style="font-size:26px;line-height:1.2;font-weight:700;color:#111827;margin:0 0 8px 0;">' + jobs.length + ' new A-priority job' + (jobs.length === 1 ? '' : 's') + '</div>',
+    '      <div style="font-size:26px;line-height:1.2;font-weight:700;color:#111827;margin:0 0 8px 0;">' + jobs.length + ' new P01-priority job' + (jobs.length === 1 ? '' : 's') + '</div>',
     (summaryLine ? '      <div style="font-size:14px;line-height:1.5;color:#6b7280;margin:0 0 16px 0;">Top scores: ' + summaryLine + '</div>' : ''),
     '      <a href="' + _escapeHtml(sheetUrl) + '" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;font-weight:700;font-size:14px;line-height:1;padding:12px 16px;border-radius:10px;">Open sheet</a>',
     '    </div>',
