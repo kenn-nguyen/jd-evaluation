@@ -409,6 +409,9 @@ function replaceAllJobs(rows) {
   var existingLastRow = sheet.getLastRow();
   var clearRowCount = Math.max(existingLastRow - JOB_PRIORITY_DATA_START_ROW + 1, 0);
 
+  // Capture user-applied formatting before clearing, keyed by job_id
+  var userFormatting = _captureRowFormattingByJobId(sheet, existingLastRow);
+
   if (rows && rows.length) {
     _upsertRawDataRows(rows);
   }
@@ -430,9 +433,70 @@ function replaceAllJobs(rows) {
       outputRows.length,
       JOB_PRIORITY_COLUMNS.length
     ).setValues(outputRows);
+
+    // Restore user formatting to the new row positions
+    _restoreRowFormattingByJobId(sheet, rows, userFormatting);
   }
 
   _applyStatusValidation(sheet);
+}
+
+function _captureRowFormattingByJobId(sheet, lastRow) {
+  var result = {};
+  if (!lastRow || lastRow < JOB_PRIORITY_DATA_START_ROW) return result;
+
+  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var visibleColCount = JOB_PRIORITY_VISIBLE_COLUMNS.length;
+  var dataRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, rowCount, visibleColCount);
+  var jobIdValues = sheet.getRange(
+    JOB_PRIORITY_DATA_START_ROW,
+    JOB_PRIORITY_COLUMN_INDEX.job_id,
+    rowCount,
+    1
+  ).getValues();
+
+  var backgrounds = dataRange.getBackgrounds();
+  var fontColors = dataRange.getFontColors();
+  var fontWeights = dataRange.getFontWeights();
+
+  jobIdValues.forEach(function(idRow, i) {
+    var jobId = _stringifyField(idRow[0]);
+    if (!jobId) return;
+    result[jobId] = {
+      backgrounds: backgrounds[i],
+      fontColors: fontColors[i],
+      fontWeights: fontWeights[i]
+    };
+  });
+
+  return result;
+}
+
+function _restoreRowFormattingByJobId(sheet, rows, formattingByJobId) {
+  if (!rows || !rows.length || !formattingByJobId) return;
+
+  var visibleColCount = JOB_PRIORITY_VISIBLE_COLUMNS.length;
+  var defaultBackground = '#ffffff';
+  var defaultFontColor = '#000000';
+  var defaultFontWeight = 'normal';
+
+  rows.forEach(function(job, i) {
+    var jobId = _stringifyField(job.jobId);
+    var fmt = jobId ? formattingByJobId[jobId] : null;
+    var rowNumber = JOB_PRIORITY_DATA_START_ROW + i;
+    var range = sheet.getRange(rowNumber, 1, 1, visibleColCount);
+
+    if (fmt) {
+      range.setBackgrounds([fmt.backgrounds]);
+      range.setFontColors([fmt.fontColors]);
+      range.setFontWeights([fmt.fontWeights]);
+    } else {
+      // Clear any stale formatting left over from the previous row occupant
+      range.setBackground(defaultBackground);
+      range.setFontColor(defaultFontColor);
+      range.setFontWeight(defaultFontWeight);
+    }
+  });
 }
 
 function deduplicateExistingJobRows() {
