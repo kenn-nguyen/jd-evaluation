@@ -3,6 +3,7 @@ var CRITICAL_FAILURE_MIN_COUNT = 5;
 var ACTIVE_RUN_STATE_PROPERTY_KEY = 'ACTIVE_JOB_IMPORT_RUN_STATE';
 var RESUME_TRIGGER_HANDLER = 'resumeJobImportAndScoring';
 var BACKUP_RESUME_TRIGGER_DELAY_MS = 7 * 60 * 1000;
+var BATCH_POLL_INTERVAL_MS = 10 * 60 * 1000;
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -146,6 +147,52 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
     config.activeRunState = activeRunState;
     resumedAfterUnexpectedStop = _markTrackedExecutionStarted(activeRunState, executionStartedAt);
     _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
+
+    // If a Vertex batch job is pending collection, poll it instead of running a new import
+    if (activeRunState && activeRunState.batchPending && activeRunState.batchJobName) {
+      validateRuntimeConfig(config, { requireApify: false });
+      progressState.status = 'Polling batch scoring job';
+      updateRunSummary(progressState);
+      var batchResult = _handleBatchCollection(activeRunState, config);
+      writeJobs(batchResult.rows);
+      sortAndRankJobs();
+
+      if (batchResult.batchPending) {
+        _markTrackedExecutionFinished(batchResult.activeRunState, 'yielded');
+        _saveActiveRunState(batchResult.activeRunState);
+        _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
+        progressState.status = 'Batch scoring in progress — next poll in 10 min';
+        updateRunSummary(progressState);
+        return batchResult;
+      }
+
+      _markTrackedExecutionFinished(batchResult.activeRunState, 'completed');
+      _clearActiveRunState();
+      _removeResumeTriggers();
+
+      try {
+        progressState.status = 'Pruning expired jobs';
+        updateRunSummary(progressState);
+        pruneExpiredJobRows();
+      } catch (batchPruneError) { Logger.log(batchPruneError); }
+
+      try {
+        progressState.status = 'Deduplicating similar JDs';
+        updateRunSummary(progressState);
+        deduplicateSimilarJdRows();
+      } catch (batchDedupError) { Logger.log(batchDedupError); }
+
+      batchResult.newAJobs = _getJobsByJobIds(batchResult.newTopPriorityJobIds || []);
+      progressState.status = 'Completed';
+      progressState.scoredJobsCount = batchResult.scoredJobsCount;
+      progressState.failedJobsCount = batchResult.failedJobsCount;
+      progressState.errorMessage = batchResult.errors && batchResult.errors.length
+        ? _truncate(batchResult.errors.join(' | '), 500) : '';
+      updateRunSummary(progressState);
+      _sendCompletionNotifications(config, batchResult, progressState);
+      return batchResult;
+    }
+
     validateRuntimeConfig(config);
     updateRunSummary(progressState);
 
@@ -190,6 +237,19 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
 
     writeJobs(result.rows);
     sortAndRankJobs();
+
+    if (result.batchPending) {
+      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
+      _saveActiveRunState(result.activeRunState);
+      _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
+
+      progressState.status = 'Batch scoring submitted — waiting for Vertex AI results';
+      progressState.toScoreCount = result.totalScoreableCount;
+      progressState.errorMessage = 'Batch job submitted. Results will be applied automatically when ready (polling every 10 min).';
+      updateRunSummary(progressState);
+
+      return result;
+    }
 
     if (result.hasMore) {
       _markTrackedExecutionFinished(result.activeRunState, 'yielded');
@@ -500,6 +560,37 @@ function _runJobReevaluationInternal(initialActiveRunState) {
     config.activeRunState = activeRunState;
     resumedAfterUnexpectedStop = _markTrackedExecutionStarted(activeRunState, executionStartedAt);
     _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
+
+    // If a Vertex batch job is pending collection, poll it instead of running reevaluation
+    if (activeRunState && activeRunState.batchPending && activeRunState.batchJobName) {
+      validateRuntimeConfig(config, { requireApify: false });
+      progressState.status = 'Polling batch scoring job';
+      updateRunSummary(progressState);
+      var revalBatchResult = _handleBatchCollection(activeRunState, config);
+      writeJobs(revalBatchResult.rows);
+      sortAndRankJobs();
+
+      if (revalBatchResult.batchPending) {
+        _markTrackedExecutionFinished(revalBatchResult.activeRunState, 'yielded');
+        _saveActiveRunState(revalBatchResult.activeRunState);
+        _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
+        progressState.status = 'Batch scoring in progress — next poll in 10 min';
+        updateRunSummary(progressState);
+        return revalBatchResult;
+      }
+
+      _markTrackedExecutionFinished(revalBatchResult.activeRunState, 'completed');
+      _clearActiveRunState();
+      _removeResumeTriggers();
+      progressState.status = 'Completed';
+      progressState.scoredJobsCount = revalBatchResult.scoredJobsCount;
+      progressState.failedJobsCount = revalBatchResult.failedJobsCount;
+      progressState.errorMessage = revalBatchResult.errors && revalBatchResult.errors.length
+        ? _truncate(revalBatchResult.errors.join(' | '), 500) : '';
+      updateRunSummary(progressState);
+      return revalBatchResult;
+    }
+
     validateRuntimeConfig(config, { requireApify: false });
     updateRunSummary(progressState);
 
@@ -539,6 +630,19 @@ function _runJobReevaluationInternal(initialActiveRunState) {
 
     writeJobs(result.rows);
     sortAndRankJobs();
+
+    if (result.batchPending) {
+      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
+      _saveActiveRunState(result.activeRunState);
+      _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
+
+      progressState.status = 'Batch scoring submitted — waiting for Vertex AI results';
+      progressState.toScoreCount = result.totalScoreableCount;
+      progressState.errorMessage = 'Batch job submitted. Results will be applied automatically when ready (polling every 10 min).';
+      updateRunSummary(progressState);
+
+      return result;
+    }
 
     if (result.hasMore) {
       _markTrackedExecutionFinished(result.activeRunState, 'yielded');
@@ -587,6 +691,67 @@ function _runJobReevaluationInternal(initialActiveRunState) {
       lock.releaseLock();
     }
   }
+}
+
+function _handleBatchCollection(activeRunState, config) {
+  var status = _pollVertexBatchJobState(activeRunState.batchJobName, config);
+
+  Logger.log('Batch job ' + activeRunState.batchJobName + ' state: ' + status.state);
+
+  var pendingStates = { JOB_STATE_PENDING: true, JOB_STATE_RUNNING: true, JOB_STATE_QUEUED: true };
+  if (pendingStates[status.state]) {
+    activeRunState.updatedAt = new Date().toISOString();
+    return {
+      batchPending: true,
+      hasMore: false,
+      rows: [],
+      scoredJobsCount: activeRunState.scoredJobsCount || 0,
+      failedJobsCount: activeRunState.failedJobsCount || 0,
+      processedCount: activeRunState.processedCount || 0,
+      totalJobsCount: activeRunState.totalJobsCount || 0,
+      totalScoreableCount: activeRunState.totalScoreableCount || 0,
+      uniqueRolesCount: activeRunState.totalJobsCount || 0,
+      errors: activeRunState.errors || [],
+      newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || [],
+      activeRunState: activeRunState
+    };
+  }
+
+  if (status.state !== 'JOB_STATE_SUCCEEDED') {
+    throw new Error('Vertex batch job ended with state ' + status.state +
+      (status.error ? ': ' + status.error : ''));
+  }
+
+  var existingIndex = getExistingJobIndex();
+  var batchResults = _readBatchJobResults(activeRunState, status.outputDirectory, config, existingIndex);
+
+  activeRunState.batchPending = false;
+  activeRunState.batchJobName = '';
+  activeRunState.scoredJobsCount = Number(activeRunState.scoredJobsCount || 0) + batchResults.scoredJobsCount;
+  activeRunState.failedJobsCount = Number(activeRunState.failedJobsCount || 0) + batchResults.failedJobsCount;
+  activeRunState.processedCount = Number(activeRunState.totalJobsCount || 0);
+  activeRunState.errors = _appendErrors(activeRunState.errors || [], batchResults.errors);
+  activeRunState.updatedAt = new Date().toISOString();
+
+  Logger.log('Batch collection complete: ' + batchResults.scoredJobsCount + ' scored, ' +
+    batchResults.failedJobsCount + ' failed');
+
+  return {
+    batchPending: false,
+    hasMore: false,
+    rows: batchResults.scoredRows,
+    scoredJobsCount: activeRunState.scoredJobsCount,
+    failedJobsCount: activeRunState.failedJobsCount,
+    processedCount: activeRunState.processedCount,
+    totalJobsCount: activeRunState.totalJobsCount || 0,
+    totalScoreableCount: activeRunState.totalScoreableCount || 0,
+    uniqueRolesCount: activeRunState.totalJobsCount || 0,
+    newJobsCount: activeRunState.newJobsCount || '',
+    aJobsCount: activeRunState.aJobsCount || 0,
+    errors: activeRunState.errors || [],
+    newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || [],
+    activeRunState: activeRunState
+  };
 }
 
 function _buildReevaluationStateFromRecords(records, config, modeLabel) {

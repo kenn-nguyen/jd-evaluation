@@ -1,3 +1,6 @@
+var SCORING_CACHE_STATE_KEY = 'GEMINI_SCORING_CACHE_STATE';
+var SCORING_CACHE_TTL_SECONDS = 7200;
+
 function loadRuntimeConfig() {
   var settings = getSettingsMap();
   var properties = PropertiesService.getScriptProperties();
@@ -28,7 +31,10 @@ function loadRuntimeConfig() {
     vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
     geminiApiKey: properties.getProperty('GEMINI_API_KEY'),
-    openAiApiKey: properties.getProperty('OPENAI_API_KEY')
+    openAiApiKey: properties.getProperty('OPENAI_API_KEY'),
+    gcsBucket: String(settings.GCS_BUCKET || '').trim(),
+    batchMode: String(settings.BATCH_MODE || 'off').toLowerCase().trim(),
+    batchAutoThreshold: _normalizePositiveInteger(settings.BATCH_AUTO_THRESHOLD || 50, 50, 10000)
   };
 }
 
@@ -117,7 +123,6 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
   });
 
   activeRunState.totalScoreableCount = activeRunState.totalScoreableCount || jobsToScore.length;
-  scoreableJobsForThisExecution = jobsToScore.slice(0, maxJobsPerExecution);
 
   if (rowsToWriteWithoutScoring.length) {
     rows = rows.concat(rowsToWriteWithoutScoring);
@@ -128,6 +133,63 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     uniqueRolesCount: activeRunState.totalJobsCount,
     toScoreCount: activeRunState.totalScoreableCount
   });
+
+  // Batch submission path: submit all scoreable jobs to Vertex Batch Prediction at once
+  if (jobsToScore.length && _shouldUseBatch(jobsToScore.length, config)) {
+    try {
+      _emitProgress(progressCallback, {
+        status: 'Submitting batch scoring job',
+        processed: rowsToWriteWithoutScoring.length + ' / ' + activeRunState.totalJobsCount
+      });
+
+      var batchCacheName = _getOrCreateScoringCache(config) || '';
+      var batchRunPrefix = _gcsRunPrefix(config);
+      var batchJsonl = _buildBatchInputJsonl(jobsToScore, config, batchCacheName);
+      var batchInputUri = _uploadToGcs(batchJsonl, batchRunPrefix + '/input.jsonl', config);
+      var batchOutputPrefix = 'gs://' + config.gcsBucket + '/' + batchRunPrefix + '/output/';
+      var batchJobName = _submitVertexBatchJob(batchInputUri, batchOutputPrefix, config);
+
+      activeRunState.batchPending = true;
+      activeRunState.batchJobName = batchJobName;
+      activeRunState.batchOutputGcsPrefix = batchOutputPrefix;
+      activeRunState.batchTargetJobIds = jobsToScore.map(function(j) { return j.jobId; });
+      activeRunState.totalScoreableCount = jobsToScore.length;
+      activeRunState.processedCount = rowsToWriteWithoutScoring.length;
+      activeRunState.handledJobIds = _appendUniqueStrings(
+        activeRunState.handledJobIds || [],
+        rowsToWriteWithoutScoring.map(function(j) { return j.jobId; })
+      );
+      activeRunState.updatedAt = new Date().toISOString();
+
+      // Include unscored new jobs in rows so they are written to the sheet immediately
+      rows = rows.concat(jobsToScore);
+
+      return {
+        rows: rows,
+        batchPending: true,
+        newJobsCount: activeRunState.newJobsCount || 0,
+        aJobsCount: activeRunState.aJobsCount || 0,
+        duplicateJobsCount: duplicateJobsCount,
+        scoredJobsCount: activeRunState.scoredJobsCount || 0,
+        failedJobsCount: activeRunState.failedJobsCount || 0,
+        importFailedJobsCount: importFailedJobsCount,
+        processedCount: activeRunState.processedCount,
+        rawScrapedCount: activeRunState.rawScrapedCount,
+        uniqueRolesCount: activeRunState.totalJobsCount,
+        totalScoreableCount: activeRunState.totalScoreableCount,
+        totalJobsCount: activeRunState.totalJobsCount,
+        errors: activeRunState.errors || [],
+        hasMore: false,
+        activeRunState: activeRunState,
+        newTopPriorityJobIds: []
+      };
+    } catch (batchSubmitError) {
+      Logger.log('Batch submission failed, falling back to synchronous scoring: ' + batchSubmitError.message);
+      errors.push(_truncate('Batch submission failed: ' + batchSubmitError.message, 300));
+    }
+  }
+
+  scoreableJobsForThisExecution = jobsToScore.slice(0, maxJobsPerExecution);
 
   _emitProgress(progressCallback, {
     status: 'Scoring jobs',
@@ -256,6 +318,57 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     toScoreCount: activeRunState.totalScoreableCount
   });
 
+  if (jobsToScore.length && _shouldUseBatch(jobsToScore.length, config)) {
+    try {
+      _emitProgress(progressCallback, {
+        status: 'Submitting batch scoring job',
+        processed: (activeRunState.handledJobIds.length + skippedThisExecution.length) + ' / ' + activeRunState.totalJobsCount
+      });
+
+      var revalBatchCacheName = _getOrCreateScoringCache(config) || '';
+      var revalBatchRunPrefix = _gcsRunPrefix(config);
+      var revalBatchJsonl = _buildBatchInputJsonl(jobsToScore, config, revalBatchCacheName);
+      var revalBatchInputUri = _uploadToGcs(revalBatchJsonl, revalBatchRunPrefix + '/input.jsonl', config);
+      var revalBatchOutputPrefix = 'gs://' + config.gcsBucket + '/' + revalBatchRunPrefix + '/output/';
+      var revalBatchJobName = _submitVertexBatchJob(revalBatchInputUri, revalBatchOutputPrefix, config);
+
+      activeRunState.batchPending = true;
+      activeRunState.batchJobName = revalBatchJobName;
+      activeRunState.batchOutputGcsPrefix = revalBatchOutputPrefix;
+      activeRunState.batchTargetJobIds = jobsToScore.map(function(j) { return j.jobId; });
+      activeRunState.totalScoreableCount = jobsToScore.length;
+      activeRunState.handledJobIds = _appendUniqueStrings(
+        activeRunState.handledJobIds || [],
+        skippedThisExecution
+      );
+      activeRunState.processedCount = activeRunState.handledJobIds.length;
+      activeRunState.updatedAt = new Date().toISOString();
+
+      return {
+        rows: [],
+        batchPending: true,
+        newJobsCount: '',
+        aJobsCount: activeRunState.aJobsCount || 0,
+        duplicateJobsCount: 0,
+        scoredJobsCount: activeRunState.scoredJobsCount || 0,
+        failedJobsCount: activeRunState.failedJobsCount || 0,
+        importFailedJobsCount: 0,
+        processedCount: activeRunState.processedCount,
+        rawScrapedCount: '',
+        uniqueRolesCount: activeRunState.totalJobsCount,
+        totalScoreableCount: activeRunState.totalScoreableCount,
+        totalJobsCount: activeRunState.totalJobsCount,
+        errors: activeRunState.errors || [],
+        hasMore: false,
+        activeRunState: activeRunState,
+        newTopPriorityJobIds: []
+      };
+    } catch (revalBatchError) {
+      Logger.log('Batch submission failed for reevaluation, falling back to synchronous: ' + revalBatchError.message);
+      errors.push(_truncate('Batch submission failed: ' + revalBatchError.message, 300));
+    }
+  }
+
   if (jobsToScore.length) {
     var scoringResult = _scoreJobsInBatches(
       jobsToScore.slice(0, maxJobsPerExecution),
@@ -326,6 +439,12 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
   var resolvedStatusLabel = statusLabel || 'Scoring jobs';
   var hitExecutionBudget = false;
 
+  // Initialize Gemini context cache once for this scoring session
+  if (!config._scoringCacheAttempted) {
+    config._scoringCacheAttempted = true;
+    config._scoringCacheName = _getOrCreateScoringCache(config) || '';
+  }
+
   for (var start = 0; start < jobs.length; start += batchSize) {
     if (start > 0 && _shouldYieldExecution(config)) {
       hitExecutionBudget = true;
@@ -391,7 +510,11 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
     return _parseScoreResponseByProvider(initialResponse, config.aiProvider);
   } catch (firstError) {
     Logger.log(firstError);
-    var retryResponse = _executeSingleScoreRequest(_buildScoreRequest(job, config));
+    // Retry without cache in case the cached content expired or is invalid
+    var retryConfig = config._scoringCacheName
+      ? _cloneConfigWithoutCache(config)
+      : config;
+    var retryResponse = _executeSingleScoreRequest(_buildScoreRequest(job, retryConfig));
 
     try {
       return _parseScoreResponseByProvider(retryResponse, config.aiProvider);
@@ -402,6 +525,13 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
       );
     }
   }
+}
+
+function _cloneConfigWithoutCache(config) {
+  var clone = {};
+  Object.keys(config).forEach(function(key) { clone[key] = config[key]; });
+  clone._scoringCacheName = '';
+  return clone;
 }
 
 function _executeScoreRequests(requests) {
@@ -863,24 +993,29 @@ function _buildScoreRequest(job, config) {
 }
 
 function _buildGeminiScoreRequest(job, config) {
-  var prompt = _buildScoringPrompt(job, config);
   var generationConfig = {
     temperature: 0.2,
     responseMimeType: 'application/json'
   };
-  var payload = {
-    contents: [
-      {
+  var payload;
+
+  if (config._scoringCacheName) {
+    // Cached prefix — only send the dynamic job content
+    payload = {
+      cachedContent: config._scoringCacheName,
+      contents: [{ role: 'user', parts: [{ text: _buildDynamicJobContent(job) }] }],
+      generationConfig: generationConfig
+    };
+  } else {
+    // Full prompt fallback
+    payload = {
+      contents: [{
         role: 'user',
-        parts: [
-          {
-            text: 'You score product management jobs for a single power user. Return strict JSON only.\n\n' + prompt
-          }
-        ]
-      }
-    ],
-    generationConfig: generationConfig
-  };
+        parts: [{ text: 'You score product management jobs for a single power user. Return strict JSON only.\n\n' + _buildScoringPrompt(job, config) }]
+      }],
+      generationConfig: generationConfig
+    };
+  }
 
   if (config.geminiApiRoute === 'vertex') {
     generationConfig.responseSchema = _getScoreResponseSchema();
@@ -892,9 +1027,7 @@ function _buildGeminiScoreRequest(job, config) {
         ':generateContent',
       method: 'post',
       contentType: 'application/json',
-      headers: {
-        Authorization: 'Bearer ' + ScriptApp.getOAuthToken()
-      },
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
       payload: JSON.stringify(payload),
       muteHttpExceptions: true
     };
@@ -905,9 +1038,7 @@ function _buildGeminiScoreRequest(job, config) {
     url: 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(config.scoringModel) + ':generateContent',
     method: 'post',
     contentType: 'application/json',
-    headers: {
-      'x-goog-api-key': config.geminiApiKey
-    },
+    headers: { 'x-goog-api-key': config.geminiApiKey },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   };
@@ -945,14 +1076,20 @@ function _buildOpenAiScoreRequest(job, config) {
   };
 }
 
-function _buildScoringPrompt(job, config) {
+function _buildStaticScoringContent(config) {
   return [
+    'You score product management jobs for a single power user. Return strict JSON only.',
+    '',
     'Target profile:',
     config.targetProfile,
     '',
     'Scoring instructions:',
-    config.scoringInstructions,
-    '',
+    config.scoringInstructions
+  ].join('\n');
+}
+
+function _buildDynamicJobContent(job) {
+  return [
     'Job:',
     'Company: ' + job.company,
     'Title: ' + job.title,
@@ -967,6 +1104,110 @@ function _buildScoringPrompt(job, config) {
     'Description:',
     job.jobDescription || ''
   ].join('\n');
+}
+
+function _buildScoringPrompt(job, config) {
+  return [
+    'Target profile:',
+    config.targetProfile,
+    '',
+    'Scoring instructions:',
+    config.scoringInstructions,
+    '',
+    _buildDynamicJobContent(job)
+  ].join('\n');
+}
+
+function _getScoringCacheFingerprint(config) {
+  return _sha1(config.scoringModel + '|' + config.promptVersion + '|' + _buildStaticScoringContent(config));
+}
+
+function _loadScoringCacheState() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(SCORING_CACHE_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _saveScoringCacheState(state) {
+  PropertiesService.getScriptProperties().setProperty(SCORING_CACHE_STATE_KEY, JSON.stringify(state));
+}
+
+function _clearScoringCacheState() {
+  PropertiesService.getScriptProperties().deleteProperty(SCORING_CACHE_STATE_KEY);
+}
+
+function _getOrCreateScoringCache(config) {
+  if (config.aiProvider !== 'gemini') return null;
+
+  var fingerprint = _getScoringCacheFingerprint(config);
+  var stored = _loadScoringCacheState();
+
+  if (stored && stored.fingerprint === fingerprint && stored.name) {
+    return stored.name;
+  }
+
+  try {
+    var name = _createGeminiCachedContent(config);
+    if (name) {
+      _saveScoringCacheState({ name: name, fingerprint: fingerprint });
+    }
+    return name || null;
+  } catch (e) {
+    Logger.log('Gemini cache creation failed, falling back to uncached: ' + e.message);
+    return null;
+  }
+}
+
+function _createGeminiCachedContent(config) {
+  var staticContent = _buildStaticScoringContent(config);
+  var payload;
+  var request;
+
+  if (config.geminiApiRoute === 'vertex') {
+    payload = {
+      model: 'projects/' + config.vertexProjectId + '/locations/' + config.vertexLocation + '/publishers/google/models/' + config.scoringModel,
+      contents: [{ role: 'user', parts: [{ text: staticContent }] }],
+      ttl: SCORING_CACHE_TTL_SECONDS + 's'
+    };
+    request = {
+      url: 'https://aiplatform.googleapis.com/v1beta1/projects/' + encodeURIComponent(config.vertexProjectId) +
+        '/locations/' + encodeURIComponent(config.vertexLocation) + '/cachedContents',
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+  } else {
+    payload = {
+      model: 'models/' + config.scoringModel,
+      contents: [{ role: 'user', parts: [{ text: staticContent }] }],
+      ttl: SCORING_CACHE_TTL_SECONDS + 's'
+    };
+    request = {
+      url: 'https://generativelanguage.googleapis.com/v1beta/cachedContents',
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'x-goog-api-key': config.geminiApiKey },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+  }
+
+  var response = UrlFetchApp.fetch(request.url, _toFetchOptions(request));
+  var code = response.getResponseCode();
+  var body = response.getContentText();
+
+  if (code >= 300) {
+    Logger.log('Gemini cachedContent creation failed: ' + code + ' ' + _truncate(body, 300));
+    return null;
+  }
+
+  var parsed = JSON.parse(body);
+  return parsed.name || null;
 }
 
 function _parseScoreResponseByProvider(response, aiProvider) {
@@ -1754,4 +1995,252 @@ function _titlesSanityCheck(titleA, titleB) {
   var setB = {};
   wordsB.forEach(function(w) { setB[w] = true; });
   return wordsA.some(function(w) { return setB[w]; });
+}
+
+// --- Vertex AI Batch Prediction ---
+
+function _shouldUseBatch(jobCount, config) {
+  if (config.geminiApiRoute !== 'vertex') return false;
+  if (!config.gcsBucket) return false;
+  var mode = String(config.batchMode || 'off');
+  if (mode === 'off') return false;
+  if (mode === 'always') return jobCount > 0;
+  if (mode === 'auto') return jobCount >= Number(config.batchAutoThreshold || 50);
+  return false;
+}
+
+function _gcsRunPrefix(config) {
+  var ts = config.runStartedAt instanceof Date
+    ? config.runStartedAt.getTime()
+    : new Date().getTime();
+  return 'job-scoring/' + String(ts);
+}
+
+function _buildBatchInputJsonl(jobs, config, cacheName) {
+  return jobs.map(function(job) {
+    var generationConfig = {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+      responseSchema: _getScoreResponseSchema()
+    };
+    var request;
+    if (cacheName) {
+      request = {
+        cachedContent: cacheName,
+        contents: [{ role: 'user', parts: [{ text: _buildDynamicJobContent(job) }] }],
+        generationConfig: generationConfig
+      };
+    } else {
+      var fullPrompt = _buildStaticScoringContent(config) + '\n\n' + _buildDynamicJobContent(job);
+      request = {
+        contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+        generationConfig: generationConfig
+      };
+    }
+    return JSON.stringify({ request: request });
+  }).join('\n');
+}
+
+function _uploadToGcs(content, objectName, config) {
+  var bucket = config.gcsBucket;
+  var token = ScriptApp.getOAuthToken();
+
+  var response = UrlFetchApp.fetch(
+    'https://storage.googleapis.com/upload/storage/v1/b/' + encodeURIComponent(bucket) +
+    '/o?uploadType=media&name=' + encodeURIComponent(objectName),
+    {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + token },
+      payload: content,
+      muteHttpExceptions: true
+    }
+  );
+
+  var code = response.getResponseCode();
+  if (code >= 300) {
+    throw new Error('GCS upload failed (' + code + '): ' + _truncate(response.getContentText(), 200));
+  }
+
+  return 'gs://' + bucket + '/' + objectName;
+}
+
+function _submitVertexBatchJob(inputGcsUri, outputGcsPrefix, config) {
+  var payload = {
+    displayName: 'job-scoring-batch',
+    model: 'publishers/google/models/' + config.scoringModel,
+    inputConfig: {
+      instancesFormat: 'jsonl',
+      gcsSource: { uris: [inputGcsUri] }
+    },
+    outputConfig: {
+      predictionsFormat: 'jsonl',
+      gcsDestination: { outputUriPrefix: outputGcsPrefix }
+    }
+  };
+
+  var response = UrlFetchApp.fetch(
+    'https://aiplatform.googleapis.com/v1/projects/' + encodeURIComponent(config.vertexProjectId) +
+    '/locations/' + encodeURIComponent(config.vertexLocation) + '/batchPredictionJobs',
+    {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    }
+  );
+
+  var code = response.getResponseCode();
+  var body = response.getContentText();
+  if (code >= 300) {
+    throw new Error('Vertex batch job creation failed (' + code + '): ' + _truncate(body, 300));
+  }
+
+  return JSON.parse(body).name;
+}
+
+function _pollVertexBatchJobState(jobName, config) {
+  var response = UrlFetchApp.fetch(
+    'https://aiplatform.googleapis.com/v1/' + jobName,
+    {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    }
+  );
+
+  var code = response.getResponseCode();
+  if (code >= 300) {
+    throw new Error('Vertex batch job status check failed (' + code + ')');
+  }
+
+  var parsed = JSON.parse(response.getContentText());
+  return {
+    state: String(parsed.state || ''),
+    outputDirectory: (parsed.outputInfo && parsed.outputInfo.gcsOutputDirectory)
+      ? String(parsed.outputInfo.gcsOutputDirectory)
+      : '',
+    error: parsed.error ? _truncate(String(parsed.error.message || ''), 300) : ''
+  };
+}
+
+function _listGcsObjectsByPrefix(gcsDirectoryUri, config) {
+  var match = String(gcsDirectoryUri || '').match(/^gs:\/\/([^\/]+)\/?(.*)$/);
+  if (!match) return [];
+  var bucket = match[1];
+  var prefix = match[2];
+
+  var response = UrlFetchApp.fetch(
+    'https://storage.googleapis.com/storage/v1/b/' + encodeURIComponent(bucket) +
+    '/o?prefix=' + encodeURIComponent(prefix),
+    {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    }
+  );
+
+  if (response.getResponseCode() >= 300) return [];
+
+  var parsed = JSON.parse(response.getContentText());
+  return (parsed.items || [])
+    .map(function(item) { return { bucket: bucket, name: item.name }; })
+    .sort(function(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+}
+
+function _downloadGcsObject(bucket, objectName, config) {
+  var response = UrlFetchApp.fetch(
+    'https://storage.googleapis.com/download/storage/v1/b/' + encodeURIComponent(bucket) +
+    '/o/' + encodeURIComponent(objectName) + '?alt=media',
+    {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true
+    }
+  );
+
+  var code = response.getResponseCode();
+  if (code >= 300) {
+    throw new Error('GCS download failed for ' + objectName + ' (' + code + ')');
+  }
+
+  return response.getContentText();
+}
+
+function _readBatchJobResults(activeRunState, outputDirectory, config, existingIndex) {
+  var batchTargetJobIds = activeRunState.batchTargetJobIds || [];
+  var scoredRows = [];
+  var failedJobIds = [];
+  var errors = [];
+  var lineIndex = 0;
+
+  var objectRefs = _listGcsObjectsByPrefix(outputDirectory, config);
+  objectRefs.forEach(function(ref) {
+    if (!ref.name.match(/\.jsonl$/i)) return;
+
+    var content;
+    try {
+      content = _downloadGcsObject(ref.bucket, ref.name, config);
+    } catch (e) {
+      errors.push('Download failed for ' + ref.name + ': ' + e.message);
+      return;
+    }
+
+    var lines = content.split('\n');
+    lines.forEach(function(line) {
+      line = line.trim();
+      if (!line) return;
+
+      var jobId = batchTargetJobIds[lineIndex];
+      lineIndex += 1;
+
+      if (!jobId) return;
+
+      var existing = existingIndex.byJobId[jobId];
+      if (!existing) {
+        failedJobIds.push(jobId);
+        return;
+      }
+
+      try {
+        var parsed = JSON.parse(line);
+        var status = parsed.status;
+        if (status && status.code && status.code !== 0) {
+          throw new Error(String(status.message || status.code));
+        }
+
+        var response = parsed.response;
+        var candidate = response && response.candidates && response.candidates[0];
+        var parts = candidate && candidate.content && candidate.content.parts;
+        var text = parts && parts.map(function(p) { return p.text || ''; }).join('');
+
+        if (!text) throw new Error('Empty response from batch result');
+
+        var scoreResult = _normalizeScorePayload(_parseJsonSafely(text));
+        var scored = _cloneJobRecord(existing);
+        scored.existingRowNumber = existing.rowNumber;
+        scored.score = scoreResult.score;
+        scored.priority = scoreResult.priority;
+        scored.usVisaSponsorshipPotential = scoreResult.usVisaSponsorshipPotential;
+        scored.usVisaReason = scoreResult.usVisaReason;
+        scored.summary = scoreResult.summary;
+        scored.why = scoreResult.why;
+        scored.angle = scoreResult.angle;
+        scored.titleLevel = scoreResult.titleLevel;
+        scored.jdImpliedLevel = scoreResult.jdImpliedLevel;
+        scored.scoredAt = new Date();
+        scored.scoringFingerprint = _buildScoringFingerprint(existing, config);
+        scoredRows.push(scored);
+      } catch (e) {
+        failedJobIds.push(jobId);
+        errors.push(_truncate('Batch result parse failed for ' + jobId + ': ' + e.message, 200));
+      }
+    });
+  });
+
+  return {
+    scoredRows: scoredRows,
+    failedJobIds: failedJobIds,
+    scoredJobsCount: scoredRows.length,
+    failedJobsCount: failedJobIds.length,
+    errors: errors
+  };
 }

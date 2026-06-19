@@ -69,7 +69,10 @@ var SETTINGS_DEFAULT_ROWS = [
   ['APIFY_TASK_IDS', '', 'Your Apify task id, for example masterabctech~linkedin-job-scraper-task'],
   ['RUN_INTERVAL_HOURS', '4', 'How often the pipeline runs (hours). Supported values: 1, 2, 4, 6, 8, 12.'],
   ['QUIET_START_HOUR', '19', 'Hour to stop running, 0-23 Pacific Time. Default 19 = 7pm PT.'],
-  ['QUIET_END_HOUR', '5', 'Hour to resume running, 0-23 Pacific Time. Default 5 = 5am PT. Set both to 0 to disable quiet hours.']
+  ['QUIET_END_HOUR', '5', 'Hour to resume running, 0-23 Pacific Time. Default 5 = 5am PT. Set both to 0 to disable quiet hours.'],
+  ['GCS_BUCKET', '', 'GCS bucket name for Vertex AI Batch Prediction (e.g. my-job-scoring). Required when BATCH_MODE is not off. Vertex only.'],
+  ['BATCH_MODE', 'off', 'off = synchronous. auto = batch when job count >= BATCH_AUTO_THRESHOLD. always = always batch. Vertex AI only.'],
+  ['BATCH_AUTO_THRESHOLD', '50', 'Minimum job count to trigger batch mode when BATCH_MODE=auto. Default 50.']
 ];
 var HELP_ROWS = [
   ['Job Priority Help', ''],
@@ -624,11 +627,49 @@ function deduplicateSimilarJdRows() {
     byCompany[companyKey].push(record);
   });
 
-  var mergedRecords = noJdRecords.slice();
+  // Group records with no JD by exact company + normalized title — covers multi-location posts
+  // where the JD wasn't stored (e.g., older imports before Raw_Data was added).
+  var noJdByCompanyTitle = {};
+  var trueNoJdRecords = [];
+  noJdRecords.forEach(function(record) {
+    var companyKey = _normalizeJdText(record.company || '');
+    var titleKey = _normalizeJdText(record.title || '');
+    if (!companyKey || !titleKey) {
+      trueNoJdRecords.push(record);
+      return;
+    }
+    var groupKey = companyKey + '|||' + titleKey;
+    if (!noJdByCompanyTitle[groupKey]) {
+      noJdByCompanyTitle[groupKey] = [];
+    }
+    noJdByCompanyTitle[groupKey].push(record);
+  });
+
+  var mergedRecords = trueNoJdRecords.slice();
   var archiveRows = [];
   var duplicateGroupCount = 0;
   var removedRowCount = 0;
   var dedupedAt = new Date();
+
+  // Merge no-JD groups that share exact company + exact title
+  Object.keys(noJdByCompanyTitle).forEach(function(groupKey) {
+    var group = noJdByCompanyTitle[groupKey];
+    if (group.length === 1) {
+      mergedRecords.push(group[0]);
+      return;
+    }
+    duplicateGroupCount += 1;
+    removedRowCount += group.length - 1;
+    var merged = _mergeSimilarJdGroup(group);
+    group.forEach(function(record) {
+      if (record.rowNumber !== merged.rowNumber) {
+        var archived = _cloneJobRecord(record);
+        archived.dedupedAt = dedupedAt;
+        archiveRows.push(archived);
+      }
+    });
+    mergedRecords.push(merged);
+  });
 
   Object.keys(byCompany).forEach(function(companyKey) {
     var groups = _clusterSimilarJdRecords(byCompany[companyKey], JD_SIMILARITY_THRESHOLD);
@@ -1290,7 +1331,10 @@ function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
   var jobLinkFormula = formulas[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
   var jobLinkCellValue = row[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
   var jobLink = _extractUrlFromHyperlinkFormula(jobLinkFormula) || _buildLinkedInJobUrlFromJobId(jobId) || sourceUrl;
-  var jobDescription = (rawData && rawData.sourceJd) || row[JOB_PRIORITY_COLUMN_INDEX.source_jd - 1] || '';
+  var jobDescription = (rawData && rawData.sourceJd)
+    || row[JOB_PRIORITY_COLUMN_INDEX.source_jd - 1]
+    || _extractJobDescriptionFromRawRef((rawData && rawData.rawRef) || row[JOB_PRIORITY_COLUMN_INDEX.raw_ref - 1])
+    || '';
   var sourceTask = (rawData && rawData.sourceTask) || row[JOB_PRIORITY_COLUMN_INDEX.source_task - 1] || '';
 
   return {
@@ -1522,7 +1566,7 @@ function _toRawDataRow(rawData) {
 
 function _hasAnyRawPayload(record) {
   return !!(
-    _stringifyField(record && record.jobDescription) ||
+    _stringifyField(record && record.sourceJd) ||
     _stringifyField(record && record.sourceTask) ||
     _stringifyField(record && record.sourceUrl) ||
     _stringifyField(record && record.rawRef)
