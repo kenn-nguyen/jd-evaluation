@@ -3,20 +3,63 @@ var CRITICAL_FAILURE_MIN_COUNT = 5;
 var ACTIVE_RUN_STATE_PROPERTY_KEY = 'ACTIVE_JOB_IMPORT_RUN_STATE';
 var RESUME_TRIGGER_HANDLER = 'resumeJobImportAndScoring';
 var BACKUP_RESUME_TRIGGER_DELAY_MS = 7 * 60 * 1000;
-var BATCH_POLL_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * Standardized status-board progress tracker.
+ * Holds a progressState object and exposes:
+ *   tracker.update(patch)   — merges patch into state and writes to status board immediately
+ *   tracker.callback        — drop-in progressCallback for pipeline calls (same as update)
+ *   tracker.get()           — returns current state (pass to notification helpers, etc.)
+ *
+ * Usage:
+ *   var tracker = _createProgressTracker({ lastRun: new Date(), status: 'Starting' });
+ *   importAndScoreJobs(config, existingIndex, tracker.callback);
+ *   tracker.update({ status: 'Writing sheet', processed: '5 / 10', ... });
+ */
+function _createProgressTracker(initialState) {
+  var state = {
+    lastRun: new Date(),
+    status: '',
+    processed: '',
+    scrapedCount: '',
+    uniqueRolesCount: '',
+    toScoreCount: '',
+    newJobsCount: '',
+    aJobsCount: '',
+    failedJobsCount: '',
+    scoredJobsCount: '',
+    errorMessage: ''
+  };
+  var keys = Object.keys(initialState || {});
+  for (var i = 0; i < keys.length; i++) {
+    if (initialState[keys[i]] !== undefined) state[keys[i]] = initialState[keys[i]];
+  }
+
+  function update(patch) {
+    var patchKeys = Object.keys(patch || {});
+    for (var j = 0; j < patchKeys.length; j++) {
+      if (patchKeys[j] === 'rows') continue; // rows go to writeJobs, not the status board state
+      if (patch[patchKeys[j]] !== undefined) state[patchKeys[j]] = patch[patchKeys[j]];
+    }
+    updateRunSummary(state);
+    if (patch && patch.rows && patch.rows.length) {
+      writeJobs(patch.rows); // stream each batch's results to the sheet as they arrive
+    }
+  }
+
+  function get() { return state; }
+
+  return { update: update, get: get, callback: update };
+}
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Jobs Pipeline')
-    .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
     .addItem('Run Now', 'runJobImportAndScoring')
-    .addItem('Deduplicate Existing Jobs', 'deduplicateExistingJobs')
-    .addItem('Deduplicate Similar JDs', 'deduplicateSimilarJds')
-    .addItem('Prune Expired Jobs', 'pruneExpiredJobs')
-    .addItem('Repair Job Links from Raw Ref', 'repairJobLinksFromRawRef')
-    .addItem('Migrate Raw Data', 'migrateRawData')
+    .addSeparator()
     .addItem('Reevaluate Active Backlog', 'reevaluateActiveBacklog')
     .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
+    .addItem('Rerun Raw Data', 'rerunAllFromRawData')
     .addSeparator()
     .addItem('Import Apify Run ID...', 'importApifyRunByIdPrompt')
     .addItem('Retry Apify Run ID...', 'resurrectApifyRunByIdPrompt')
@@ -24,6 +67,7 @@ function onOpen() {
     .addItem('Create Run Trigger', 'createRunTrigger')
     .addItem('Remove Run Triggers', 'removeHourlyTriggers')
     .addSeparator()
+    .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
     .addItem('Validate Config', 'validateConfiguration')
     .addToUi();
 }
@@ -111,217 +155,227 @@ function resurrectApifyRunByIdPrompt() {
   _runJobImportAndScoringInternal(_buildActiveRunStateFromApifyRunId(runId, true));
 }
 
-function _runJobImportAndScoringInternal(initialActiveRunState) {
+/**
+ * Single pipeline execution engine used by every run entry point.
+ *
+ * options:
+ *   pipelineFn      — importAndScoreJobs or reevaluateExistingJobs
+ *   initialStatus   — first status string shown on the status board
+ *   requireApify    — boolean; pass true for import runs
+ *   validateMode    — if set, throws when activeRunState.mode !== this value
+ *   postProcess     — boolean; run prune + dedup after completion (import only)
+ *   notify          — boolean; send completion/failure emails (import only)
+ *   initialTrackerExtra — extra fields merged into the opening tracker state
+ */
+
+// Patches existingIndex records whose rawRef was not populated by the cross-sheet lookup
+// (can happen when the job_id column in Job Priority has date-corrupted values). Reads
+// Raw_Data directly and fills in rawRef + jobDescription for any record that's missing them.
+function _patchIndexWithRawData(existingIndex) {
+  var rawDataIndex = getRawDataIndex();
+  var records = existingIndex.records || [];
+  records.forEach(function(r) {
+    if (_stringifyField(r.rawRef)) return;
+    var jobId = _extractLinkedInJobId(_stringifyField(r.jobId));
+    if (!jobId) return;
+    var rawData = rawDataIndex.byJobId[jobId];
+    if (!rawData || !rawData.rawRef) return;
+    r.rawRef = rawData.rawRef;
+    r.jobDescription = r.jobDescription || _extractJobDescriptionFromRawRef(rawData.rawRef);
+    if (existingIndex.byJobId[jobId]) {
+      existingIndex.byJobId[jobId].rawRef = r.rawRef;
+      existingIndex.byJobId[jobId].jobDescription = existingIndex.byJobId[jobId].jobDescription || r.jobDescription;
+    }
+  });
+}
+
+function _runPipelineInternal(activeRunState, options) {
   var lock = LockService.getScriptLock();
   var executionStartedAt = new Date();
-  var activeRunState = initialActiveRunState || _loadActiveRunState() || _createEmptyImportRunState(executionStartedAt);
-  var scoringRunStartedAt = activeRunState && activeRunState.runStartedAt ? new Date(activeRunState.runStartedAt) : executionStartedAt;
+  var scoringRunStartedAt = activeRunState && activeRunState.runStartedAt
+    ? new Date(activeRunState.runStartedAt) : executionStartedAt;
   var config = null;
   var resumedAfterUnexpectedStop = false;
-  var progressState = {
-    lastRun: executionStartedAt,
-    status: 'Starting Apify task',
-    processed: '',
-    scrapedCount: '',
-    uniqueRolesCount: '',
-    toScoreCount: '',
-    newJobsCount: '',
-    aJobsCount: '',
-    failedJobsCount: '',
-    scoredJobsCount: '',
-    errorMessage: ''
-  };
+
+  var initialTrackerState = { lastRun: executionStartedAt, status: options.initialStatus || 'Running' };
+  var extra = options.initialTrackerExtra || {};
+  var extraKeys = Object.keys(extra);
+  for (var k = 0; k < extraKeys.length; k++) initialTrackerState[extraKeys[k]] = extra[extraKeys[k]];
+  var tracker = _createProgressTracker(initialTrackerState);
+  tracker.update({}); // Write initial status immediately — before lock wait or any API calls
 
   lock.waitLock(30000);
 
   try {
     ensureWorkbookReadyForRuntime();
 
-    if (initialActiveRunState) {
+    // Clear any stale saved state only when a fresh initialActiveRunState was explicitly passed
+    if (options._hadInitialState) {
       _clearActiveRunState();
       _removeResumeTriggers();
+    }
+
+    if (options.validateMode && (!activeRunState || activeRunState.mode !== options.validateMode)) {
+      throw new Error('No active ' + options.validateMode + ' state was found.');
     }
 
     config = loadRuntimeConfig();
     config.runStartedAt = scoringRunStartedAt;
     config.activeRunState = activeRunState;
+    if (activeRunState && activeRunState.forceRescore) config.forceRescore = true;
     resumedAfterUnexpectedStop = _markTrackedExecutionStarted(activeRunState, executionStartedAt);
     _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
 
-    // If a Vertex batch job is pending collection, poll it instead of running a new import
-    if (activeRunState && activeRunState.batchPending && activeRunState.batchJobName) {
-      validateRuntimeConfig(config, { requireApify: false });
-      progressState.status = 'Polling batch scoring job';
-      updateRunSummary(progressState);
-      var batchResult = _handleBatchCollection(activeRunState, config);
-      writeJobs(batchResult.rows);
-      sortAndRankJobs();
-
-      if (batchResult.batchPending) {
-        _markTrackedExecutionFinished(batchResult.activeRunState, 'yielded');
-        _saveActiveRunState(batchResult.activeRunState);
-        _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
-        progressState.status = 'Batch scoring in progress — next poll in 10 min';
-        updateRunSummary(progressState);
-        return batchResult;
-      }
-
-      _markTrackedExecutionFinished(batchResult.activeRunState, 'completed');
-      _clearActiveRunState();
-      _removeResumeTriggers();
-
-      try {
-        progressState.status = 'Pruning expired jobs';
-        updateRunSummary(progressState);
-        pruneExpiredJobRows();
-      } catch (batchPruneError) { Logger.log(batchPruneError); }
-
-      try {
-        progressState.status = 'Deduplicating similar JDs';
-        updateRunSummary(progressState);
-        deduplicateSimilarJdRows();
-      } catch (batchDedupError) { Logger.log(batchDedupError); }
-
-      batchResult.newAJobs = _getJobsByJobIds(batchResult.newTopPriorityJobIds || []);
-      progressState.status = 'Completed';
-      progressState.scoredJobsCount = batchResult.scoredJobsCount;
-      progressState.failedJobsCount = batchResult.failedJobsCount;
-      progressState.errorMessage = batchResult.errors && batchResult.errors.length
-        ? _truncate(batchResult.errors.join(' | '), 500) : '';
-      updateRunSummary(progressState);
-      _sendCompletionNotifications(config, batchResult, progressState);
-      return batchResult;
-    }
-
-    validateRuntimeConfig(config);
-    updateRunSummary(progressState);
+    validateRuntimeConfig(config, options.requireApify ? undefined : { requireApify: false });
+    tracker.update({});
 
     if (resumedAfterUnexpectedStop) {
-      progressState.errorMessage = 'Previous execution stopped unexpectedly, likely due to an Apps Script timeout. Resuming from saved progress.';
-      updateRunSummary(progressState);
+      tracker.update({ errorMessage: 'Previous execution stopped unexpectedly, likely due to an Apps Script timeout. Resuming from saved progress.' });
     }
 
     var existingIndex = getExistingJobIndex();
-    var result = importAndScoreJobs(config, existingIndex, function(nextState) {
-      if (nextState.status) {
-        progressState.status = nextState.status;
-      }
-      if (nextState.processed !== undefined) {
-        progressState.processed = nextState.processed;
-      }
-      if (nextState.scrapedCount !== undefined) {
-        progressState.scrapedCount = nextState.scrapedCount;
-      }
-      if (nextState.uniqueRolesCount !== undefined) {
-        progressState.uniqueRolesCount = nextState.uniqueRolesCount;
-      }
-      if (nextState.toScoreCount !== undefined) {
-        progressState.toScoreCount = nextState.toScoreCount;
-      }
-      if (nextState.errorMessage !== undefined) {
-        progressState.errorMessage = nextState.errorMessage;
-      }
-      updateRunSummary(progressState);
+    // For reevaluation runs, patch any records whose rawRef was not populated by the
+    // cross-sheet lookup (e.g. date-corrupted job_id column in Job Priority sheet).
+    if (!options.requireApify) {
+      _patchIndexWithRawData(existingIndex);
+    }
+    var result = options.pipelineFn(config, existingIndex, tracker.callback);
+
+    tracker.update({
+      status: 'Writing sheet',
+      processed: result.processedCount + ' / ' + result.totalJobsCount,
+      scrapedCount: result.rawScrapedCount,
+      uniqueRolesCount: result.uniqueRolesCount,
+      toScoreCount: result.totalScoreableCount,
+      newJobsCount: result.newJobsCount,
+      aJobsCount: result.aJobsCount,
+      failedJobsCount: result.failedJobsCount,
+      scoredJobsCount: result.scoredJobsCount
     });
 
-    progressState.status = 'Writing sheet';
-    progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
-    progressState.scrapedCount = result.rawScrapedCount;
-    progressState.uniqueRolesCount = result.uniqueRolesCount;
-    progressState.toScoreCount = result.totalScoreableCount;
-    progressState.newJobsCount = result.newJobsCount;
-    progressState.aJobsCount = result.aJobsCount;
-    progressState.failedJobsCount = result.failedJobsCount;
-    progressState.scoredJobsCount = result.scoredJobsCount;
-    updateRunSummary(progressState);
-
     writeJobs(result.rows);
-    sortAndRankJobs();
-
-    if (result.batchPending) {
-      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
-      _saveActiveRunState(result.activeRunState);
-      _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
-
-      progressState.status = 'Batch scoring submitted — waiting for Vertex AI results';
-      progressState.toScoreCount = result.totalScoreableCount;
-      progressState.errorMessage = 'Batch job submitted. Results will be applied automatically when ready (polling every 10 min).';
-      updateRunSummary(progressState);
-
-      return result;
-    }
 
     if (result.hasMore) {
       _markTrackedExecutionFinished(result.activeRunState, 'yielded');
       _saveActiveRunState(result.activeRunState);
       _scheduleResumeTrigger();
+      // Skip sortAndRankJobs here — it holds the lock for 30-90s, which causes the 1-min
+      // resume trigger to fail its lock wait (chain relies on backup trigger instead, adding
+      // 1+ min of idle time per cycle). Sort happens on final completion only.
 
-      progressState.status = 'Continuing in next execution';
-      progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
-      progressState.scrapedCount = result.rawScrapedCount;
-      progressState.uniqueRolesCount = result.uniqueRolesCount;
-      progressState.toScoreCount = result.totalScoreableCount;
-      progressState.newJobsCount = result.newJobsCount;
-      progressState.aJobsCount = result.aJobsCount;
-      progressState.failedJobsCount = result.failedJobsCount;
-      progressState.scoredJobsCount = result.scoredJobsCount;
-      progressState.errorMessage = result.errors.length
-        ? _truncate(result.errors.join(' | '), 500)
-        : 'Continuation scheduled automatically before the Apps Script execution limit.';
-      updateRunSummary(progressState);
+      tracker.update({
+        status: 'Continuing in next execution',
+        processed: result.processedCount + ' / ' + result.totalJobsCount,
+        scrapedCount: result.rawScrapedCount,
+        uniqueRolesCount: result.uniqueRolesCount,
+        toScoreCount: result.totalScoreableCount,
+        newJobsCount: result.newJobsCount,
+        aJobsCount: result.aJobsCount,
+        failedJobsCount: result.failedJobsCount,
+        scoredJobsCount: result.scoredJobsCount,
+        errorMessage: result.errors.length
+          ? _truncate(result.errors.join(' | '), 500)
+          : 'Continuation scheduled automatically before the Apps Script execution limit.'
+      });
 
       return result;
     }
+
+    sortAndRankJobs();
 
     _markTrackedExecutionFinished(result.activeRunState, 'completed');
     _clearActiveRunState();
     _removeResumeTriggers();
 
-    try {
-      progressState.status = 'Pruning expired jobs';
-      updateRunSummary(progressState);
-      pruneExpiredJobRows();
-    } catch (pruneError) {
-      Logger.log(pruneError);
+    if (options.postProcess) {
+      try {
+        tracker.update({ status: 'Pruning expired jobs' });
+        pruneExpiredJobRows();
+      } catch (pruneError) {
+        Logger.log(pruneError);
+      }
+
+      try {
+        tracker.update({ status: 'Deduplicating similar JDs' });
+        deduplicateSimilarJdRows();
+      } catch (dedupError) {
+        Logger.log(dedupError);
+      }
+
+      result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
     }
 
-    try {
-      progressState.status = 'Deduplicating similar JDs';
-      updateRunSummary(progressState);
-      deduplicateSimilarJdRows();
-    } catch (dedupError) {
-      Logger.log(dedupError);
+    tracker.update({
+      status: 'Completed',
+      processed: result.processedCount + ' / ' + result.totalJobsCount,
+      scrapedCount: result.rawScrapedCount,
+      uniqueRolesCount: result.uniqueRolesCount,
+      toScoreCount: result.totalScoreableCount,
+      newJobsCount: result.newJobsCount,
+      aJobsCount: result.aJobsCount,
+      failedJobsCount: result.failedJobsCount,
+      scoredJobsCount: result.scoredJobsCount,
+      errorMessage: result.errors.length ? _truncate(result.errors.join(' | '), 500) : ''
+    });
+
+    if (options.notify) {
+      _sendCompletionNotifications(config, result, tracker.get());
     }
-
-    result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
-
-    progressState.status = 'Completed';
-    progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
-    progressState.scrapedCount = result.rawScrapedCount;
-    progressState.uniqueRolesCount = result.uniqueRolesCount;
-    progressState.toScoreCount = result.totalScoreableCount;
-    progressState.newJobsCount = result.newJobsCount;
-    progressState.aJobsCount = result.aJobsCount;
-    progressState.failedJobsCount = result.failedJobsCount;
-    progressState.scoredJobsCount = result.scoredJobsCount;
-    progressState.errorMessage = result.errors.length ? _truncate(result.errors.join(' | '), 500) : '';
-    updateRunSummary(progressState);
-    _sendCompletionNotifications(config, result, progressState);
 
     return result;
   } catch (error) {
-    _clearActiveRunState();
-    _removeResumeTriggers();
-    progressState.status = 'Failed';
-    progressState.errorMessage = _truncate(error && error.message ? error.message : String(error), 500);
-    updateRunSummary(progressState);
-    _sendWholeRunFailureNotification(config, progressState, error);
+    var errorMsg = error && error.message ? error.message : String(error);
+    // Do NOT wipe saved state on timeout — the backup trigger needs it to resume.
+    var isTimeout = errorMsg.indexOf('Exceeded maximum execution time') !== -1 ||
+                    errorMsg.indexOf('Script execution time') !== -1;
+    if (!isTimeout) {
+      _clearActiveRunState();
+      _removeResumeTriggers();
+      if (options.notify) {
+        _sendWholeRunFailureNotification(config, tracker.get(), error);
+      }
+    }
+    tracker.update({
+      status: isTimeout ? 'Continuing in next execution' : 'Failed',
+      errorMessage: _truncate(errorMsg, 500)
+    });
     throw error;
   } finally {
     if (lock.hasLock()) {
       lock.releaseLock();
     }
   }
+}
+
+function _runJobImportAndScoringInternal(initialActiveRunState) {
+  var executionStartedAt = new Date();
+  var activeRunState = initialActiveRunState || _loadActiveRunState() || _createEmptyImportRunState(executionStartedAt);
+  return _runPipelineInternal(activeRunState, {
+    pipelineFn: importAndScoreJobs,
+    initialStatus: 'Starting Apify task',
+    requireApify: true,
+    postProcess: true,
+    notify: true,
+    _hadInitialState: !!initialActiveRunState
+  });
+}
+
+function _runJobReevaluationInternal(initialActiveRunState) {
+  var activeRunState = initialActiveRunState || _loadActiveRunState();
+  return _runPipelineInternal(activeRunState, {
+    pipelineFn: reevaluateExistingJobs,
+    initialStatus: 'Reevaluating jobs',
+    requireApify: false,
+    validateMode: 'reevaluate',
+    postProcess: false,
+    notify: false,
+    _hadInitialState: !!initialActiveRunState,
+    initialTrackerExtra: {
+      uniqueRolesCount: activeRunState && activeRunState.totalJobsCount ? activeRunState.totalJobsCount : '',
+      toScoreCount: activeRunState && activeRunState.totalScoreableCount ? activeRunState.totalScoreableCount : '',
+      aJobsCount: activeRunState && activeRunState.aJobsCount ? activeRunState.aJobsCount : ''
+    }
+  });
 }
 
 function createRunTrigger() {
@@ -433,7 +487,7 @@ function reevaluateActiveBacklog() {
   }
 
   if (!Number(activeRunState.totalScoreableCount || 0)) {
-    SpreadsheetApp.getUi().alert('No active backlog rows need reevaluation. They either already match the current scoring fingerprint or are missing source_jd.');
+    SpreadsheetApp.getUi().alert('No active backlog rows need reevaluation. They either already match the current scoring fingerprint or have no job description in Raw_Data (re-import first).');
     return;
   }
 
@@ -443,40 +497,58 @@ function reevaluateActiveBacklog() {
 function reevaluateSelectedRows() {
   ensureWorkbookReadyForRuntime();
 
-  var sheet = _getJobPrioritySheet();
-  var range = sheet && sheet.getActiveRange();
-  var selectedRows = {};
-  var selectedRecords = [];
+  var ui = SpreadsheetApp.getUi();
+  var jobSheet = _getJobPrioritySheet();
+  var range = jobSheet && jobSheet.getActiveRange();
 
   if (!range) {
-    SpreadsheetApp.getUi().alert('Select one or more job rows first.');
+    ui.alert('Select one or more job rows first.');
     return;
   }
 
-  for (var row = range.getRow(); row < range.getRow() + range.getNumRows(); row += 1) {
-    if (row >= JOB_PRIORITY_DATA_START_ROW) {
-      selectedRows[row] = true;
-    }
+  // Collect job IDs from selected data rows
+  var jobIdCol   = JOB_PRIORITY_COLUMN_INDEX.job_id;
+  var statusCol  = JOB_PRIORITY_COLUMN_INDEX.status;
+  var jobLinkCol = JOB_PRIORITY_COLUMN_INDEX.job_link;
+  var selectedJobIds = {};
+
+  for (var r = range.getRow(); r < range.getRow() + range.getNumRows(); r++) {
+    if (r < JOB_PRIORITY_DATA_START_ROW) continue;
+    var rowValues   = jobSheet.getRange(r, 1, 1, JOB_PRIORITY_COLUMNS.length).getValues()[0];
+    var rowFormulas = jobSheet.getRange(r, 1, 1, JOB_PRIORITY_COLUMNS.length).getFormulas()[0];
+    var status = _stringifyField(rowValues[statusCol - 1]);
+    if (!_isReevaluationEligibleStatus(status)) continue;
+
+    var rawJobId    = _stringifyField(rowValues[jobIdCol - 1]);
+    var linkFormula = _stringifyField(rowFormulas[jobLinkCol - 1]);
+    var linkUrl     = linkFormula.match(/=HYPERLINK\("([^"]+)"/i);
+    var jobId = _extractLinkedInJobId(rawJobId) ||
+                _extractLinkedInJobId(linkUrl ? linkUrl[1] : '');
+    if (jobId) selectedJobIds[jobId] = true;
   }
 
+  if (!Object.keys(selectedJobIds).length) {
+    ui.alert('No eligible rows selected. Applied and Skip rows are ignored.');
+    return;
+  }
+
+  // Filter existing records to selected job IDs and route through standard pipeline
   var config = loadRuntimeConfig();
   validateRuntimeConfig(config, { requireApify: false });
   var existingIndex = getExistingJobIndex();
-  existingIndex.records.forEach(function(record) {
-    if (selectedRows[record.rowNumber] && _isReevaluationEligibleStatus(record.status)) {
-      selectedRecords.push(record);
-    }
+  var selectedRecords = existingIndex.records.filter(function(r) {
+    return selectedJobIds[_extractLinkedInJobId(_stringifyField(r.jobId)) || _stringifyField(r.jobId)];
   });
-
   var activeRunState = _buildReevaluationStateFromRecords(selectedRecords, config, 'selected rows');
+  activeRunState.forceRescore = true;
 
   if (!activeRunState.targetJobIds.length) {
-    SpreadsheetApp.getUi().alert('No eligible selected rows were found. Reevaluation ignores Applied and Skip rows.');
+    ui.alert('No eligible rows selected. Applied and Skip rows are ignored.');
     return;
   }
 
   if (!Number(activeRunState.totalScoreableCount || 0)) {
-    SpreadsheetApp.getUi().alert('No selected rows need reevaluation. They either already match the current scoring fingerprint or are missing source_jd.');
+    ui.alert('Selected rows have no job descriptions in Raw_Data. Run "Run Now" or "Import Apify Run ID" first to populate Raw_Data.');
     return;
   }
 
@@ -505,254 +577,61 @@ function repairJobLinksFromRawRef() {
   SpreadsheetApp.getUi().alert(message.join('\n'));
 }
 
-function migrateRawData() {
+
+function rerunAllFromRawData() {
   ensureWorkbookReadyForRuntime();
 
-  var result = migrateRawDataToDedicatedSheet();
-  var message = [
-    'Raw-data migration completed.',
-    'Rows checked: ' + result.checkedCount,
-    'Rows migrated: ' + result.migratedCount,
-    'Rows skipped: ' + result.skippedCount,
-    'Missing job_id: ' + result.missingJobIdCount
-  ];
+  var ui = SpreadsheetApp.getUi();
+  var config = loadRuntimeConfig();
+  validateRuntimeConfig(config, { requireApify: false });
 
-  SpreadsheetApp.getUi().alert(message.join('\n'));
-}
+  // Read Raw_Data directly — the cross-sheet lookup in getExistingJobIndex may miss rawRef
+  // when the job_id column in Job Priority has date-corrupted values.
+  var rawDataIndex = getRawDataIndex();
+  var allRecords = getExistingJobIndex().records;
 
-function _runJobReevaluationInternal(initialActiveRunState) {
-  var lock = LockService.getScriptLock();
-  var executionStartedAt = new Date();
-  var activeRunState = initialActiveRunState || _loadActiveRunState();
-  var scoringRunStartedAt = activeRunState && activeRunState.runStartedAt ? new Date(activeRunState.runStartedAt) : executionStartedAt;
-  var config = null;
-  var resumedAfterUnexpectedStop = false;
-  var progressState = {
-    lastRun: executionStartedAt,
-    status: 'Reevaluating jobs',
-    processed: '',
-    scrapedCount: '',
-    uniqueRolesCount: activeRunState && activeRunState.totalJobsCount ? activeRunState.totalJobsCount : '',
-    toScoreCount: activeRunState && activeRunState.totalScoreableCount ? activeRunState.totalScoreableCount : '',
-    newJobsCount: '',
-    aJobsCount: activeRunState && activeRunState.aJobsCount ? activeRunState.aJobsCount : '',
-    failedJobsCount: '',
-    scoredJobsCount: '',
-    errorMessage: ''
-  };
-
-  lock.waitLock(30000);
-
-  try {
-    ensureWorkbookReadyForRuntime();
-
-    if (initialActiveRunState) {
-      _clearActiveRunState();
-      _removeResumeTriggers();
+  // Patch any records whose rawRef was not populated by the cross-sheet lookup.
+  allRecords.forEach(function(r) {
+    if (_stringifyField(r.rawRef)) return;
+    var jobId = _extractLinkedInJobId(_stringifyField(r.jobId));
+    if (!jobId) return;
+    var rawData = rawDataIndex.byJobId[jobId];
+    if (rawData && rawData.rawRef) {
+      r.rawRef = rawData.rawRef;
+      r.jobDescription = _extractJobDescriptionFromRawRef(rawData.rawRef);
     }
+  });
 
-    if (!activeRunState || activeRunState.mode !== 'reevaluate') {
-      throw new Error('No active reevaluation state was found.');
-    }
+  // Dedup by job ID — keep only the most recent record per job ID
+  var grouped = _groupJobRecordsByJobId(allRecords);
+  var deduped = Object.keys(grouped).map(function(jobId) {
+    var group = grouped[jobId];
+    return group.length === 1 ? group[0] : _mergeDuplicateJobRecordsByJobId(group);
+  });
 
-    config = loadRuntimeConfig();
-    config.runStartedAt = scoringRunStartedAt;
-    config.activeRunState = activeRunState;
-    resumedAfterUnexpectedStop = _markTrackedExecutionStarted(activeRunState, executionStartedAt);
-    _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
+  var scoreable = deduped.filter(function(r) {
+    if (!_extractLinkedInJobId(_stringifyField(r.jobId))) return false;
+    return _stringifyField(r.jobDescription) || _extractJobDescriptionFromRawRef(_stringifyField(r.rawRef));
+  });
 
-    // If a Vertex batch job is pending collection, poll it instead of running reevaluation
-    if (activeRunState && activeRunState.batchPending && activeRunState.batchJobName) {
-      validateRuntimeConfig(config, { requireApify: false });
-      progressState.status = 'Polling batch scoring job';
-      updateRunSummary(progressState);
-      var revalBatchResult = _handleBatchCollection(activeRunState, config);
-      writeJobs(revalBatchResult.rows);
-      sortAndRankJobs();
-
-      if (revalBatchResult.batchPending) {
-        _markTrackedExecutionFinished(revalBatchResult.activeRunState, 'yielded');
-        _saveActiveRunState(revalBatchResult.activeRunState);
-        _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
-        progressState.status = 'Batch scoring in progress — next poll in 10 min';
-        updateRunSummary(progressState);
-        return revalBatchResult;
-      }
-
-      _markTrackedExecutionFinished(revalBatchResult.activeRunState, 'completed');
-      _clearActiveRunState();
-      _removeResumeTriggers();
-      progressState.status = 'Completed';
-      progressState.scoredJobsCount = revalBatchResult.scoredJobsCount;
-      progressState.failedJobsCount = revalBatchResult.failedJobsCount;
-      progressState.errorMessage = revalBatchResult.errors && revalBatchResult.errors.length
-        ? _truncate(revalBatchResult.errors.join(' | '), 500) : '';
-      updateRunSummary(progressState);
-      return revalBatchResult;
-    }
-
-    validateRuntimeConfig(config, { requireApify: false });
-    updateRunSummary(progressState);
-
-    if (resumedAfterUnexpectedStop) {
-      progressState.errorMessage = 'Previous execution stopped unexpectedly, likely due to an Apps Script timeout. Resuming from saved progress.';
-      updateRunSummary(progressState);
-    }
-
-    var existingIndex = getExistingJobIndex();
-    var result = reevaluateExistingJobs(config, existingIndex, function(nextState) {
-      if (nextState.status) {
-        progressState.status = nextState.status;
-      }
-      if (nextState.processed !== undefined) {
-        progressState.processed = nextState.processed;
-      }
-      if (nextState.uniqueRolesCount !== undefined) {
-        progressState.uniqueRolesCount = nextState.uniqueRolesCount;
-      }
-      if (nextState.toScoreCount !== undefined) {
-        progressState.toScoreCount = nextState.toScoreCount;
-      }
-      if (nextState.errorMessage !== undefined) {
-        progressState.errorMessage = nextState.errorMessage;
-      }
-      updateRunSummary(progressState);
-    });
-
-    progressState.status = 'Writing sheet';
-    progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
-    progressState.uniqueRolesCount = result.uniqueRolesCount;
-    progressState.toScoreCount = result.totalScoreableCount;
-    progressState.aJobsCount = result.aJobsCount;
-    progressState.failedJobsCount = result.failedJobsCount;
-    progressState.scoredJobsCount = result.scoredJobsCount;
-    updateRunSummary(progressState);
-
-    writeJobs(result.rows);
-    sortAndRankJobs();
-
-    if (result.batchPending) {
-      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
-      _saveActiveRunState(result.activeRunState);
-      _scheduleResumeTrigger(BATCH_POLL_INTERVAL_MS);
-
-      progressState.status = 'Batch scoring submitted — waiting for Vertex AI results';
-      progressState.toScoreCount = result.totalScoreableCount;
-      progressState.errorMessage = 'Batch job submitted. Results will be applied automatically when ready (polling every 10 min).';
-      updateRunSummary(progressState);
-
-      return result;
-    }
-
-    if (result.hasMore) {
-      _markTrackedExecutionFinished(result.activeRunState, 'yielded');
-      _saveActiveRunState(result.activeRunState);
-      _scheduleResumeTrigger();
-
-      progressState.status = 'Continuing in next execution';
-      progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
-      progressState.uniqueRolesCount = result.uniqueRolesCount;
-      progressState.toScoreCount = result.totalScoreableCount;
-      progressState.aJobsCount = result.aJobsCount;
-      progressState.failedJobsCount = result.failedJobsCount;
-      progressState.scoredJobsCount = result.scoredJobsCount;
-      progressState.errorMessage = result.errors.length
-        ? _truncate(result.errors.join(' | '), 500)
-        : 'Continuation scheduled automatically before the Apps Script execution limit.';
-      updateRunSummary(progressState);
-
-      return result;
-    }
-
-    _markTrackedExecutionFinished(result.activeRunState, 'completed');
-    _clearActiveRunState();
-    _removeResumeTriggers();
-
-    progressState.status = 'Completed';
-    progressState.processed = result.processedCount + ' / ' + result.totalJobsCount;
-    progressState.uniqueRolesCount = result.uniqueRolesCount;
-    progressState.toScoreCount = result.totalScoreableCount;
-    progressState.aJobsCount = result.aJobsCount;
-    progressState.failedJobsCount = result.failedJobsCount;
-    progressState.scoredJobsCount = result.scoredJobsCount;
-    progressState.errorMessage = result.errors.length ? _truncate(result.errors.join(' | '), 500) : '';
-    updateRunSummary(progressState);
-
-    return result;
-  } catch (error) {
-    _clearActiveRunState();
-    _removeResumeTriggers();
-    progressState.status = 'Failed';
-    progressState.errorMessage = _truncate(error && error.message ? error.message : String(error), 500);
-    updateRunSummary(progressState);
-    throw error;
-  } finally {
-    if (lock.hasLock()) {
-      lock.releaseLock();
-    }
-  }
-}
-
-function _handleBatchCollection(activeRunState, config) {
-  var status = _pollVertexBatchJobState(activeRunState.batchJobName, config);
-
-  Logger.log('Batch job ' + activeRunState.batchJobName + ' state: ' + status.state);
-
-  var pendingStates = { JOB_STATE_PENDING: true, JOB_STATE_RUNNING: true, JOB_STATE_QUEUED: true };
-  if (pendingStates[status.state]) {
-    activeRunState.updatedAt = new Date().toISOString();
-    return {
-      batchPending: true,
-      hasMore: false,
-      rows: [],
-      scoredJobsCount: activeRunState.scoredJobsCount || 0,
-      failedJobsCount: activeRunState.failedJobsCount || 0,
-      processedCount: activeRunState.processedCount || 0,
-      totalJobsCount: activeRunState.totalJobsCount || 0,
-      totalScoreableCount: activeRunState.totalScoreableCount || 0,
-      uniqueRolesCount: activeRunState.totalJobsCount || 0,
-      errors: activeRunState.errors || [],
-      newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || [],
-      activeRunState: activeRunState
-    };
+  if (!scoreable.length) {
+    ui.alert('No scoreable records found. Raw_Data may be empty — run "Import Apify Run ID" or "Run Now" first to populate it.');
+    return;
   }
 
-  if (status.state !== 'JOB_STATE_SUCCEEDED') {
-    throw new Error('Vertex batch job ended with state ' + status.state +
-      (status.error ? ': ' + status.error : ''));
-  }
+  var response = ui.alert(
+    'Rerun Raw Data',
+    scoreable.length + ' records will be force-rescored using Gemini. Continue?',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response !== ui.Button.OK) return;
 
-  var existingIndex = getExistingJobIndex();
-  var batchResults = _readBatchJobResults(activeRunState, status.outputDirectory, config, existingIndex);
+  var activeRunState = _buildReevaluationStateFromRecords(scoreable, config, 'all records');
+  activeRunState.forceRescore = true;
 
-  activeRunState.batchPending = false;
-  activeRunState.batchJobName = '';
-  activeRunState.scoredJobsCount = Number(activeRunState.scoredJobsCount || 0) + batchResults.scoredJobsCount;
-  activeRunState.failedJobsCount = Number(activeRunState.failedJobsCount || 0) + batchResults.failedJobsCount;
-  activeRunState.processedCount = Number(activeRunState.totalJobsCount || 0);
-  activeRunState.errors = _appendErrors(activeRunState.errors || [], batchResults.errors);
-  activeRunState.updatedAt = new Date().toISOString();
-
-  Logger.log('Batch collection complete: ' + batchResults.scoredJobsCount + ' scored, ' +
-    batchResults.failedJobsCount + ' failed');
-
-  return {
-    batchPending: false,
-    hasMore: false,
-    rows: batchResults.scoredRows,
-    scoredJobsCount: activeRunState.scoredJobsCount,
-    failedJobsCount: activeRunState.failedJobsCount,
-    processedCount: activeRunState.processedCount,
-    totalJobsCount: activeRunState.totalJobsCount || 0,
-    totalScoreableCount: activeRunState.totalScoreableCount || 0,
-    uniqueRolesCount: activeRunState.totalJobsCount || 0,
-    newJobsCount: activeRunState.newJobsCount || '',
-    aJobsCount: activeRunState.aJobsCount || 0,
-    errors: activeRunState.errors || [],
-    newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || [],
-    activeRunState: activeRunState
-  };
+  _runJobReevaluationInternal(activeRunState);
 }
+
 
 function _buildReevaluationStateFromRecords(records, config, modeLabel) {
   var seen = {};
@@ -794,6 +673,7 @@ function _buildReevaluationStateFromRecords(records, config, modeLabel) {
     scoredJobsCount: 0,
     importFailedJobsCount: 0,
     handledJobIds: [],
+    pendingStage2JobIds: [],
     newTopPriorityJobIds: [],
     errors: []
   };
@@ -814,6 +694,7 @@ function _createEmptyImportRunState(runStartedAt) {
     scoredJobsCount: 0,
     importFailedJobsCount: 0,
     handledJobIds: [],
+    pendingStage2JobIds: [],
     newTopPriorityJobIds: [],
     errors: []
   };
@@ -858,7 +739,6 @@ function _hasScoringPayload(record) {
     _stringifyField(record.usVisaReason) &&
     _stringifyField(record.summary) &&
     _stringifyField(record.why) &&
-    _stringifyField(record.angle) &&
     record.score !== '';
 }
 
@@ -1001,6 +881,7 @@ function _buildActiveRunStateFromApifyRunId(runId, shouldResurrect) {
     scoredJobsCount: 0,
     importFailedJobsCount: 0,
     handledJobIds: [],
+    pendingStage2JobIds: [],
     newTopPriorityJobIds: [],
     errors: []
   };
@@ -1177,3 +1058,5 @@ function _sendEmailSafely(message) {
     Logger.log(error);
   }
 }
+
+

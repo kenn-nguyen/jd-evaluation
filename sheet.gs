@@ -29,24 +29,17 @@ var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'job_link',
   'summary',
   'why',
-  'us_visa_reason',
-  'angle',
-  'notes'
+  'us_visa_reason'
 ];
 var JOB_PRIORITY_HIDDEN_COLUMNS = [
-  'source_jd',
   'job_id',
   'imported_at',
   'scored_at',
-  'source_task',
-  'posted_sort',
-  'source_url',
   'scoring_fingerprint',
-  'raw_ref'
+  'merged_job_ids'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
-var DEDUP_ARCHIVE_COLUMNS = ['deduped_at'].concat(JOB_PRIORITY_COLUMNS);
-var RAW_DATA_COLUMNS = ['job_id', 'source_jd', 'source_task', 'source_url', 'raw_ref', 'updated_at'];
+var RAW_DATA_COLUMNS = ['job_id', 'raw_ref'];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
   var map = {};
   for (var i = 0; i < JOB_PRIORITY_COLUMNS.length; i += 1) {
@@ -60,8 +53,14 @@ var SETTINGS_DEFAULT_ROWS = [
   ['GEMINI_API_ROUTE', 'developer', 'developer uses Gemini Developer API. vertex uses your linked Google Cloud project and Vertex billing.'],
   ['VERTEX_PROJECT_ID', '', 'Required only when GEMINI_API_ROUTE=vertex. Use your standard Google Cloud project id.'],
   ['VERTEX_LOCATION', 'global', 'Usually keep global for Gemini models on Vertex'],
-  ['SCORING_MODEL', 'gemini-2.5-flash', 'Editable model name used for scoring'],
+  ['SCORING_MODEL', 'gemini-2.5-flash', 'Editable model name used for scoring. Used as fallback when STAGE1_MODEL or STAGE2_MODEL are blank.'],
   ['SCORING_PARALLEL_REQUESTS', '3', 'How many AI scoring requests to send in parallel per batch'],
+  ['SCORING_RPM_LIMIT', '0', 'API rate limit in requests per minute. Set to your Vertex/Gemini quota (e.g. 10 for free trial). 0 = no pacing.'],
+  ['SCORING_MAX_JOBS_PER_EXECUTION', '0', 'Max jobs scored per Apps Script execution. 0 = auto-calculated from RPM and batch size to fit within 5 minutes. Override if the auto value is too conservative or too aggressive.'],
+  ['STAGE1_MODEL', 'gemini-2.5-flash', 'Model for Stage 1: scores all jobs with the full prompt for a coarse P01-P10 sort. Leave blank to use SCORING_MODEL.'],
+  ['STAGE2_MODEL', 'gemini-2.5-flash', 'Model for Stage 2: re-scores the promising subset from Stage 1. Default: same as Stage 1 (shared cache). Change to gemini-2.5-pro for higher quality at greater cost.'],
+  ['STAGE2_THRESHOLD', 'P05', 'Stage 1 jobs at or above this priority are re-scored in Stage 2. Valid values: P01-P09. Default P05 (re-scores P01-P05).'],
+  ['STAGE2_THINKING_BUDGET', '0', 'Thinking token budget for Stage 2. 0 = off. Try 1024 (light) or 8192 (deep). Effective on Gemini 2.5 Flash/Pro. When Stage 1 and Stage 2 use the same model, thinking adds quality with no extra cache cost.'],
   ['TARGET_PROFILE', 'Candidate target profile:\n\nExperienced product manager / product leader with 10+ years of experience, most recently Senior Product Manager / Associate Product Director level, with Yale SOM and NUS MBA training.\n\nPrimary interview wedge:\nfintech infrastructure, banking technology, payments, fraud/risk, identity verification, authentication, biometric/liveness verification, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification platforms, and regulated financial workflows for banks/fintechs.\n\nStrong proof points:\nscaled API-based identity/risk verification from ~500K to ~2M daily verifications across cloud and on-prem; launched biometric payment authentication across 9 tier-1 banks; owned fraud/risk, KYC, liveness, authentication, and API verification products; improved verification/authentication conversion; reduced integration friction; defined ML product/model requirements; supported ~40% YoY ARR/API growth; standardized platform deployments across markets.\n\nSecondary/adjacent fit:\nAI workflow, agentic AI, API/developer platforms, technical platform PM, B2B SaaS, data products, security/governance, and enterprise workflow. Lumi supports AI workflow and product-building evidence, but should not be treated as equivalent to large-scale enterprise AI platform PM experience.\n\nDirect fit requires the role itself to own payments, fraud/risk, identity, authentication, KYC, onboarding, risk decisioning, API verification, or financial infrastructure. Do not treat a financial-services customer segment or famous employer as direct domain fit.\n\nPrioritize PM and Senior PM roles. Treat Staff, Principal, Director, VP+, entry-level, pure engineering, pure strategy, product marketing, sales, account management, support, operations, healthcare clinical systems, procurement, supply chain, ads, gaming, marketplace operations, and investment-product roles as lower priority unless the JD has unusually strong product ownership and proof mapping.', 'Editable scoring context. Replace this with your own resume-derived profile text as needed.'],
   ['SCORING_INSTRUCTIONS', 'default', 'Use default to keep the built-in scoring prompt, or replace with your own instruction block. The built-in prompt scores interview-conversion priority and evaluates visa separately at the end.'],
   ['NOTIFY_EMAIL', '', 'Optional. Email address for P01-priority alerts and critical failure alerts'],
@@ -70,9 +69,6 @@ var SETTINGS_DEFAULT_ROWS = [
   ['RUN_INTERVAL_HOURS', '4', 'How often the pipeline runs (hours). Supported values: 1, 2, 4, 6, 8, 12.'],
   ['QUIET_START_HOUR', '19', 'Hour to stop running, 0-23 Pacific Time. Default 19 = 7pm PT.'],
   ['QUIET_END_HOUR', '5', 'Hour to resume running, 0-23 Pacific Time. Default 5 = 5am PT. Set both to 0 to disable quiet hours.'],
-  ['GCS_BUCKET', '', 'GCS bucket name for Vertex AI Batch Prediction (e.g. my-job-scoring). Required when BATCH_MODE is not off. Vertex only.'],
-  ['BATCH_MODE', 'off', 'off = synchronous. auto = batch when job count >= BATCH_AUTO_THRESHOLD. always = always batch. Vertex AI only.'],
-  ['BATCH_AUTO_THRESHOLD', '50', 'Minimum job count to trigger batch mode when BATCH_MODE=auto. Default 50.']
 ];
 var HELP_ROWS = [
   ['Job Priority Help', ''],
@@ -89,16 +85,15 @@ var HELP_ROWS = [
   ['Step 10', 'Use Jobs Pipeline > Validate Config, then Jobs Pipeline > Run Now.'],
   ['Import old Apify run', 'Use Jobs Pipeline > Import Apify Run ID... to score a finished Apify run again from its saved dataset without scraping a new batch.'],
   ['Retry failed Apify run', 'Use Jobs Pipeline > Retry Apify Run ID... to rerun a finished or failed Apify run in Apify, wait for completion, then import and score that rerun.'],
-  ['Repair job links', 'Use Jobs Pipeline > Repair Job Links from Raw Ref to rebuild missing LinkedIn job links as https://www.linkedin.com/jobs/view/<job_id>/ using the job ID stored in raw_ref.'],
-  ['Migrate raw data', 'Use Jobs Pipeline > Migrate Raw Data to move source_jd, source_task, source_url, and raw_ref out of Job_Priority into the Raw_Data sheet keyed by job_id.'],
   ['Reevaluate active backlog', 'Use Jobs Pipeline > Reevaluate Active Backlog to rescore current New, Opened, and Tailoring rows using the latest prompt/profile. Applied and Skip rows are ignored.'],
   ['Reevaluate selected rows', 'Use Jobs Pipeline > Reevaluate Selected Rows to rescore only the currently selected job rows. Applied and Skip rows are ignored.'],
+  ['Rerun Raw Data', 'Use Jobs Pipeline > Rerun Raw Data to force-rescore every record in Job_Priority using the raw JSON stored in Raw_Data. Deduplicates by job ID first, then rescores all records via batch Gemini API with caching. Use this after changing TARGET_PROFILE or SCORING_INSTRUCTIONS to reprice the entire backlog.'],
   ['Large runs', 'Large scoring runs now continue automatically in chunks. If the batch is too large for one Apps Script execution, the script writes partial results, updates Processed, and schedules the next continuation automatically.'],
   ['Resetting prompt default', 'If you want the built-in scoring prompt again, just type default into SCORING_INSTRUCTIONS. You do not need to run setupJobPriorityWorkbook() for that reset.'],
-  ['Deduplicate Existing Jobs', 'Use Jobs Pipeline > Deduplicate Existing Jobs to merge existing duplicate rows by job_id and archive removed rows into Dedup_Archive.'],
   ['When you change Apify account', 'Usually only APIFY_TOKEN and APIFY_TASK_IDS in the Settings sheet need to change.'],
   ['Task id example', 'masterabctech~linkedin-job-scraper-task'],
   ['Parallel AI requests', 'SCORING_PARALLEL_REQUESTS controls how many jobs are scored in parallel per batch. 3 is a safe default.'],
+  ['Two-stage scoring', 'Stage 1 runs all jobs through STAGE1_MODEL for a coarse P01-P10 sort. Stage 2 re-runs jobs at or above STAGE2_THRESHOLD through STAGE2_MODEL (with optional STAGE2_THINKING_BUDGET) for refined final scores. Jobs below the threshold keep their Stage 1 scores. Using the same model for both stages shares the cache and avoids extra cache creation cost.'],
   ['Notification email', 'If NOTIFY_EMAIL is blank, no email notifications are sent.'],
   ['P01 job alert email', 'Sent when the run finds at least one new P01-priority job. The email includes summary, visa signal, why, and job link.'],
   ['Critical failure email', 'Sent when the whole run fails or when a large share of jobs in the run fail to import or score.'],
@@ -111,13 +106,11 @@ function setupJobPriorityWorkbook() {
   var jobSheet = _getOrCreateSheet(spreadsheet, JOB_PRIORITY_SHEET_NAME);
   var settingsSheet = _getOrCreateSheet(spreadsheet, SETTINGS_SHEET_NAME);
   var helpSheet = _getOrCreateSheet(spreadsheet, HELP_SHEET_NAME);
-  var dedupArchiveSheet = _getOrCreateSheet(spreadsheet, DEDUP_ARCHIVE_SHEET_NAME);
   var rawDataSheet = _getOrCreateSheet(spreadsheet, RAW_DATA_SHEET_NAME);
 
   _setupJobPrioritySheet(jobSheet);
   _setupSettingsSheet(settingsSheet);
   _setupHelpSheet(helpSheet);
-  _setupDedupArchiveSheet(dedupArchiveSheet);
   _setupRawDataSheet(rawDataSheet);
 }
 
@@ -126,11 +119,10 @@ function ensureWorkbookReadyForRuntime() {
   var jobSheet = spreadsheet.getSheetByName(JOB_PRIORITY_SHEET_NAME);
   var settingsSheet = spreadsheet.getSheetByName(SETTINGS_SHEET_NAME);
   var helpSheet = spreadsheet.getSheetByName(HELP_SHEET_NAME);
-  var dedupArchiveSheet = spreadsheet.getSheetByName(DEDUP_ARCHIVE_SHEET_NAME);
   var rawDataSheet = spreadsheet.getSheetByName(RAW_DATA_SHEET_NAME);
   var existingHeaders = [];
 
-  if (!jobSheet || !settingsSheet || !helpSheet || !dedupArchiveSheet || !rawDataSheet) {
+  if (!jobSheet || !settingsSheet || !helpSheet || !rawDataSheet) {
     setupJobPriorityWorkbook();
     return;
   }
@@ -146,7 +138,8 @@ function ensureWorkbookReadyForRuntime() {
   }
 
   existingHeaders = jobSheet.getRange(JOB_PRIORITY_HEADER_ROW, 1, 1, JOB_PRIORITY_COLUMNS.length).getValues()[0] || [];
-  if (jobSheet.getMaxColumns() < JOB_PRIORITY_COLUMNS.length || !_headerMatches(existingHeaders, JOB_PRIORITY_COLUMNS)) {
+  // Use !== so surplus columns (old schema remnants) also trigger a sync, not just missing columns
+  if (jobSheet.getMaxColumns() !== JOB_PRIORITY_COLUMNS.length || !_headerMatches(existingHeaders, JOB_PRIORITY_COLUMNS)) {
     _syncJobPrioritySchemaForRuntime(jobSheet);
   }
 
@@ -243,6 +236,7 @@ function writeJobs(rows) {
   _upsertRawDataRows(rows);
   var updates = [];
   var appends = [];
+  var appendedJobs = [];
 
   rows.forEach(function(job) {
     var rowValues = _toSheetRow(job);
@@ -253,16 +247,23 @@ function writeJobs(rows) {
       });
     } else {
       appends.push(rowValues);
+      appendedJobs.push(job);
     }
   });
 
   updates.forEach(function(update) {
     sheet.getRange(update.rowNumber, 1, 1, JOB_PRIORITY_COLUMNS.length).setValues([update.values]);
+    _applyJobIdColumnFormat(sheet, update.rowNumber, 1);
   });
 
   if (appends.length) {
     var startRow = Math.max(sheet.getLastRow() + 1, JOB_PRIORITY_DATA_START_ROW);
     sheet.getRange(startRow, 1, appends.length, JOB_PRIORITY_COLUMNS.length).setValues(appends);
+    _applyJobIdColumnFormat(sheet, startRow, appends.length);
+    // Assign row numbers back so any future write (e.g. Stage 2) updates in-place
+    appendedJobs.forEach(function(job, i) {
+      job.existingRowNumber = startRow + i;
+    });
   }
 
   _applyStatusValidation(sheet);
@@ -279,7 +280,12 @@ function getRawDataIndex() {
     };
   }
 
-  var values = sheet.getRange(2, 1, lastRow - 1, RAW_DATA_COLUMNS.length).getValues();
+  var maxCols = sheet.getMaxColumns();
+  var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
+  var rawRefColIndex = headers.indexOf('raw_ref');
+  if (rawRefColIndex === -1) rawRefColIndex = 1; // fallback: col 2 (0-based index 1)
+
+  var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
 
   values.forEach(function(row, offset) {
     var jobId = _extractLinkedInJobId(row[0]) || _stringifyField(row[0]);
@@ -290,11 +296,7 @@ function getRawDataIndex() {
     byJobId[jobId] = {
       rowNumber: offset + 2,
       jobId: jobId,
-      sourceJd: row[1] || '',
-      sourceTask: row[2] || '',
-      sourceUrl: row[3] || '',
-      rawRef: row[4] || '',
-      updatedAt: row[5] || ''
+      rawRef: row[rawRefColIndex] || ''
     };
   });
 
@@ -407,15 +409,17 @@ function migrateRawDataToDedicatedSheet() {
   };
 }
 
-function replaceAllJobs(rows) {
+function replaceAllJobs(rows, opts) {
+  var skipFormatting = opts && opts.skipFormatting;
+  var skipRawDataSync = opts && opts.skipRawDataSync;
+
   var sheet = _getJobPrioritySheet();
   var existingLastRow = sheet.getLastRow();
   var clearRowCount = Math.max(existingLastRow - JOB_PRIORITY_DATA_START_ROW + 1, 0);
 
-  // Capture user-applied formatting before clearing, keyed by job_id
-  var userFormatting = _captureRowFormattingByJobId(sheet, existingLastRow);
+  var userFormatting = skipFormatting ? null : _captureRowFormattingByJobId(sheet, existingLastRow);
 
-  if (rows && rows.length) {
+  if (!skipRawDataSync && rows && rows.length) {
     _upsertRawDataRows(rows);
   }
 
@@ -437,8 +441,14 @@ function replaceAllJobs(rows) {
       JOB_PRIORITY_COLUMNS.length
     ).setValues(outputRows);
 
-    // Restore user formatting to the new row positions
-    _restoreRowFormattingByJobId(sheet, rows, userFormatting);
+    _applyJobIdColumnFormat(sheet, JOB_PRIORITY_DATA_START_ROW, outputRows.length);
+
+    if (!skipFormatting) {
+      _restoreRowFormattingByJobId(sheet, rows, userFormatting);
+    } else {
+      // Just clear any stale explicit formatting so conditional formatting rules apply cleanly
+      sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, outputRows.length, JOB_PRIORITY_VISIBLE_COLUMNS.length).clearFormat();
+    }
   }
 
   _applyStatusValidation(sheet);
@@ -483,22 +493,34 @@ function _restoreRowFormattingByJobId(sheet, rows, formattingByJobId) {
   var defaultFontColor = '#000000';
   var defaultFontWeight = 'normal';
 
+  // Clear all explicit formatting on the data region so conditional formatting rules take effect.
+  // Applying explicit white/black/normal values (even "defaults") overrides conditional formatting
+  // in Google Sheets, which is why rows appeared uniformly formatted after a dedup write.
+  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, rows.length, visibleColCount).clearFormat();
+
+  // Re-apply only genuinely custom (non-default) row formatting
   rows.forEach(function(job, i) {
     var jobId = _stringifyField(job.jobId);
     var fmt = jobId ? formattingByJobId[jobId] : null;
+    if (!fmt) return;
+
+    var hasCustomBg = fmt.backgrounds.some(function(bg) {
+      return bg && bg.toLowerCase() !== defaultBackground;
+    });
+    var hasCustomColor = fmt.fontColors.some(function(c) {
+      return c && c.toLowerCase() !== defaultFontColor;
+    });
+    var hasCustomWeight = fmt.fontWeights.some(function(w) {
+      return w && w.toLowerCase() !== defaultFontWeight;
+    });
+
+    if (!hasCustomBg && !hasCustomColor && !hasCustomWeight) return;
+
     var rowNumber = JOB_PRIORITY_DATA_START_ROW + i;
     var range = sheet.getRange(rowNumber, 1, 1, visibleColCount);
-
-    if (fmt) {
-      range.setBackgrounds([fmt.backgrounds]);
-      range.setFontColors([fmt.fontColors]);
-      range.setFontWeights([fmt.fontWeights]);
-    } else {
-      // Clear any stale formatting left over from the previous row occupant
-      range.setBackground(defaultBackground);
-      range.setFontColor(defaultFontColor);
-      range.setFontWeight(defaultFontWeight);
-    }
+    if (hasCustomBg) range.setBackgrounds([fmt.backgrounds]);
+    if (hasCustomColor) range.setFontColors([fmt.fontColors]);
+    if (hasCustomWeight) range.setFontWeights([fmt.fontWeights]);
   });
 }
 
@@ -519,10 +541,8 @@ function deduplicateExistingJobRows() {
   });
 
   var mergedRecords = [];
-  var archiveRows = [];
   var duplicateGroupCount = 0;
   var removedRowCount = 0;
-  var dedupedAt = new Date();
 
   groupedEntries.forEach(function(entry) {
     if (entry.records.length === 1) {
@@ -533,22 +553,11 @@ function deduplicateExistingJobRows() {
     duplicateGroupCount += 1;
     removedRowCount += entry.records.length - 1;
 
-    var metadataWinner = entry.records.slice().sort(_compareJobRecencyDesc)[0];
     var mergedRecord = _mergeDuplicateJobRecordsByJobId(entry.records);
-
-    entry.records.forEach(function(record) {
-      if (record.rowNumber !== metadataWinner.rowNumber) {
-        var archivedRecord = _cloneJobRecord(record);
-        archivedRecord.dedupedAt = dedupedAt;
-        archiveRows.push(archivedRecord);
-      }
-    });
-
     mergedRecords.push(mergedRecord);
   });
 
-  if (archiveRows.length) {
-    _appendDedupArchiveRows(archiveRows);
+  if (removedRowCount > 0) {
     replaceAllJobs(mergedRecords);
     sortAndRankJobs();
   }
@@ -556,7 +565,7 @@ function deduplicateExistingJobRows() {
   return {
     duplicateGroupCount: duplicateGroupCount,
     removedRowCount: removedRowCount,
-    archivedRowCount: archiveRows.length,
+    archivedRowCount: 0,
     finalRowCount: mergedRecords.length || records.length
   };
 }
@@ -567,8 +576,7 @@ function pruneExpiredJobRows() {
   var expiryMs = EXPIRY_DAYS * 24 * 60 * 60 * 1000;
   var records = getExistingJobRecords();
   var keepRecords = [];
-  var archiveRows = [];
-  var prunedAt = new Date();
+  var prunedCount = 0;
 
   records.forEach(function(record) {
     if (record.status === 'Applied') {
@@ -576,28 +584,23 @@ function pruneExpiredJobRows() {
       return;
     }
 
-    var ageRef = record.postedSort || record.importedAt;
-    var ageTime = _toComparableTime(ageRef);
-
-    if (!ageTime || (now.getTime() - ageTime) <= expiryMs) {
+    var importedTime = _toComparableTime(record.importedAt);
+    if (importedTime && (now.getTime() - importedTime) <= expiryMs) {
       keepRecords.push(record);
       return;
     }
-
-    var archived = _cloneJobRecord(record);
-    archived.dedupedAt = prunedAt;
-    archiveRows.push(archived);
+    // No importedAt OR older than EXPIRY_DAYS → prune
+    prunedCount++;
   });
 
-  if (archiveRows.length) {
-    _appendDedupArchiveRows(archiveRows);
+  if (prunedCount > 0) {
     replaceAllJobs(keepRecords);
     sortAndRankJobs();
   }
 
   return {
     checkedCount: records.length,
-    prunedCount: archiveRows.length,
+    prunedCount: prunedCount,
     remainingCount: keepRecords.length
   };
 }
@@ -627,49 +630,11 @@ function deduplicateSimilarJdRows() {
     byCompany[companyKey].push(record);
   });
 
-  // Group records with no JD by exact company + normalized title — covers multi-location posts
-  // where the JD wasn't stored (e.g., older imports before Raw_Data was added).
-  var noJdByCompanyTitle = {};
-  var trueNoJdRecords = [];
-  noJdRecords.forEach(function(record) {
-    var companyKey = _normalizeJdText(record.company || '');
-    var titleKey = _normalizeJdText(record.title || '');
-    if (!companyKey || !titleKey) {
-      trueNoJdRecords.push(record);
-      return;
-    }
-    var groupKey = companyKey + '|||' + titleKey;
-    if (!noJdByCompanyTitle[groupKey]) {
-      noJdByCompanyTitle[groupKey] = [];
-    }
-    noJdByCompanyTitle[groupKey].push(record);
-  });
-
-  var mergedRecords = trueNoJdRecords.slice();
-  var archiveRows = [];
+  // Records with no JD content cannot be reliably compared — pass them through unchanged.
+  // JD-based similarity already handles multi-location posts when JD text is available.
+  var mergedRecords = noJdRecords.slice();
   var duplicateGroupCount = 0;
   var removedRowCount = 0;
-  var dedupedAt = new Date();
-
-  // Merge no-JD groups that share exact company + exact title
-  Object.keys(noJdByCompanyTitle).forEach(function(groupKey) {
-    var group = noJdByCompanyTitle[groupKey];
-    if (group.length === 1) {
-      mergedRecords.push(group[0]);
-      return;
-    }
-    duplicateGroupCount += 1;
-    removedRowCount += group.length - 1;
-    var merged = _mergeSimilarJdGroup(group);
-    group.forEach(function(record) {
-      if (record.rowNumber !== merged.rowNumber) {
-        var archived = _cloneJobRecord(record);
-        archived.dedupedAt = dedupedAt;
-        archiveRows.push(archived);
-      }
-    });
-    mergedRecords.push(merged);
-  });
 
   Object.keys(byCompany).forEach(function(companyKey) {
     var groups = _clusterSimilarJdRecords(byCompany[companyKey], JD_SIMILARITY_THRESHOLD);
@@ -684,21 +649,11 @@ function deduplicateSimilarJdRows() {
       removedRowCount += group.length - 1;
 
       var merged = _mergeSimilarJdGroup(group);
-
-      group.forEach(function(record) {
-        if (record.rowNumber !== merged.rowNumber) {
-          var archived = _cloneJobRecord(record);
-          archived.dedupedAt = dedupedAt;
-          archiveRows.push(archived);
-        }
-      });
-
       mergedRecords.push(merged);
     });
   });
 
-  if (archiveRows.length) {
-    _appendDedupArchiveRows(archiveRows);
+  if (removedRowCount > 0) {
     replaceAllJobs(mergedRecords);
     sortAndRankJobs();
   }
@@ -706,7 +661,7 @@ function deduplicateSimilarJdRows() {
   return {
     duplicateGroupCount: duplicateGroupCount,
     removedRowCount: removedRowCount,
-    archivedRowCount: archiveRows.length,
+    archivedRowCount: 0,
     finalRowCount: mergedRecords.length
   };
 }
@@ -760,13 +715,11 @@ function _mergeSimilarJdGroup(records) {
     merged.usVisaReason = scoringWinner.usVisaReason;
     merged.summary = scoringWinner.summary;
     merged.why = scoringWinner.why;
-    merged.angle = scoringWinner.angle;
     merged.scoringFingerprint = scoringWinner.scoringFingerprint;
     merged.scoredAt = scoringWinner.scoredAt;
   }
 
   merged.status = manualWinner.status || merged.status || 'New';
-  merged.notes = manualWinner.notes || merged.notes || '';
 
   // Concatenate all unique locations across the group
   var seenLocations = {};
@@ -789,6 +742,41 @@ function _mergeSimilarJdGroup(records) {
   }, null);
   if (earliestImport) {
     merged.importedAt = earliestImport;
+  }
+
+  // Ensure posted: newestRecord may have empty human-readable posted
+  if (!_stringifyField(merged.posted)) {
+    var withPosted = records.filter(function(r) { return _stringifyField(r.posted); });
+    withPosted.sort(_compareJobRecencyDesc);
+    if (withPosted.length) {
+      merged.posted = withPosted[0].posted;
+    }
+  }
+
+  // Ensure jobId: take first non-empty jobId from the group (sorted newest first)
+  if (!_stringifyField(merged.jobId)) {
+    var withJobId = records.slice().sort(_compareJobRecencyDesc).filter(function(r) {
+      return _stringifyField(r.jobId);
+    });
+    if (withJobId.length) {
+      merged.jobId = _stringifyField(withJobId[0].jobId);
+    }
+  }
+
+  // Rebuild jobLink from the canonical jobId if missing
+  if (!_stringifyField(merged.jobLink) && _stringifyField(merged.jobId)) {
+    merged.jobLink = _buildLinkedInJobUrlFromJobId(_stringifyField(merged.jobId)) || '';
+  }
+
+  // Record all jobIds that were merged into this canonical record
+  var mergedIntoThis = records
+    .filter(function(r) { return _stringifyField(r.jobId) && _stringifyField(r.jobId) !== _stringifyField(merged.jobId); })
+    .map(function(r) { return _stringifyField(r.jobId); });
+  if (mergedIntoThis.length) {
+    var existingMerged = _stringifyField(merged.mergedJobIds) ? merged.mergedJobIds.split(/,\s*/) : [];
+    merged.mergedJobIds = existingMerged.concat(mergedIntoThis).filter(function(id, i, arr) {
+      return id && arr.indexOf(id) === i;
+    }).join(', ');
   }
 
   return merged;
@@ -855,10 +843,6 @@ function _getHelpSheet() {
   return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(HELP_SHEET_NAME);
 }
 
-function _getDedupArchiveSheet() {
-  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DEDUP_ARCHIVE_SHEET_NAME);
-}
-
 function _getRawDataSheet() {
   return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RAW_DATA_SHEET_NAME);
 }
@@ -920,16 +904,6 @@ function _setupJobPrioritySheet(sheet) {
   _applyWrappedColumns(sheet);
   _applyStatusFormattingRules(sheet);
 }
-
-function _setupDedupArchiveSheet(sheet) {
-  _ensureSheetDimensions(sheet, DEDUP_ARCHIVE_COLUMNS.length, 2);
-  sheet.getRange(1, 1, 1, DEDUP_ARCHIVE_COLUMNS.length).setValues([DEDUP_ARCHIVE_COLUMNS]);
-  sheet.getRange(1, 1, 1, DEDUP_ARCHIVE_COLUMNS.length)
-    .setFontWeight('bold')
-    .setBackground('#f4cccc');
-  sheet.setFrozenRows(1);
-}
-
 function _setupRawDataSheet(sheet) {
   _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
   sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
@@ -939,19 +913,47 @@ function _setupRawDataSheet(sheet) {
   sheet.setFrozenRows(1);
   sheet.setColumnWidth(1, 120);
   sheet.setColumnWidth(2, 180);
-  sheet.setColumnWidth(3, 140);
-  sheet.setColumnWidth(4, 160);
-  sheet.setColumnWidth(5, 180);
-  sheet.setColumnWidth(6, 140);
   sheet.hideColumns(2, RAW_DATA_COLUMNS.length - 1);
 }
 
 function _syncJobPrioritySchemaForRuntime(sheet) {
+  // Delete surplus columns FIRST (before remap reads them as valid data)
+  var maxCols = sheet.getMaxColumns();
+  if (maxCols > JOB_PRIORITY_COLUMNS.length) {
+    sheet.deleteColumns(JOB_PRIORITY_COLUMNS.length + 1, maxCols - JOB_PRIORITY_COLUMNS.length);
+  }
+
   _ensureSheetDimensions(sheet, JOB_PRIORITY_COLUMNS.length, JOB_PRIORITY_DATA_START_ROW);
   _remapJobPriorityDataIfNeeded(sheet);
   sheet.getRange(JOB_PRIORITY_HEADER_ROW, 1, 1, JOB_PRIORITY_COLUMNS.length).setValues([JOB_PRIORITY_COLUMNS]);
   sheet.hideColumns(JOB_PRIORITY_VISIBLE_COLUMNS.length + 1, JOB_PRIORITY_HIDDEN_COLUMNS.length);
   _applyStatusValidation(sheet);
+
+  // Repair job_id column: existing cells may hold corrupted date serials or misaligned data.
+  // Read each job_link HYPERLINK formula and write the extracted ID back as a plain string.
+  var lastRow = sheet.getLastRow();
+  if (lastRow >= JOB_PRIORITY_DATA_START_ROW) {
+    var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+    var jobIdCol    = JOB_PRIORITY_COLUMN_INDEX.job_id;
+    var jobLinkCol  = JOB_PRIORITY_COLUMN_INDEX.job_link;
+
+    var jobIdValues   = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, jobIdCol,   rowCount, 1).getValues();
+    var jobLinkFormulas = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, jobLinkCol, rowCount, 1).getFormulas();
+
+    var repairedIds = jobIdValues.map(function(row, i) {
+      var rawId  = _stringifyField(row[0]);
+      var goodId = _extractLinkedInJobId(rawId);
+      if (goodId) return [goodId]; // already valid
+
+      // Fall back to the HYPERLINK formula in job_link
+      var url = _extractUrlFromHyperlinkFormula(_stringifyField(jobLinkFormulas[i][0]));
+      var fromLink = _extractLinkedInJobId(url);
+      return [fromLink || rawId]; // keep original if nothing works
+    });
+
+    var jobIdRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, jobIdCol, rowCount, 1);
+    jobIdRange.setNumberFormat('@').setValues(repairedIds);
+  }
 }
 
 function _remapJobPriorityDataIfNeeded(sheet) {
@@ -1067,6 +1069,13 @@ function _ensureSheetDimensions(sheet, minColumns, minRows) {
   }
 }
 
+function _applyJobIdColumnFormat(sheet, startRow, numRows) {
+  // LinkedIn job IDs are large integers (e.g. 4416623195). Without explicit text formatting,
+  // Google Sheets auto-converts them to date serials and displays "invalid date".
+  sheet.getRange(startRow, JOB_PRIORITY_COLUMN_INDEX.job_id, numRows, 1)
+    .setNumberFormat('@');
+}
+
 function _applyStatusValidation(sheet) {
   var statusRule = SpreadsheetApp.newDataValidation()
     .requireValueInList(JOB_PRIORITY_STATUS_OPTIONS, true)
@@ -1152,14 +1161,12 @@ function _applyColumnWidths(sheet, existingColumnWidths) {
     job_link: 90,
     summary: 260,
     why: 300,
-    angle: 280,
-    notes: 240,
-    source_jd: 130,
     us_visa_reason: 200
   };
 
   Object.keys(widthByColumnName).forEach(function(columnName) {
     var columnIndex = JOB_PRIORITY_COLUMN_INDEX[columnName];
+    if (!columnIndex) return;
     var width = existingColumnWidths && existingColumnWidths[columnName]
       ? existingColumnWidths[columnName]
       : widthByColumnName[columnName];
@@ -1168,7 +1175,7 @@ function _applyColumnWidths(sheet, existingColumnWidths) {
 }
 
 function _applyWrappedColumns(sheet) {
-  [JOB_PRIORITY_COLUMN_INDEX.summary, JOB_PRIORITY_COLUMN_INDEX.why, JOB_PRIORITY_COLUMN_INDEX.angle, JOB_PRIORITY_COLUMN_INDEX.notes]
+  [JOB_PRIORITY_COLUMN_INDEX.summary, JOB_PRIORITY_COLUMN_INDEX.why]
     .forEach(function(columnIndex) {
       sheet.getRange(
         JOB_PRIORITY_DATA_START_ROW,
@@ -1180,22 +1187,13 @@ function _applyWrappedColumns(sheet) {
 
   sheet.getRange(
     JOB_PRIORITY_DATA_START_ROW,
-    JOB_PRIORITY_COLUMN_INDEX.source_jd,
-    Math.max(sheet.getMaxRows() - JOB_PRIORITY_DATA_START_ROW + 1, 1),
-    1
-  ).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
-
-  sheet.getRange(
-    JOB_PRIORITY_DATA_START_ROW,
     JOB_PRIORITY_COLUMN_INDEX.us_visa_reason,
     Math.max(sheet.getMaxRows() - JOB_PRIORITY_DATA_START_ROW + 1, 1),
     1
   ).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 }
 
-function _toSheetRow(job, options) {
-  options = options || {};
-  var includeRawData = options.includeRawData === true;
+function _toSheetRow(job) {
   var jobUrl = _buildLinkedInJobUrlFromJobId(job.jobId) || job.jobLink || job.sourceUrl || '';
 
   return [
@@ -1215,17 +1213,11 @@ function _toSheetRow(job, options) {
     job.summary || '',
     job.why || '',
     job.usVisaReason || '',
-    job.angle || '',
-    job.notes || '',
-    includeRawData ? (job.jobDescription || '') : '',
     job.jobId || '',
     job.importedAt || '',
     job.scoredAt || '',
-    includeRawData ? (job.sourceTask || '') : '',
-    job.postedSort || '',
-    includeRawData ? (job.sourceUrl || '') : '',
     job.scoringFingerprint || '',
-    includeRawData ? (job.rawRef || '') : ''
+    job.mergedJobIds || ''
   ];
 }
 
@@ -1252,11 +1244,6 @@ function _compareJobsForDisplay(left, right) {
   var rightScore = Number(right.score || 0);
   if (leftScore !== rightScore) {
     return rightScore - leftScore;
-  }
-
-  var postedDifference = _toComparableTime(right.postedSort) - _toComparableTime(left.postedSort);
-  if (postedDifference !== 0) {
-    return postedDifference;
   }
 
   var importedDifference = _toComparableTime(right.importedAt) - _toComparableTime(left.importedAt);
@@ -1315,11 +1302,14 @@ function _columnToLetter(columnNumber) {
 }
 
 function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
-  var rowRawRef = row[JOB_PRIORITY_COLUMN_INDEX.raw_ref - 1] || '';
   var rawJobId = _stringifyField(row[JOB_PRIORITY_COLUMN_INDEX.job_id - 1]);
-  var jobId = _extractLinkedInJobId(rawJobId) || rawJobId || _extractLinkedInJobIdFromRawRef(rowRawRef);
+  // job_id cells can get auto-formatted as dates by Sheets (large integers treated as date serials).
+  // Always try the HYPERLINK formula as the authoritative source.
+  var jobLinkFormula = formulas[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
+  var jobLinkUrl = _extractUrlFromHyperlinkFormula(jobLinkFormula) || '';
+  var jobId = _extractLinkedInJobId(rawJobId) || _extractLinkedInJobId(jobLinkUrl);
   var rawData = rawDataByJobId && jobId ? rawDataByJobId[jobId] : null;
-  var rawRef = rawData && _stringifyField(rawData.rawRef) ? rawData.rawRef : rowRawRef;
+  var rawRef = rawData ? (rawData.rawRef || '') : '';
   var company = row[JOB_PRIORITY_COLUMN_INDEX.company - 1];
   var title = row[JOB_PRIORITY_COLUMN_INDEX.title - 1];
 
@@ -1327,15 +1317,15 @@ function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
     return null;
   }
 
-  var sourceUrl = (rawData && rawData.sourceUrl) || row[JOB_PRIORITY_COLUMN_INDEX.source_url - 1] || '';
-  var jobLinkFormula = formulas[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
+  var sourceUrl = _extractSourceUrlFromRawRef(rawData && rawData.rawRef);
   var jobLinkCellValue = row[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
-  var jobLink = _extractUrlFromHyperlinkFormula(jobLinkFormula) || _buildLinkedInJobUrlFromJobId(jobId) || sourceUrl;
-  var jobDescription = (rawData && rawData.sourceJd)
-    || row[JOB_PRIORITY_COLUMN_INDEX.source_jd - 1]
-    || _extractJobDescriptionFromRawRef((rawData && rawData.rawRef) || row[JOB_PRIORITY_COLUMN_INDEX.raw_ref - 1])
-    || '';
-  var sourceTask = (rawData && rawData.sourceTask) || row[JOB_PRIORITY_COLUMN_INDEX.source_task - 1] || '';
+  var jobLink = jobLinkUrl || _buildLinkedInJobUrlFromJobId(jobId) || sourceUrl;
+  var jobDescription = _extractJobDescriptionFromRawRef(rawData && rawData.rawRef);
+  var sourceTask = (function() {
+    if (!rawData || !rawData.rawRef) return '';
+    try { return _stringifyField(JSON.parse(String(rawData.rawRef)).searchString || ''); } catch (e) { return ''; }
+  })();
+  var mergedJobIds = _stringifyField(row[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids - 1]);
 
   return {
     rowNumber: rowNumber,
@@ -1356,17 +1346,15 @@ function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
     jdImpliedLevel: row[JOB_PRIORITY_COLUMN_INDEX.jd_implied_level - 1] || '',
     summary: row[JOB_PRIORITY_COLUMN_INDEX.summary - 1] || '',
     why: row[JOB_PRIORITY_COLUMN_INDEX.why - 1] || '',
-    angle: row[JOB_PRIORITY_COLUMN_INDEX.angle - 1] || '',
-    notes: row[JOB_PRIORITY_COLUMN_INDEX.notes - 1] || '',
     jobDescription: jobDescription,
     usVisaReason: row[JOB_PRIORITY_COLUMN_INDEX.us_visa_reason - 1] || '',
     jobId: jobId || '',
-    importedAt: row[JOB_PRIORITY_COLUMN_INDEX.imported_at - 1] || '',
-    scoredAt: row[JOB_PRIORITY_COLUMN_INDEX.scored_at - 1] || '',
+    importedAt: _toDateField(row[JOB_PRIORITY_COLUMN_INDEX.imported_at - 1]),
+    scoredAt: _toDateField(row[JOB_PRIORITY_COLUMN_INDEX.scored_at - 1]),
     sourceTask: sourceTask,
-    postedSort: row[JOB_PRIORITY_COLUMN_INDEX.posted_sort - 1] || '',
     sourceUrl: sourceUrl,
     scoringFingerprint: row[JOB_PRIORITY_COLUMN_INDEX.scoring_fingerprint - 1] || '',
+    mergedJobIds: mergedJobIds,
     rawRef: rawRef
   };
 }
@@ -1406,6 +1394,14 @@ function _extractJobDescriptionFromRawRef(rawRef) {
   }
 
   return '';
+}
+
+function _extractSourceUrlFromRawRef(rawRef) {
+  if (!rawRef) return '';
+  try {
+    var p = JSON.parse(String(rawRef));
+    return _stringifyField(p.jobUrl || p.applyUrl || p.url || p.link || p.postingUrl || '');
+  } catch (e) { return ''; }
 }
 
 function _extractLinkedInJobIdFromRawRef(rawRef) {
@@ -1471,19 +1467,6 @@ function _extractJsonScalarField(rawText, fieldName) {
   return match[1];
 }
 
-function _appendDedupArchiveRows(rows) {
-  if (!rows || !rows.length) {
-    return;
-  }
-
-  var sheet = _getDedupArchiveSheet();
-  var outputRows = rows.map(function(row) {
-    return [row.dedupedAt || ''].concat(_toSheetRow(row, { includeRawData: true }));
-  });
-  var startRow = Math.max(sheet.getLastRow() + 1, 2);
-  sheet.getRange(startRow, 1, outputRows.length, DEDUP_ARCHIVE_COLUMNS.length).setValues(outputRows);
-}
-
 function _upsertRawDataRows(jobs) {
   if (!jobs || !jobs.length) {
     return 0;
@@ -1497,7 +1480,6 @@ function _upsertRawDataRows(jobs) {
   var updates = [];
   var appends = [];
   var writtenJobIds = {};
-  var updatedAt = new Date();
   var writtenCount = 0;
 
   jobs.forEach(function(job) {
@@ -1510,7 +1492,7 @@ function _upsertRawDataRows(jobs) {
     }
 
     existing = rawDataIndex[jobId] || null;
-    payload = _buildRawDataPayload(job, existing, updatedAt);
+    payload = _buildRawDataPayload(job, existing);
 
     if (!_hasAnyRawPayload(payload)) {
       return;
@@ -1532,56 +1514,39 @@ function _upsertRawDataRows(jobs) {
 
   updates.forEach(function(update) {
     sheet.getRange(update.rowNumber, 1, 1, RAW_DATA_COLUMNS.length).setValues([update.values]);
+    sheet.getRange(update.rowNumber, 1, 1, 1).setNumberFormat('@');
   });
 
   if (appends.length) {
     var startRow = Math.max(sheet.getLastRow() + 1, 2);
     sheet.getRange(startRow, 1, appends.length, RAW_DATA_COLUMNS.length).setValues(appends);
+    sheet.getRange(startRow, 1, appends.length, 1).setNumberFormat('@');
   }
 
   return writtenCount;
 }
 
-function _buildRawDataPayload(job, existing, updatedAt) {
+function _buildRawDataPayload(job, existing) {
   return {
     jobId: _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId),
-    sourceJd: _stringifyField(job && job.jobDescription) || (existing && existing.sourceJd) || '',
-    sourceTask: _stringifyField(job && job.sourceTask) || (existing && existing.sourceTask) || '',
-    sourceUrl: _stringifyField(job && job.sourceUrl) || (existing && existing.sourceUrl) || '',
-    rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || '',
-    updatedAt: updatedAt || new Date()
+    rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || ''
   };
 }
 
 function _toRawDataRow(rawData) {
   return [
     rawData.jobId || '',
-    rawData.sourceJd || '',
-    rawData.sourceTask || '',
-    rawData.sourceUrl || '',
-    rawData.rawRef || '',
-    rawData.updatedAt || ''
+    rawData.rawRef || ''
   ];
 }
 
 function _hasAnyRawPayload(record) {
-  return !!(
-    _stringifyField(record && record.sourceJd) ||
-    _stringifyField(record && record.sourceTask) ||
-    _stringifyField(record && record.sourceUrl) ||
-    _stringifyField(record && record.rawRef)
-  );
+  return !!_stringifyField(record && record.rawRef);
 }
 
 function _clearMainSheetRawPayloadColumns(sheet, rowCount) {
-  [
-    JOB_PRIORITY_COLUMN_INDEX.source_jd,
-    JOB_PRIORITY_COLUMN_INDEX.source_task,
-    JOB_PRIORITY_COLUMN_INDEX.source_url,
-    JOB_PRIORITY_COLUMN_INDEX.raw_ref
-  ].forEach(function(columnIndex) {
-    sheet.getRange(JOB_PRIORITY_DATA_START_ROW, columnIndex, Math.max(rowCount, 1), 1).clearContent();
-  });
+  // source_jd, source_task, source_url, and raw_ref have been removed from the main sheet schema.
+  // Raw data now lives exclusively in Raw_Data. This function is a no-op in the new schema.
 }
 
 function _groupJobRecordsByJobId(records) {
@@ -1605,7 +1570,6 @@ function _mergeDuplicateJobRecordsByJobId(records) {
   var merged = _cloneJobRecord(metadataWinner);
 
   merged.status = manualWinner && manualWinner.status ? manualWinner.status : (merged.status || 'New');
-  merged.notes = manualWinner && manualWinner.notes ? manualWinner.notes : (merged.notes || '');
 
   return merged;
 }
@@ -1636,10 +1600,6 @@ function _manualWorkflowScore(record) {
   } else if (status === 'Skip') {
     score += 1;
   }
-  if (_stringifyField(record.notes)) {
-    score += 5;
-  }
-
   return score;
 }
 

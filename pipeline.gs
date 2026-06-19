@@ -1,5 +1,5 @@
 var SCORING_CACHE_STATE_KEY = 'GEMINI_SCORING_CACHE_STATE';
-var SCORING_CACHE_TTL_SECONDS = 7200;
+var SCORING_CACHE_TTL_SECONDS = 18000;
 
 function loadRuntimeConfig() {
   var settings = getSettingsMap();
@@ -9,7 +9,13 @@ function loadRuntimeConfig() {
     aiProvider: 'gemini',
     geminiApiRoute: String(settings.GEMINI_API_ROUTE || 'developer').toLowerCase(),
     scoringModel: String(settings.SCORING_MODEL || 'gemini-2.5-flash'),
-    scoringParallelRequests: _normalizePositiveInteger(settings.SCORING_PARALLEL_REQUESTS || 3, 3, 20),
+    stage1Model: String(settings.STAGE1_MODEL || settings.SCORING_MODEL || 'gemini-2.5-flash'),
+    stage2Model: String(settings.STAGE2_MODEL || settings.SCORING_MODEL || 'gemini-2.5-flash'),
+    stage2Threshold: _normalizePriority(settings.STAGE2_THRESHOLD || 'P05') || 'P05',
+    stage2ThinkingBudget: Math.max(0, parseInt(settings.STAGE2_THINKING_BUDGET || '0', 10) || 0),
+    scoringParallelRequests: _normalizePositiveInteger(settings.SCORING_PARALLEL_REQUESTS || 3, 1, 100),
+    scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
+    maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
     promptVersion: 'v2',
     targetProfile: String(
@@ -23,18 +29,15 @@ function loadRuntimeConfig() {
     quietEndHour: _parseHourSetting(settings.QUIET_END_HOUR, 5),
     apifyPollIntervalMs: 5000,
     apifyRunWaitSeconds: 240,
-    executionSoftLimitMs: 330000,
-    executionYieldBufferMs: 45000,
-    executionDeadlineMs: Date.now() + 330000,
+    executionSoftLimitMs: 300000,
+    executionYieldBufferMs: 90000,
+    executionDeadlineMs: Date.now() + 300000,
     apifyToken: String(settings.APIFY_TOKEN || properties.getProperty('APIFY_TOKEN') || '').trim(),
     apifyTaskIds: _splitCsv(settings.APIFY_TASK_IDS || properties.getProperty('APIFY_TASK_IDS')),
     vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
     geminiApiKey: properties.getProperty('GEMINI_API_KEY'),
-    openAiApiKey: properties.getProperty('OPENAI_API_KEY'),
-    gcsBucket: String(settings.GCS_BUCKET || '').trim(),
-    batchMode: String(settings.BATCH_MODE || 'off').toLowerCase().trim(),
-    batchAutoThreshold: _normalizePositiveInteger(settings.BATCH_AUTO_THRESHOLD || 50, 50, 10000)
+    openAiApiKey: properties.getProperty('OPENAI_API_KEY')
   };
 }
 
@@ -134,61 +137,6 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     toScoreCount: activeRunState.totalScoreableCount
   });
 
-  // Batch submission path: submit all scoreable jobs to Vertex Batch Prediction at once
-  if (jobsToScore.length && _shouldUseBatch(jobsToScore.length, config)) {
-    try {
-      _emitProgress(progressCallback, {
-        status: 'Submitting batch scoring job',
-        processed: rowsToWriteWithoutScoring.length + ' / ' + activeRunState.totalJobsCount
-      });
-
-      var batchCacheName = _getOrCreateScoringCache(config) || '';
-      var batchRunPrefix = _gcsRunPrefix(config);
-      var batchJsonl = _buildBatchInputJsonl(jobsToScore, config, batchCacheName);
-      var batchInputUri = _uploadToGcs(batchJsonl, batchRunPrefix + '/input.jsonl', config);
-      var batchOutputPrefix = 'gs://' + config.gcsBucket + '/' + batchRunPrefix + '/output/';
-      var batchJobName = _submitVertexBatchJob(batchInputUri, batchOutputPrefix, config);
-
-      activeRunState.batchPending = true;
-      activeRunState.batchJobName = batchJobName;
-      activeRunState.batchOutputGcsPrefix = batchOutputPrefix;
-      activeRunState.batchTargetJobIds = jobsToScore.map(function(j) { return j.jobId; });
-      activeRunState.totalScoreableCount = jobsToScore.length;
-      activeRunState.processedCount = rowsToWriteWithoutScoring.length;
-      activeRunState.handledJobIds = _appendUniqueStrings(
-        activeRunState.handledJobIds || [],
-        rowsToWriteWithoutScoring.map(function(j) { return j.jobId; })
-      );
-      activeRunState.updatedAt = new Date().toISOString();
-
-      // Include unscored new jobs in rows so they are written to the sheet immediately
-      rows = rows.concat(jobsToScore);
-
-      return {
-        rows: rows,
-        batchPending: true,
-        newJobsCount: activeRunState.newJobsCount || 0,
-        aJobsCount: activeRunState.aJobsCount || 0,
-        duplicateJobsCount: duplicateJobsCount,
-        scoredJobsCount: activeRunState.scoredJobsCount || 0,
-        failedJobsCount: activeRunState.failedJobsCount || 0,
-        importFailedJobsCount: importFailedJobsCount,
-        processedCount: activeRunState.processedCount,
-        rawScrapedCount: activeRunState.rawScrapedCount,
-        uniqueRolesCount: activeRunState.totalJobsCount,
-        totalScoreableCount: activeRunState.totalScoreableCount,
-        totalJobsCount: activeRunState.totalJobsCount,
-        errors: activeRunState.errors || [],
-        hasMore: false,
-        activeRunState: activeRunState,
-        newTopPriorityJobIds: []
-      };
-    } catch (batchSubmitError) {
-      Logger.log('Batch submission failed, falling back to synchronous scoring: ' + batchSubmitError.message);
-      errors.push(_truncate('Batch submission failed: ' + batchSubmitError.message, 300));
-    }
-  }
-
   scoreableJobsForThisExecution = jobsToScore.slice(0, maxJobsPerExecution);
 
   _emitProgress(progressCallback, {
@@ -196,12 +144,66 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     processed: (activeRunState.handledJobIds.length + rowsToWriteWithoutScoring.length) + ' / ' + activeRunState.totalJobsCount
   });
 
+  // === Resume pending Stage 2 jobs first before scoring new jobs ===
+  var pendingStage2JobIds = activeRunState.pendingStage2JobIds || [];
+  if (pendingStage2JobIds.length > 0) {
+    var pendingJobs = pendingStage2JobIds.map(function(id) {
+      var existing = existingIndex.byJobId[id];
+      if (!existing) return null;
+      var job = _buildCandidateJob(_normalizeJob(existing, '', config.runStartedAt), existing);
+      return job;
+    }).filter(Boolean);
+
+    if (pendingJobs.length > 0) {
+      _emitProgress(progressCallback, { status: 'Stage 2: Resuming', processed: '' });
+      var stage2Resume = _runStage2Only(pendingJobs, config, progressCallback);
+      rows = rows.concat(stage2Resume.rows);
+      executionScoredJobsCount += stage2Resume.scoredJobsCount;
+      executionFailedJobsCount += stage2Resume.failedJobsCount;
+      errors = errors.concat(stage2Resume.errors);
+      stage2Resume.rows.forEach(function(j) { handledThisExecution.push(j.jobId); });
+      (stage2Resume.failedJobIds || []).forEach(function(id) { handledThisExecution.push(id); });
+      activeRunState.pendingStage2JobIds = stage2Resume.pendingStage2JobIds;
+
+      if (stage2Resume.hitExecutionBudget) {
+        activeRunState.handledJobIds = _appendUniqueStrings(activeRunState.handledJobIds || [], handledThisExecution);
+        activeRunState.scoredJobsCount = Number(activeRunState.scoredJobsCount || 0) + executionScoredJobsCount;
+        activeRunState.failedJobsCount = Number(activeRunState.failedJobsCount || 0) + executionFailedJobsCount + importFailedJobsCount;
+        activeRunState.importFailedJobsCount = Number(activeRunState.importFailedJobsCount || 0) + importFailedJobsCount;
+        activeRunState.errors = _appendErrors(activeRunState.errors || [], errors);
+        activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
+        activeRunState.updatedAt = new Date().toISOString();
+        return {
+          rows: rows,
+          newJobsCount: activeRunState.newJobsCount,
+          aJobsCount: activeRunState.aJobsCount,
+          duplicateJobsCount: duplicateJobsCount,
+          scoredJobsCount: activeRunState.scoredJobsCount,
+          failedJobsCount: activeRunState.failedJobsCount,
+          importFailedJobsCount: activeRunState.importFailedJobsCount,
+          processedCount: activeRunState.processedCount,
+          rawScrapedCount: activeRunState.rawScrapedCount,
+          uniqueRolesCount: activeRunState.totalJobsCount,
+          totalScoreableCount: activeRunState.totalScoreableCount,
+          totalJobsCount: activeRunState.totalJobsCount,
+          errors: activeRunState.errors || [],
+          hasMore: true,
+          activeRunState: activeRunState,
+          newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
+        };
+      }
+    } else {
+      activeRunState.pendingStage2JobIds = [];
+    }
+  }
+
   if (scoreableJobsForThisExecution.length) {
     var scoringResult = _scoreJobsInBatches(scoreableJobsForThisExecution, config, progressCallback, activeRunState.totalJobsCount, activeRunState.handledJobIds.length + rowsToWriteWithoutScoring.length);
     rows = rows.concat(scoringResult.rows);
     executionScoredJobsCount += scoringResult.scoredJobsCount;
     executionFailedJobsCount += scoringResult.failedJobsCount;
     errors = errors.concat(scoringResult.errors);
+    // Pending Stage 2 jobs are NOT added to handledThisExecution — they stay in queue
     handledThisExecution = handledThisExecution
       .concat(scoringResult.rows.map(function(job) { return job.jobId; }))
       .concat(scoringResult.failedJobIds || []);
@@ -213,9 +215,13 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     }).length;
     newTopPriorityJobIds = scoringResult.rows.filter(function(job) {
       return !job.existingRowNumber && _isTopPriority(job.priority);
-    }).map(function(job) {
-      return job.jobId;
-    });
+    }).map(function(job) { return job.jobId; });
+
+    // Accumulate any Stage 2 jobs that didn't get refined (budget hit during Stage 2)
+    activeRunState.pendingStage2JobIds = _appendUniqueStrings(
+      activeRunState.pendingStage2JobIds || [],
+      scoringResult.pendingStage2JobIds || []
+    );
   }
 
   activeRunState.handledJobIds = _appendUniqueStrings(activeRunState.handledJobIds || [], handledThisExecution);
@@ -229,6 +235,7 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
   activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
   activeRunState.updatedAt = new Date().toISOString();
 
+  var hasPendingStage2 = (activeRunState.pendingStage2JobIds || []).length > 0;
   return {
     rows: rows,
     newJobsCount: activeRunState.newJobsCount,
@@ -243,7 +250,7 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     totalScoreableCount: activeRunState.totalScoreableCount,
     totalJobsCount: activeRunState.totalJobsCount,
     errors: activeRunState.errors || [],
-    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount,
+    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount || hasPendingStage2,
     activeRunState: activeRunState,
     newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
   };
@@ -253,6 +260,7 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
   var activeRunState = config.activeRunState || {};
   var targetJobIds = activeRunState.targetJobIds || [];
   var handledJobIdsMap = _buildLookup(activeRunState.handledJobIds || []);
+  var pendingStage2Map = _buildLookup(activeRunState.pendingStage2JobIds || []);
   var rows = [];
   var errors = [];
   var jobsToScore = [];
@@ -273,8 +281,43 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     toScoreCount: activeRunState.totalScoreableCount || 0
   });
 
+  // === Resume pending Stage 2 jobs first before starting new Stage 1 work ===
+  var pendingStage2JobIds = activeRunState.pendingStage2JobIds || [];
+  if (pendingStage2JobIds.length > 0) {
+    var pendingJobs = pendingStage2JobIds.map(function(id) {
+      var existing = existingIndex.byJobId[id];
+      if (!existing) return null;
+      var job = _refreshStoredJobForReevaluation(existing);
+      job.existingRowNumber = existing.rowNumber;
+      return job;
+    }).filter(Boolean);
+
+    if (pendingJobs.length > 0) {
+      _emitProgress(progressCallback, { status: 'Stage 2: Resuming', processed: '' });
+      var stage2Resume = _runStage2Only(pendingJobs, config, progressCallback);
+      rows = rows.concat(stage2Resume.rows);
+      executionScoredJobsCount += stage2Resume.scoredJobsCount;
+      executionFailedJobsCount += stage2Resume.failedJobsCount;
+      errors = errors.concat(stage2Resume.errors);
+      stage2Resume.rows.forEach(function(j) { handledThisExecution.push(j.jobId); });
+      (stage2Resume.failedJobIds || []).forEach(function(id) { handledThisExecution.push(id); });
+      activeRunState.pendingStage2JobIds = stage2Resume.pendingStage2JobIds;
+      pendingStage2Map = _buildLookup(stage2Resume.pendingStage2JobIds);
+
+      if (stage2Resume.hitExecutionBudget) {
+        // Budget exhausted on Stage 2 resume alone — save and yield, no Stage 1 this execution
+        _finalizeExecutionState(activeRunState, skippedThisExecution, handledThisExecution, errors, executionScoredJobsCount, executionFailedJobsCount, newTopPriorityJobIds, executionTopPriorityCount);
+        return _buildReevaluationResult(rows, activeRunState, true);
+      }
+    } else {
+      activeRunState.pendingStage2JobIds = [];
+      pendingStage2Map = {};
+    }
+  }
+
+  // === Stage 1: queue jobs that haven't been handled and aren't awaiting Stage 2 ===
   targetJobIds.forEach(function(jobId) {
-    if (handledJobIdsMap[jobId]) {
+    if (handledJobIdsMap[jobId] || pendingStage2Map[jobId]) {
       return;
     }
 
@@ -288,14 +331,14 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
       return;
     }
 
-    if (!_stringifyField(existing.jobDescription)) {
+    if (!_stringifyField(existing.jobDescription) && !_extractJobDescriptionFromRawRef(existing.rawRef)) {
       skippedThisExecution.push(jobId);
       handledJobIdsMap[jobId] = true;
       return;
     }
 
     fingerprint = _buildScoringFingerprint(existing, config);
-    if (_stringifyField(existing.scoringFingerprint) === fingerprint && _hasScoringPayload(existing)) {
+    if (!config.forceRescore && _stringifyField(existing.scoringFingerprint) === fingerprint && _hasScoringPayload(existing)) {
       skippedThisExecution.push(jobId);
       handledJobIdsMap[jobId] = true;
       return;
@@ -318,57 +361,6 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     toScoreCount: activeRunState.totalScoreableCount
   });
 
-  if (jobsToScore.length && _shouldUseBatch(jobsToScore.length, config)) {
-    try {
-      _emitProgress(progressCallback, {
-        status: 'Submitting batch scoring job',
-        processed: (activeRunState.handledJobIds.length + skippedThisExecution.length) + ' / ' + activeRunState.totalJobsCount
-      });
-
-      var revalBatchCacheName = _getOrCreateScoringCache(config) || '';
-      var revalBatchRunPrefix = _gcsRunPrefix(config);
-      var revalBatchJsonl = _buildBatchInputJsonl(jobsToScore, config, revalBatchCacheName);
-      var revalBatchInputUri = _uploadToGcs(revalBatchJsonl, revalBatchRunPrefix + '/input.jsonl', config);
-      var revalBatchOutputPrefix = 'gs://' + config.gcsBucket + '/' + revalBatchRunPrefix + '/output/';
-      var revalBatchJobName = _submitVertexBatchJob(revalBatchInputUri, revalBatchOutputPrefix, config);
-
-      activeRunState.batchPending = true;
-      activeRunState.batchJobName = revalBatchJobName;
-      activeRunState.batchOutputGcsPrefix = revalBatchOutputPrefix;
-      activeRunState.batchTargetJobIds = jobsToScore.map(function(j) { return j.jobId; });
-      activeRunState.totalScoreableCount = jobsToScore.length;
-      activeRunState.handledJobIds = _appendUniqueStrings(
-        activeRunState.handledJobIds || [],
-        skippedThisExecution
-      );
-      activeRunState.processedCount = activeRunState.handledJobIds.length;
-      activeRunState.updatedAt = new Date().toISOString();
-
-      return {
-        rows: [],
-        batchPending: true,
-        newJobsCount: '',
-        aJobsCount: activeRunState.aJobsCount || 0,
-        duplicateJobsCount: 0,
-        scoredJobsCount: activeRunState.scoredJobsCount || 0,
-        failedJobsCount: activeRunState.failedJobsCount || 0,
-        importFailedJobsCount: 0,
-        processedCount: activeRunState.processedCount,
-        rawScrapedCount: '',
-        uniqueRolesCount: activeRunState.totalJobsCount,
-        totalScoreableCount: activeRunState.totalScoreableCount,
-        totalJobsCount: activeRunState.totalJobsCount,
-        errors: activeRunState.errors || [],
-        hasMore: false,
-        activeRunState: activeRunState,
-        newTopPriorityJobIds: []
-      };
-    } catch (revalBatchError) {
-      Logger.log('Batch submission failed for reevaluation, falling back to synchronous: ' + revalBatchError.message);
-      errors.push(_truncate('Batch submission failed: ' + revalBatchError.message, 300));
-    }
-  }
-
   if (jobsToScore.length) {
     var scoringResult = _scoreJobsInBatches(
       jobsToScore.slice(0, maxJobsPerExecution),
@@ -383,6 +375,7 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     executionScoredJobsCount += scoringResult.scoredJobsCount;
     executionFailedJobsCount += scoringResult.failedJobsCount;
     errors = errors.concat(scoringResult.errors);
+    // Pending Stage 2 jobs are NOT added to handledThisExecution — they stay in the queue
     handledThisExecution = handledThisExecution
       .concat(scoringResult.rows.map(function(job) { return job.jobId; }))
       .concat(scoringResult.failedJobIds || []);
@@ -391,11 +384,21 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     }).length;
     newTopPriorityJobIds = scoringResult.rows.filter(function(job) {
       return _isTopPriority(job.priority);
-    }).map(function(job) {
-      return job.jobId;
-    });
+    }).map(function(job) { return job.jobId; });
+
+    // Accumulate any Stage 2 jobs that didn't get refined (budget hit during Stage 2)
+    activeRunState.pendingStage2JobIds = _appendUniqueStrings(
+      activeRunState.pendingStage2JobIds || [],
+      scoringResult.pendingStage2JobIds || []
+    );
   }
 
+  _finalizeExecutionState(activeRunState, skippedThisExecution, handledThisExecution, errors, executionScoredJobsCount, executionFailedJobsCount, newTopPriorityJobIds, executionTopPriorityCount);
+  var hasPendingStage2 = (activeRunState.pendingStage2JobIds || []).length > 0;
+  return _buildReevaluationResult(rows, activeRunState, hasPendingStage2);
+}
+
+function _finalizeExecutionState(activeRunState, skippedThisExecution, handledThisExecution, errors, executionScoredJobsCount, executionFailedJobsCount, newTopPriorityJobIds, executionTopPriorityCount) {
   activeRunState.handledJobIds = _appendUniqueStrings(
     activeRunState.handledJobIds || [],
     skippedThisExecution.concat(handledThisExecution)
@@ -407,7 +410,9 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
   activeRunState.errors = _appendErrors(activeRunState.errors || [], errors);
   activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
   activeRunState.updatedAt = new Date().toISOString();
+}
 
+function _buildReevaluationResult(rows, activeRunState, hasPendingStage2) {
   return {
     rows: rows,
     newJobsCount: '',
@@ -422,13 +427,19 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     totalScoreableCount: activeRunState.totalScoreableCount,
     totalJobsCount: activeRunState.totalJobsCount,
     errors: activeRunState.errors || [],
-    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount,
+    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount || hasPendingStage2,
     activeRunState: activeRunState,
     newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
   };
 }
 
-function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, initialProcessedCount, statusLabel) {
+function _priorityIsAtOrAbove(priority, threshold) {
+  var p = parseInt((priority || 'P10').slice(1), 10);
+  var t = parseInt((threshold || 'P05').slice(1), 10);
+  return p <= t;
+}
+
+function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCount, initialProcessedCount, statusLabel) {
   var rows = [];
   var errors = [];
   var scoredJobsCount = 0;
@@ -439,7 +450,7 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
   var resolvedStatusLabel = statusLabel || 'Scoring jobs';
   var hitExecutionBudget = false;
 
-  // Initialize Gemini context cache once for this scoring session
+  // Initialize Gemini context cache once per stage (keyed by _activeModel via fingerprint)
   if (!config._scoringCacheAttempted) {
     config._scoringCacheAttempted = true;
     config._scoringCacheName = _getOrCreateScoringCache(config) || '';
@@ -455,7 +466,9 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
     var requests = batch.map(function(job) {
       return _buildScoreRequest(job, config);
     });
+    var batchStartedAt = Date.now();
     var responses = _executeScoreRequests(requests);
+    var prevRowCount = rows.length;
 
     batch.forEach(function(job, index) {
       try {
@@ -466,7 +479,6 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
         job.usVisaReason = scoreResult.usVisaReason;
         job.summary = scoreResult.summary;
         job.why = scoreResult.why;
-        job.angle = scoreResult.angle;
         job.titleLevel = scoreResult.titleLevel;
         job.jdImpliedLevel = scoreResult.jdImpliedLevel;
         job.scoredAt = new Date();
@@ -485,8 +497,21 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
     processedCount += batch.length;
     _emitProgress(progressCallback, {
       status: resolvedStatusLabel,
-      processed: (initialProcessedCount + processedCount) + ' / ' + totalJobsCount
+      processed: (initialProcessedCount + processedCount) + ' / ' + totalJobsCount,
+      rows: rows.slice(prevRowCount)  // flush this batch's results to the sheet immediately
     });
+
+    // Adaptive rate-limit pacing: if SCORING_RPM_LIMIT is set, sleep only the time
+    // remaining in the rate window — batch execution time already counts toward it.
+    var hasMoreBatches = (start + batch.length) < jobs.length;
+    if (hasMoreBatches && config.scoringRpmLimit > 0) {
+      var windowMs = Math.floor(60000 * batch.length / config.scoringRpmLimit);
+      var elapsed = Date.now() - batchStartedAt;
+      var sleepMs = windowMs - elapsed;
+      if (sleepMs > 0) {
+        Utilities.sleep(sleepMs);
+      }
+    }
 
     if (_shouldYieldExecution(config) && (start + batch.length) < jobs.length) {
       hitExecutionBudget = true;
@@ -502,6 +527,129 @@ function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, ini
     errors: errors,
     failedJobIds: failedJobIds,
     hitExecutionBudget: hitExecutionBudget
+  };
+}
+
+function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, initialProcessedCount, statusLabel) {
+  // Stage 1 — coarse sort using stage1Model across all jobs
+  config._activeModel = config.stage1Model;
+  config._isStage2 = false;
+  config._scoringCacheAttempted = false;
+  config._scoringCacheName = '';
+
+  var stage1Label = (jobs.length > 0 && config.stage1Model !== config.stage2Model)
+    ? 'Stage 1: ' + (statusLabel || 'Scoring jobs')
+    : (statusLabel || 'Scoring jobs');
+
+  var stage1 = _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCount, initialProcessedCount || 0, stage1Label);
+
+  if (stage1.hitExecutionBudget) {
+    // Stage 1 incomplete — no Stage 2 possible yet; no pending Stage 2 either
+    return {
+      rows: stage1.rows,
+      pendingStage2JobIds: [],
+      scoredJobsCount: stage1.scoredJobsCount,
+      failedJobsCount: stage1.failedJobsCount,
+      processedCount: stage1.processedCount,
+      errors: stage1.errors,
+      failedJobIds: stage1.failedJobIds,
+      hitExecutionBudget: true
+    };
+  }
+
+  // Partition Stage 1 results: jobs at or above threshold go to Stage 2
+  var toRefine = stage1.rows.filter(function(j) {
+    return _priorityIsAtOrAbove(j.priority, config.stage2Threshold);
+  });
+  var done = stage1.rows.filter(function(j) {
+    return !_priorityIsAtOrAbove(j.priority, config.stage2Threshold);
+  });
+
+  if (toRefine.length === 0) {
+    return {
+      rows: stage1.rows,
+      pendingStage2JobIds: [],
+      scoredJobsCount: stage1.scoredJobsCount,
+      failedJobsCount: stage1.failedJobsCount,
+      processedCount: stage1.processedCount,
+      errors: stage1.errors,
+      failedJobIds: stage1.failedJobIds,
+      hitExecutionBudget: false
+    };
+  }
+
+  // Stage 2 — re-score promising subset with stage2Model (+ optional thinking)
+  config._activeModel = config.stage2Model;
+  config._isStage2 = true;
+  // Different model needs its own cache; same model reuses Stage 1 cache automatically via fingerprint match
+  if (config.stage2Model !== config.stage1Model) {
+    config._scoringCacheAttempted = false;
+    config._scoringCacheName = '';
+  }
+
+  var stage2Label = 'Stage 2: ' + (statusLabel || 'Scoring jobs');
+
+  // Stage 2 gets its own counter (1 / N where N = subset size) so display never shows > 100%
+  var stage2 = _runSingleStageScoringLoop(toRefine, config, progressCallback, toRefine.length, 0, stage2Label);
+
+  if (stage2.hitExecutionBudget) {
+    // Stage 2 interrupted — track which qualifying jobs didn't get refined yet
+    var refinedMap = {};
+    stage2.rows.forEach(function(j) { refinedMap[j.jobId] = true; });
+    var pendingStage2JobIds = toRefine
+      .filter(function(j) { return !refinedMap[j.jobId]; })
+      .map(function(j) { return j.jobId; });
+
+    return {
+      rows: stage2.rows.concat(done),
+      pendingStage2JobIds: pendingStage2JobIds,
+      scoredJobsCount: stage1.scoredJobsCount + stage2.scoredJobsCount,
+      failedJobsCount: stage1.failedJobsCount + stage2.failedJobsCount,
+      processedCount: stage1.processedCount,
+      errors: stage1.errors.concat(stage2.errors),
+      failedJobIds: stage1.failedJobIds.concat(stage2.failedJobIds),
+      hitExecutionBudget: true
+    };
+  }
+
+  // Merge: Stage 2 refined results + Stage 1 P(threshold+1)–P10 results that were not re-scored.
+  // processedCount = Stage 1 total — Stage 2 jobs are refinements, not additional jobs.
+  return {
+    rows: stage2.rows.concat(done),
+    pendingStage2JobIds: [],
+    scoredJobsCount: stage1.scoredJobsCount + stage2.scoredJobsCount,
+    failedJobsCount: stage1.failedJobsCount + stage2.failedJobsCount,
+    processedCount: stage1.processedCount,
+    errors: stage1.errors.concat(stage2.errors),
+    failedJobIds: stage1.failedJobIds.concat(stage2.failedJobIds),
+    hitExecutionBudget: false
+  };
+}
+
+// Runs Stage 2 only on a pre-loaded set of jobs (resume path after a timeout mid-Stage 2).
+// Returns refined rows + any job IDs that still didn't complete if budget hit again.
+function _runStage2Only(jobs, config, progressCallback) {
+  config._activeModel = config.stage2Model;
+  config._isStage2 = true;
+  config._scoringCacheAttempted = false;
+  config._scoringCacheName = '';
+
+  var stage2 = _runSingleStageScoringLoop(jobs, config, progressCallback, jobs.length, 0, 'Stage 2: Scoring jobs');
+
+  var refinedMap = {};
+  stage2.rows.forEach(function(j) { refinedMap[j.jobId] = true; });
+  var pendingStage2JobIds = jobs
+    .filter(function(j) { return !refinedMap[j.jobId]; })
+    .map(function(j) { return j.jobId; });
+
+  return {
+    rows: stage2.rows,
+    pendingStage2JobIds: pendingStage2JobIds,
+    scoredJobsCount: stage2.scoredJobsCount,
+    failedJobsCount: stage2.failedJobsCount,
+    errors: stage2.errors,
+    failedJobIds: stage2.failedJobIds,
+    hitExecutionBudget: stage2.hitExecutionBudget
   };
 }
 
@@ -676,7 +824,34 @@ function _appendErrors(existingErrors, nextErrors) {
 }
 
 function _getMaxJobsPerExecution(config) {
-  return Math.max(1, Math.min(20, Number(config.maxJobsPerExecution || 20)));
+  var batchSize = Math.max(1, Number((config && config.scoringParallelRequests) || 3));
+  var rpmLimit  = Number((config && config.scoringRpmLimit) || 0);
+
+  // How long does one batch take?
+  // With a rate-limit: the window is forced to 60 * batchSize / RPM seconds.
+  // Without: use a conservative 12-second estimate for parallel API calls.
+  var secondsPerBatch = rpmLimit > 0
+    ? (60 * batchSize / rpmLimit)
+    : 12;
+
+  // Stage 2 re-scores roughly 50% of jobs (P01-P05 at default threshold).
+  // Use 0.6 as a conservative estimate so Stage 2 doesn't blow the budget.
+  var stage2Factor = 1.6;
+
+  // Leave ~60 s for setup, writeJobs, saveState, and scheduleResumeTrigger.
+  // executionSoftLimitMs defaults to 300 s (5 min), so scoring budget ≈ 240 s.
+  var scoringBudgetSeconds = (Number((config && config.executionSoftLimitMs) || 300000) / 1000) - 60;
+
+  // N jobs → ceil(N/B) Stage-1 batches + ceil(N*0.6/B) Stage-2 batches.
+  // Solve for N: N = scoringBudget / (stage2Factor * secondsPerBatch / batchSize)
+  var computed = Math.floor(scoringBudgetSeconds * batchSize / (stage2Factor * secondsPerBatch));
+
+  // Honor an explicit user override (from SCORING_MAX_JOBS_PER_EXECUTION setting),
+  // but never let it exceed the time-derived safe limit.
+  var explicit = Number((config && config.maxJobsPerExecution) || 0);
+  var limit = explicit > 0 ? Math.min(explicit, computed) : computed;
+
+  return Math.max(1, limit);
 }
 
 function _shouldYieldExecution(config) {
@@ -844,17 +1019,14 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
     sourceUrl: rawJobLink,
     summary: '',
     why: '',
-    angle: '',
     titleLevel: '',
     jdImpliedLevel: '',
     priority: '',
     score: '',
     status: 'New',
-    notes: '',
     importedAt: importedAt,
     scoredAt: '',
     sourceTask: searchString || sourceLabel || '',
-    postedSort: postedDate || '',
     rawRef: _serializeRawRef(item),
     jobDescription: description,
     contractType: contractType,
@@ -993,10 +1165,14 @@ function _buildScoreRequest(job, config) {
 }
 
 function _buildGeminiScoreRequest(job, config) {
+  var activeModel = config._activeModel || config.scoringModel;
   var generationConfig = {
     temperature: 0.2,
     responseMimeType: 'application/json'
   };
+  if (config._isStage2 && config.stage2ThinkingBudget > 0) {
+    generationConfig.thinkingConfig = { thinkingBudget: config.stage2ThinkingBudget };
+  }
   var payload;
 
   if (config._scoringCacheName) {
@@ -1023,7 +1199,7 @@ function _buildGeminiScoreRequest(job, config) {
       url: 'https://aiplatform.googleapis.com/v1/projects/' +
         encodeURIComponent(config.vertexProjectId) +
         '/locations/' + encodeURIComponent(config.vertexLocation) +
-        '/publishers/google/models/' + encodeURIComponent(config.scoringModel) +
+        '/publishers/google/models/' + encodeURIComponent(activeModel) +
         ':generateContent',
       method: 'post',
       contentType: 'application/json',
@@ -1035,7 +1211,7 @@ function _buildGeminiScoreRequest(job, config) {
 
   generationConfig.responseJsonSchema = _getScoreResponseSchema();
   return {
-    url: 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(config.scoringModel) + ':generateContent',
+    url: 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(activeModel) + ':generateContent',
     method: 'post',
     contentType: 'application/json',
     headers: { 'x-goog-api-key': config.geminiApiKey },
@@ -1119,7 +1295,8 @@ function _buildScoringPrompt(job, config) {
 }
 
 function _getScoringCacheFingerprint(config) {
-  return _sha1(config.scoringModel + '|' + config.promptVersion + '|' + _buildStaticScoringContent(config));
+  var model = config._activeModel || config.scoringModel;
+  return _sha1(model + '|' + config.promptVersion + '|' + _buildStaticScoringContent(config));
 }
 
 function _loadScoringCacheState() {
@@ -1162,13 +1339,14 @@ function _getOrCreateScoringCache(config) {
 }
 
 function _createGeminiCachedContent(config) {
+  var activeModel = config._activeModel || config.scoringModel;
   var staticContent = _buildStaticScoringContent(config);
   var payload;
   var request;
 
   if (config.geminiApiRoute === 'vertex') {
     payload = {
-      model: 'projects/' + config.vertexProjectId + '/locations/' + config.vertexLocation + '/publishers/google/models/' + config.scoringModel,
+      model: 'projects/' + config.vertexProjectId + '/locations/' + config.vertexLocation + '/publishers/google/models/' + activeModel,
       contents: [{ role: 'user', parts: [{ text: staticContent }] }],
       ttl: SCORING_CACHE_TTL_SECONDS + 's'
     };
@@ -1183,7 +1361,7 @@ function _createGeminiCachedContent(config) {
     };
   } else {
     payload = {
-      model: 'models/' + config.scoringModel,
+      model: 'models/' + activeModel,
       contents: [{ role: 'user', parts: [{ text: staticContent }] }],
       ttl: SCORING_CACHE_TTL_SECONDS + 's'
     };
@@ -1276,7 +1454,6 @@ function _normalizeScorePayload(parsedContent) {
     usVisaReason: _truncate(_stringifyField(parsedContent.us_visa_reason), 220),
     summary: _truncate(_stringifyField(parsedContent.summary), 200),
     why: _truncate(_stringifyField(parsedContent.why), 300),
-    angle: _truncate(_stringifyField(parsedContent.angle), 250),
     titleLevel: _normalizeJobLevel(parsedContent.title_level),
     jdImpliedLevel: _normalizeJobLevel(parsedContent.jd_implied_level)
   };
@@ -1310,8 +1487,8 @@ function _getScoreResponseSchema() {
       },
       us_visa_sponsorship_potential: {
         type: 'string',
-        enum: ['Likely', 'Possible', 'Unclear', 'Unlikely', 'No'],
-        description: 'Estimated US visa sponsorship potential.'
+        enum: ['Likely (90%)', 'Possible (70%)', 'Unclear (50%)', 'Unlikely (20%)', 'No (0%)'],
+        description: 'Estimated US visa sponsorship potential, with an informational probability anchor.'
       },
       us_visa_reason: {
         type: 'string',
@@ -1325,10 +1502,6 @@ function _getScoreResponseSchema() {
         type: 'string',
         description: 'One short sentence explaining the fit or skip reason.'
       },
-      angle: {
-        type: 'string',
-        description: 'One short sentence describing how to position the candidate.'
-      },
       title_level: {
         type: 'string',
         enum: ['APM', 'PM', 'Senior-PM', 'Staff-PM', 'Principal-PM', 'Manager', 'Senior-Manager', 'Group-PM', 'Director', 'Senior-Director', 'VP', 'Head-of-Product', 'Founding-PM', 'Unknown'],
@@ -1340,7 +1513,7 @@ function _getScoreResponseSchema() {
         description: 'Actual seniority implied by the JD body — ignore the job title for this field.'
       }
     },
-    required: ['score', 'priority', 'us_visa_sponsorship_potential', 'us_visa_reason', 'summary', 'why', 'angle', 'title_level', 'jd_implied_level']
+    required: ['score', 'priority', 'us_visa_sponsorship_potential', 'us_visa_reason', 'summary', 'why', 'title_level', 'jd_implied_level']
   };
 }
 
@@ -1399,22 +1572,26 @@ function _resolveDefaultableSetting(value, defaultFn) {
 
 function _defaultScoringInstructions() {
   return [
-    'Act as the hiring manager for this exact role and as a pragmatic PM job-screening analyst.',
+    'You are the hiring manager who owns this exact role and team. Judge whether you would hire this candidate for this role. Do NOT evaluate like an ATS, recruiter, or HR keyword screen — look past missing keywords, exact-year thresholds, or exact title labels when the candidate\'s substance and transferable depth clearly cover the role.',
     '',
     'Objective:',
-    'Score interview-conversion priority: how likely this candidate’s truthful, tailored resume is to earn an interview for this exact job.',
+    'Score the realistic probability that this candidate gets hired for this exact role, judged as the hiring manager who owns it — based on whether the candidate can do the job, has defensible and relevant proof, and stands out against typical applicants.',
     '',
-    'Use only the real job title, company, metadata, and raw JD. Ignore prior AI summaries, prior scores, or generated angles.',
+    'Substance over keywords: reward demonstrated impact, judgment, and transferable depth. Do not reward keyword-matching by itself, and do not penalize missing jargon/buzzwords when the underlying substance is present.',
+    '',
+    'The target profile above is the candidate\'s resume. Infer employers, roles, approximate start/end dates, and tenure directly from it. When dates are missing, estimate tenure and recency from context (ordering, "present", durations).',
+    '',
+    'Use only the real job title, company, metadata, and raw JD. Ignore prior AI summaries or prior scores.',
     '',
     'Return strict JSON only with exactly these keys:',
-    'score, priority, us_visa_sponsorship_potential, us_visa_reason, summary, why, angle.',
+    'score, priority, us_visa_sponsorship_potential, us_visa_reason, summary, why.',
     '',
     'Rules:',
     '- score: integer 0-100',
     '- priority: P01, P02, P03, P04, P05, P06, P07, P08, P09, or P10',
-    '- us_visa_sponsorship_potential: Likely, Possible, Unclear, Unlikely, or No',
+    '- us_visa_sponsorship_potential: Likely (90%), Possible (70%), Unclear (50%), Unlikely (20%), or No (0%) — copy the label verbatim, including the percentage',
     '- us_visa_reason: one short sentence explaining the evidence for the visa label',
-    '- summary, why, and angle: one short sentence each',
+    '- summary and why: one short sentence each',
     '- No markdown, no extra keys, no extra commentary.',
     '',
     'Evaluate mainly on:',
@@ -1434,6 +1611,42 @@ function _defaultScoringInstructions() {
     '',
     'Weak domain means generic AI, generic SaaS, internal tools, cloud support, procurement/supply-chain, healthcare clinical systems, logistics, staffing/marketplaces, consumer growth, media, ads, gaming, investment product, operations, strategy, product marketing, pure engineering, sales, or support.',
     '',
+    'Proof credibility and tenure:',
+    '- Weight each candidate proof point by tenure depth at the employer where it was earned.',
+    '- Anchor proof = earned over ~18+ months and deep. Full weight.',
+    '- Supporting proof = ~12-18 months, or somewhat dated. Partial weight.',
+    '- Thin proof = under ~12 months, or a coaching/side/short engagement. Secondary signal only.',
+    '- P01-P03 require at least one anchor proof point that maps directly to the JD. Thin proof alone maxes at P05.',
+    '',
+    'Recency:',
+    '- Experience within roughly the last 5-6 years carries the most weight. Progressively discount experience older than ~6 years.',
+    '- The candidate\'s most-recent role gets a recency uplift even if its tenure is thin — it signals current direction and fresh skills, so prioritize it above older thin proof and never dismiss it.',
+    '- This uplift does not override the tenure rule: a thin recent role still cannot by itself anchor P01-P03. Depth wins for anchoring (a ~4-year role outranks a ~6-month recent stint); recency wins for tie-breaking and positioning.',
+    '',
+    'Hard disqualifiers (hiring-manager judgment, not checkbox):',
+    '- Cap only on a genuine capability gap a hiring manager would actually reject on: the candidate cannot do the core of the job, or lacks a fundamentally required, non-transferable skill/specialty the role is built around (or a required license/certification). Cap at P06 regardless of other fit.',
+    '- Do NOT cap on mechanical gates: a missing exact-years threshold, an absent buzzword, or a non-matching title — if transferable depth clearly covers the work, the hiring manager would still proceed.',
+    '- Work-authorization/visa is never a disqualifier here; it stays informational in the visa fields only.',
+    '',
+    'Domain transferability:',
+    '- Transfers well from the candidate\'s fintech wedge (treat as near-direct): regtech, insurtech, security/identity, anti-fraud, risk/compliance, payments-adjacent, API/verification platforms, govtech identity.',
+    '- Transfers poorly (treat as weak even if PM craft overlaps): gaming, clinical/healthcare delivery, ad-tech, consumer social, marketplace ops, logistics.',
+    '',
+    'Convergence and breadth:',
+    '- When a JD maps to several distinct, credible proof points, or to proof spanning more than one relevant role, treat it as stronger than a single-point hit: push toward the top of the allowed bucket, and allow a one-bucket uplift when the convergence is clear.',
+    '- Weight convergence by credibility: anchor/supporting proofs count fully; stacking multiple thin proofs does NOT substitute for a missing anchor and cannot lift into P01-P03.',
+    '- Convergence concentrated in the recent ~5-6 year window counts more than the same breadth scattered across older experience.',
+    '',
+    'Seniority fit (two-sided):',
+    '- Penalize the gap between the candidate\'s proven level and the role\'s implied level in both directions.',
+    '- Over-qualified (candidate clearly senior to the role) reduces hire odds (flight-risk / comp-mismatch); not a top bucket.',
+    '- Under-qualified (role clearly above demonstrated scope) reduces hire odds.',
+    '- Best odds when the role\'s implied level matches the candidate\'s proven level (PM / Senior PM).',
+    '',
+    'Differentiation and scarcity:',
+    '- Reward rare, hard-to-replicate proof few applicants would have — it raises hire odds.',
+    '- Penalize generic matches many applicants meet equally — lower hire odds even when keywords align. Qualified is not the same as standout.',
+    '',
     'Priority buckets:',
     '- P01: rare bullseye; direct domain + strong proof + PM/Senior PM fit + clear ownership + reliable JD. Score 95-100.',
     '- P02: very strong fit; direct domain + strong proof with one minor gap. Score 90-94.',
@@ -1441,7 +1654,7 @@ function _defaultScoringInstructions() {
     '- P04: good adjacent PM fit, not top wedge. Score 80-84.',
     '- P05: adjacent but credible, weaker domain or proof. Score 75-79.',
     '- P06: possible backup. Score 70-74.',
-    '- P07: low interview-conversion fit, generic PM or weak domain. Score 60-69.',
+    '- P07: low hire odds, generic PM or weak domain. Score 60-69.',
     '- P08: poor fit or wrong product area. Score 50-59.',
     '- P09: clear mismatch. Score 35-49.',
     '- P10: hard skip: entry-level, internship, new-grad, pure engineering, pure sales/support/admin, or obvious non-target. Score 0-34.',
@@ -1455,24 +1668,28 @@ function _defaultScoringInstructions() {
     '- Famous company alone max P05.',
     '- Financial-institution customer segment does not make the product fintech.',
     '- Staff/Principal/Group/Director/VP+ max P04 unless direct-domain, IC/product-scope heavy, and unusually strong.',
+    '- Banking-industry VP exception: at banks and large financial institutions (e.g. JPMorganChase, Goldman Sachs, Capital One, Citi, Wells Fargo, Bank of America, Morgan Stanley), "Vice President" is a mid-level seniority band, NOT a tech-industry executive VP. A title like "Vice President, Product Manager" or "Product Manager - Vice President" is an individual-contributor PM/Senior-PM role, so do NOT apply the VP+ cap to it — score it as a normal PM/Senior-PM role on domain and proof. The VP+ cap still applies to true executive titles (Managing Director, Head of Product, Division/Group head). When unsure, read the JD body: IC/product-execution scope with no large team of PM reports means treat as PM/Senior-PM regardless of the VP band in the title.',
     '- Recruiter/hiring-network/generic/duplicated/unclear-employer JD max P05 unless direct-domain proof is clear.',
     '- Pure strategy, product marketing, sales, support, account management, admin, or operations max P07 unless clear product ownership exists.',
     '',
     'Batch calibration:',
     'For ~1,000 scraped PM jobs, P01 should be rare, P02 selective, P03 strong but not bullseye, most decent jobs should fall into P04-P06, and weak/non-target jobs should fall into P07-P10.',
     '',
-    'Visa:',
-    '- visa output is informational only',
-    '- do not use visa to increase or decrease score or priority',
-    '- Likely = sponsorship is explicit or strongly supported by employer and role context',
-    '- Possible = sponsorship is not explicit, but still plausibly available',
-    '- Unclear = no reliable sponsorship signal',
-    '- Unlikely = sponsorship is not stated and role or employer context makes it less likely',
-    '- No = posting explicitly says no sponsorship, no current/future sponsorship, or unrestricted US work authorization required',
+    'Visa (US H-1B / employment sponsorship):',
+    '- Visa output is informational only. Do not use visa to increase or decrease score or priority.',
+    '- Each label includes a probability anchor in parentheses; the percentage is an informational reading aid (it is NOT used in scoring or priority). Copy the label string verbatim, including the percentage.',
+    '- Pick the single label that matches the strongest evidence in the JD. The labels are ordered; do not let Possible and Unclear overlap — Possible requires a positive (even if soft) sponsorship signal, Unclear means the JD is simply silent.',
+    '- Likely (90%) = the JD explicitly states sponsorship is available/offered, OR mentions visa/H-1B/green-card/relocation support, OR the employer has a well-known strong sponsorship track record.',
+    '- Possible (70%) = no explicit statement, but a concrete positive signal exists: large/global employer, prior H-1B sponsorship history for similar roles, "open to all candidates", or international-friendly language.',
+    '- Unclear (50%) = the JD gives no sponsorship signal either way (silent). This is the default when there is no explicit statement.',
+    '- Unlikely (20%) = no sponsorship signal AND context points against it: small/early-stage company, government/defense, contractor/staffing, or a role type that rarely sponsors.',
+    '- No (0%) = the JD explicitly says no sponsorship, "must be authorized to work without sponsorship now or in the future", or requires citizenship / security clearance.',
     '- Do not treat "US applicants only", US location eligibility, or US pay-transparency language by itself as No.',
+    '- us_visa_reason must cite the concrete signal that drove the label (quote or paraphrase the JD phrase, or name the employer/context signal). When the label is Unclear because the JD is silent, still give a best-guess estimate in the reason — e.g. "JD silent; large global fintech, sponsorship plausible" or "JD silent; small early-stage startup, sponsorship doubtful".',
     '',
     'Level classification:',
     'title_level: Read the job title string only — ignore the JD body. Map to one of: APM, PM, Senior-PM, Staff-PM, Principal-PM, Manager, Senior-Manager, Group-PM, Director, Senior-Director, VP, Head-of-Product, Founding-PM, Unknown.',
+    '- Banking VP titles: when the employer is a bank/large financial institution AND the title pairs "Vice President" with "Product Manager" (e.g. "Vice President, Product Manager" or "Product Manager - Vice President"), map title_level to PM or Senior-PM (per any Senior/Sr qualifier), NOT VP — at banks VP is a seniority band equivalent to a tech Senior-PM, not an executive rank.',
     'jd_implied_level: Read the JD body only — ignore the job title. Infer the actual scope and seniority from content signals:',
     '- "first PM", "build from scratch", "wear many hats", seed/Series A stage → Founding-PM',
     '- Manages 5+ PMs, owns org-wide roadmap, sets product strategy across groups → Group-PM or Director',
@@ -1603,14 +1820,14 @@ function _normalizeJobLevel(value) {
 
 function _normalizeVisaSponsorshipPotential(value) {
   var allowed = {
-    Likely: true,
-    Possible: true,
-    Unclear: true,
-    Unlikely: true,
-    No: true
+    'Likely (90%)': true,
+    'Possible (70%)': true,
+    'Unclear (50%)': true,
+    'Unlikely (20%)': true,
+    'No (0%)': true
   };
   var potential = _stringifyField(value);
-  return allowed[potential] ? potential : 'Unclear';
+  return allowed[potential] ? potential : 'Unclear (50%)';
 }
 
 function _dedupeJobsByJobId(jobs) {
@@ -1665,9 +1882,7 @@ function _buildCandidateJob(job, existing) {
   candidate.experienceLevel = _stringifyField(candidate.experienceLevel) || _stringifyField(existing.experienceLevel) || '';
   candidate.workType = _stringifyField(candidate.workType) || _stringifyField(existing.workType) || '';
   candidate.publishedAt = _stringifyField(candidate.publishedAt) || _stringifyField(existing.publishedAt) || '';
-  candidate.postedSort = candidate.postedSort || existing.postedSort || '';
   candidate.status = existing.status || 'New';
-  candidate.notes = existing.notes || '';
   candidate.importedAt = existing.importedAt || candidate.importedAt;
   candidate.scoredAt = existing.scoredAt || '';
   candidate.score = existing.score === undefined ? '' : existing.score;
@@ -1676,7 +1891,6 @@ function _buildCandidateJob(job, existing) {
   candidate.usVisaReason = existing.usVisaReason || '';
   candidate.summary = existing.summary || '';
   candidate.why = existing.why || '';
-  candidate.angle = existing.angle || '';
   candidate.titleLevel = existing.titleLevel || '';
   candidate.jdImpliedLevel = existing.jdImpliedLevel || '';
   candidate.scoringFingerprint = existing.scoringFingerprint || '';
@@ -1714,10 +1928,6 @@ function _refreshStoredJobForReevaluation(existing) {
   refreshed.publishedAt = recoveredPublishedAt || refreshed.publishedAt || '';
   refreshed.applicants = recoveredApplicants || refreshed.applicants || '';
 
-  if ((!refreshed.postedSort || refreshed.postedSort === '') && publishedDate && !isNaN(publishedDate.getTime())) {
-    refreshed.postedSort = publishedDate;
-  }
-
   if ((!refreshed.posted || refreshed.posted === '') && publishedDate && !isNaN(publishedDate.getTime())) {
     refreshed.posted = _formatDateTimeForDisplay(publishedDate);
   }
@@ -1738,8 +1948,8 @@ function _parseRawRefObject(rawRef) {
 }
 
 function _compareJobRecencyDesc(left, right) {
-  var leftTime = _toComparableTime(left.postedSort || left.importedAt || left.scoredAt);
-  var rightTime = _toComparableTime(right.postedSort || right.importedAt || right.scoredAt);
+  var leftTime = _toComparableTime(left.importedAt || left.scoredAt);
+  var rightTime = _toComparableTime(right.importedAt || right.scoredAt);
 
   if (leftTime !== rightTime) {
     return rightTime - leftTime;
@@ -1770,6 +1980,13 @@ function _toComparableTime(value) {
   }
 
   return 0;
+}
+
+function _toDateField(value) {
+  if (!value) return '';
+  if (value instanceof Date) return isNaN(value.getTime()) ? '' : value;
+  var d = new Date(value);
+  return isNaN(d.getTime()) ? '' : d;
 }
 
 function _pickFirstValue(item, keys) {
@@ -1997,250 +2214,3 @@ function _titlesSanityCheck(titleA, titleB) {
   return wordsA.some(function(w) { return setB[w]; });
 }
 
-// --- Vertex AI Batch Prediction ---
-
-function _shouldUseBatch(jobCount, config) {
-  if (config.geminiApiRoute !== 'vertex') return false;
-  if (!config.gcsBucket) return false;
-  var mode = String(config.batchMode || 'off');
-  if (mode === 'off') return false;
-  if (mode === 'always') return jobCount > 0;
-  if (mode === 'auto') return jobCount >= Number(config.batchAutoThreshold || 50);
-  return false;
-}
-
-function _gcsRunPrefix(config) {
-  var ts = config.runStartedAt instanceof Date
-    ? config.runStartedAt.getTime()
-    : new Date().getTime();
-  return 'job-scoring/' + String(ts);
-}
-
-function _buildBatchInputJsonl(jobs, config, cacheName) {
-  return jobs.map(function(job) {
-    var generationConfig = {
-      temperature: 0.2,
-      responseMimeType: 'application/json',
-      responseSchema: _getScoreResponseSchema()
-    };
-    var request;
-    if (cacheName) {
-      request = {
-        cachedContent: cacheName,
-        contents: [{ role: 'user', parts: [{ text: _buildDynamicJobContent(job) }] }],
-        generationConfig: generationConfig
-      };
-    } else {
-      var fullPrompt = _buildStaticScoringContent(config) + '\n\n' + _buildDynamicJobContent(job);
-      request = {
-        contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
-        generationConfig: generationConfig
-      };
-    }
-    return JSON.stringify({ request: request });
-  }).join('\n');
-}
-
-function _uploadToGcs(content, objectName, config) {
-  var bucket = config.gcsBucket;
-  var token = ScriptApp.getOAuthToken();
-
-  var response = UrlFetchApp.fetch(
-    'https://storage.googleapis.com/upload/storage/v1/b/' + encodeURIComponent(bucket) +
-    '/o?uploadType=media&name=' + encodeURIComponent(objectName),
-    {
-      method: 'post',
-      contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + token },
-      payload: content,
-      muteHttpExceptions: true
-    }
-  );
-
-  var code = response.getResponseCode();
-  if (code >= 300) {
-    throw new Error('GCS upload failed (' + code + '): ' + _truncate(response.getContentText(), 200));
-  }
-
-  return 'gs://' + bucket + '/' + objectName;
-}
-
-function _submitVertexBatchJob(inputGcsUri, outputGcsPrefix, config) {
-  var payload = {
-    displayName: 'job-scoring-batch',
-    model: 'publishers/google/models/' + config.scoringModel,
-    inputConfig: {
-      instancesFormat: 'jsonl',
-      gcsSource: { uris: [inputGcsUri] }
-    },
-    outputConfig: {
-      predictionsFormat: 'jsonl',
-      gcsDestination: { outputUriPrefix: outputGcsPrefix }
-    }
-  };
-
-  var response = UrlFetchApp.fetch(
-    'https://aiplatform.googleapis.com/v1/projects/' + encodeURIComponent(config.vertexProjectId) +
-    '/locations/' + encodeURIComponent(config.vertexLocation) + '/batchPredictionJobs',
-    {
-      method: 'post',
-      contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    }
-  );
-
-  var code = response.getResponseCode();
-  var body = response.getContentText();
-  if (code >= 300) {
-    throw new Error('Vertex batch job creation failed (' + code + '): ' + _truncate(body, 300));
-  }
-
-  return JSON.parse(body).name;
-}
-
-function _pollVertexBatchJobState(jobName, config) {
-  var response = UrlFetchApp.fetch(
-    'https://aiplatform.googleapis.com/v1/' + jobName,
-    {
-      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-      muteHttpExceptions: true
-    }
-  );
-
-  var code = response.getResponseCode();
-  if (code >= 300) {
-    throw new Error('Vertex batch job status check failed (' + code + ')');
-  }
-
-  var parsed = JSON.parse(response.getContentText());
-  return {
-    state: String(parsed.state || ''),
-    outputDirectory: (parsed.outputInfo && parsed.outputInfo.gcsOutputDirectory)
-      ? String(parsed.outputInfo.gcsOutputDirectory)
-      : '',
-    error: parsed.error ? _truncate(String(parsed.error.message || ''), 300) : ''
-  };
-}
-
-function _listGcsObjectsByPrefix(gcsDirectoryUri, config) {
-  var match = String(gcsDirectoryUri || '').match(/^gs:\/\/([^\/]+)\/?(.*)$/);
-  if (!match) return [];
-  var bucket = match[1];
-  var prefix = match[2];
-
-  var response = UrlFetchApp.fetch(
-    'https://storage.googleapis.com/storage/v1/b/' + encodeURIComponent(bucket) +
-    '/o?prefix=' + encodeURIComponent(prefix),
-    {
-      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-      muteHttpExceptions: true
-    }
-  );
-
-  if (response.getResponseCode() >= 300) return [];
-
-  var parsed = JSON.parse(response.getContentText());
-  return (parsed.items || [])
-    .map(function(item) { return { bucket: bucket, name: item.name }; })
-    .sort(function(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
-}
-
-function _downloadGcsObject(bucket, objectName, config) {
-  var response = UrlFetchApp.fetch(
-    'https://storage.googleapis.com/download/storage/v1/b/' + encodeURIComponent(bucket) +
-    '/o/' + encodeURIComponent(objectName) + '?alt=media',
-    {
-      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
-      muteHttpExceptions: true
-    }
-  );
-
-  var code = response.getResponseCode();
-  if (code >= 300) {
-    throw new Error('GCS download failed for ' + objectName + ' (' + code + ')');
-  }
-
-  return response.getContentText();
-}
-
-function _readBatchJobResults(activeRunState, outputDirectory, config, existingIndex) {
-  var batchTargetJobIds = activeRunState.batchTargetJobIds || [];
-  var scoredRows = [];
-  var failedJobIds = [];
-  var errors = [];
-  var lineIndex = 0;
-
-  var objectRefs = _listGcsObjectsByPrefix(outputDirectory, config);
-  objectRefs.forEach(function(ref) {
-    if (!ref.name.match(/\.jsonl$/i)) return;
-
-    var content;
-    try {
-      content = _downloadGcsObject(ref.bucket, ref.name, config);
-    } catch (e) {
-      errors.push('Download failed for ' + ref.name + ': ' + e.message);
-      return;
-    }
-
-    var lines = content.split('\n');
-    lines.forEach(function(line) {
-      line = line.trim();
-      if (!line) return;
-
-      var jobId = batchTargetJobIds[lineIndex];
-      lineIndex += 1;
-
-      if (!jobId) return;
-
-      var existing = existingIndex.byJobId[jobId];
-      if (!existing) {
-        failedJobIds.push(jobId);
-        return;
-      }
-
-      try {
-        var parsed = JSON.parse(line);
-        var status = parsed.status;
-        if (status && status.code && status.code !== 0) {
-          throw new Error(String(status.message || status.code));
-        }
-
-        var response = parsed.response;
-        var candidate = response && response.candidates && response.candidates[0];
-        var parts = candidate && candidate.content && candidate.content.parts;
-        var text = parts && parts.map(function(p) { return p.text || ''; }).join('');
-
-        if (!text) throw new Error('Empty response from batch result');
-
-        var scoreResult = _normalizeScorePayload(_parseJsonSafely(text));
-        var scored = _cloneJobRecord(existing);
-        scored.existingRowNumber = existing.rowNumber;
-        scored.score = scoreResult.score;
-        scored.priority = scoreResult.priority;
-        scored.usVisaSponsorshipPotential = scoreResult.usVisaSponsorshipPotential;
-        scored.usVisaReason = scoreResult.usVisaReason;
-        scored.summary = scoreResult.summary;
-        scored.why = scoreResult.why;
-        scored.angle = scoreResult.angle;
-        scored.titleLevel = scoreResult.titleLevel;
-        scored.jdImpliedLevel = scoreResult.jdImpliedLevel;
-        scored.scoredAt = new Date();
-        scored.scoringFingerprint = _buildScoringFingerprint(existing, config);
-        scoredRows.push(scored);
-      } catch (e) {
-        failedJobIds.push(jobId);
-        errors.push(_truncate('Batch result parse failed for ' + jobId + ': ' + e.message, 200));
-      }
-    });
-  });
-
-  return {
-    scoredRows: scoredRows,
-    failedJobIds: failedJobIds,
-    scoredJobsCount: scoredRows.length,
-    failedJobsCount: failedJobIds.length,
-    errors: errors
-  };
-}
