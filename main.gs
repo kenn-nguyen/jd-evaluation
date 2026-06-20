@@ -67,6 +67,8 @@ function onOpen() {
     .addItem('Create Run Trigger', 'createRunTrigger')
     .addItem('Remove Run Triggers', 'removeHourlyTriggers')
     .addSeparator()
+    .addItem('Prune Raw Data...', 'pruneRawDataPrompt')
+    .addSeparator()
     .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
     .addItem('Validate Config', 'validateConfiguration')
     .addToUi();
@@ -119,6 +121,26 @@ function resumeJobImportAndScoring() {
   }
 
   return _runJobImportAndScoringInternal();
+}
+
+function pruneRawDataPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Prune Raw Data', 'Delete Raw_Data rows with a posted date older than how many days?\n(Leave blank for 30)', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+
+  var input = String(response.getResponseText() || '').trim();
+  var days = input === '' ? 30 : parseInt(input, 10);
+
+  if (isNaN(days) || days <= 0) {
+    ui.alert('Invalid input. Please enter a positive number of days.');
+    return;
+  }
+
+  var deleted = pruneRawData(days);
+  ui.alert('Pruned ' + deleted + ' row' + (deleted === 1 ? '' : 's') + ' older than ' + days + ' days from Raw_Data.');
 }
 
 function importApifyRunByIdPrompt() {

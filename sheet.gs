@@ -53,15 +53,11 @@ var SETTINGS_DEFAULT_ROWS = [
   ['GEMINI_API_ROUTE', 'developer', 'developer uses Gemini Developer API. vertex uses your linked Google Cloud project and Vertex billing.'],
   ['VERTEX_PROJECT_ID', '', 'Required only when GEMINI_API_ROUTE=vertex. Use your standard Google Cloud project id.'],
   ['VERTEX_LOCATION', 'global', 'Usually keep global for Gemini models on Vertex'],
-  ['SCORING_MODEL', 'gemini-2.5-flash', 'Editable model name used for scoring. Used as fallback when STAGE1_MODEL or STAGE2_MODEL are blank.'],
+  ['SCORING_MODEL', 'gemini-2.5-flash', 'Gemini model used for scoring.'],
   ['SCORING_PARALLEL_REQUESTS', '3', 'How many AI scoring requests to send in parallel per batch'],
   ['SCORING_RPM_LIMIT', '0', 'API rate limit in requests per minute. Set to your Vertex/Gemini quota (e.g. 10 for free trial). 0 = no pacing.'],
   ['SCORING_MAX_JOBS_PER_EXECUTION', '0', 'Max jobs scored per Apps Script execution. 0 = auto-calculated from RPM and batch size to fit within 5 minutes. Override if the auto value is too conservative or too aggressive.'],
-  ['STAGE1_MODEL', 'gemini-2.5-flash', 'Model for Stage 1: scores all jobs with the full prompt for a coarse P01-P10 sort. Leave blank to use SCORING_MODEL.'],
-  ['STAGE2_MODEL', 'gemini-2.5-flash', 'Model for Stage 2: re-scores the promising subset from Stage 1. Default: same as Stage 1 (shared cache). Change to gemini-2.5-pro for higher quality at greater cost.'],
-  ['STAGE2_THRESHOLD', 'P05', 'Stage 1 jobs at or above this priority are re-scored in Stage 2. Valid values: P01-P09. Default P05 (re-scores P01-P05).'],
-  ['STAGE2_THINKING_BUDGET', '0', 'Thinking token budget for Stage 2. 0 = off. Try 1024 (light) or 8192 (deep). Effective on Gemini 2.5 Flash/Pro. When Stage 1 and Stage 2 use the same model, thinking adds quality with no extra cache cost.'],
-  ['TARGET_PROFILE', 'Candidate target profile:\n\nExperienced product manager / product leader with 10+ years of experience, most recently Senior Product Manager / Associate Product Director level, with Yale SOM and NUS MBA training.\n\nPrimary interview wedge:\nfintech infrastructure, banking technology, payments, fraud/risk, identity verification, authentication, biometric/liveness verification, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification platforms, and regulated financial workflows for banks/fintechs.\n\nStrong proof points:\nscaled API-based identity/risk verification from ~500K to ~2M daily verifications across cloud and on-prem; launched biometric payment authentication across 9 tier-1 banks; owned fraud/risk, KYC, liveness, authentication, and API verification products; improved verification/authentication conversion; reduced integration friction; defined ML product/model requirements; supported ~40% YoY ARR/API growth; standardized platform deployments across markets.\n\nSecondary/adjacent fit:\nAI workflow, agentic AI, API/developer platforms, technical platform PM, B2B SaaS, data products, security/governance, and enterprise workflow. Lumi supports AI workflow and product-building evidence, but should not be treated as equivalent to large-scale enterprise AI platform PM experience.\n\nDirect fit requires the role itself to own payments, fraud/risk, identity, authentication, KYC, onboarding, risk decisioning, API verification, or financial infrastructure. Do not treat a financial-services customer segment or famous employer as direct domain fit.\n\nPrioritize PM and Senior PM roles. Treat Staff, Principal, Director, VP+, entry-level, pure engineering, pure strategy, product marketing, sales, account management, support, operations, healthcare clinical systems, procurement, supply chain, ads, gaming, marketplace operations, and investment-product roles as lower priority unless the JD has unusually strong product ownership and proof mapping.', 'Editable scoring context. Replace this with your own resume-derived profile text as needed.'],
+  ['TARGET_PROFILE', '', 'Leave blank to use the built-in profile defined in prompts.gs (_defaultTargetProfile). Paste your own text here to override it.'],
   ['SCORING_INSTRUCTIONS', 'default', 'Use default to keep the built-in scoring prompt, or replace with your own instruction block. The built-in prompt scores interview-conversion priority and evaluates visa separately at the end.'],
   ['NOTIFY_EMAIL', '', 'Optional. Email address for P01-priority alerts and critical failure alerts'],
   ['FORCE_RESCORE', 'FALSE', 'TRUE rescoring existing jobs in the current fetch'],
@@ -78,10 +74,10 @@ var HELP_ROWS = [
   ['Step 3', 'If using Vertex billing, switch this Apps Script project to a standard Google Cloud project, enable Vertex AI API there, and set GEMINI_API_ROUTE to vertex.'],
   ['Step 4', 'If GEMINI_API_ROUTE is vertex, fill in VERTEX_PROJECT_ID and usually leave VERTEX_LOCATION as global.'],
   ['Step 5', 'In the same Settings sheet, fill in APIFY_TASK_IDS with your task id.'],
-  ['Step 6', 'Edit TARGET_PROFILE directly with your current resume-derived summary or job-targeting profile.'],
+  ['Step 6', 'Leave TARGET_PROFILE blank to use the built-in profile from prompts.gs. Paste your own text to override.'],
   ['Step 7', 'Optional: set NOTIFY_EMAIL if you want email alerts for new P01 jobs and critical failures.'],
   ['Step 8', 'Leave SCORING_INSTRUCTIONS as default to use the built-in prompt, or replace it with your own prompt rules.'],
-  ['Step 9', 'Leave SCORING_MODEL as gemini-2.5-flash unless you want another Gemini model.'],
+  ['Step 9', 'Leave SCORING_MODEL as gemini-2.5-flash, or change it to another Gemini model name.'],
   ['Step 10', 'Use Jobs Pipeline > Validate Config, then Jobs Pipeline > Run Now.'],
   ['Import old Apify run', 'Use Jobs Pipeline > Import Apify Run ID... to score a finished Apify run again from its saved dataset without scraping a new batch.'],
   ['Retry failed Apify run', 'Use Jobs Pipeline > Retry Apify Run ID... to rerun a finished or failed Apify run in Apify, wait for completion, then import and score that rerun.'],
@@ -93,7 +89,6 @@ var HELP_ROWS = [
   ['When you change Apify account', 'Usually only APIFY_TOKEN and APIFY_TASK_IDS in the Settings sheet need to change.'],
   ['Task id example', 'masterabctech~linkedin-job-scraper-task'],
   ['Parallel AI requests', 'SCORING_PARALLEL_REQUESTS controls how many jobs are scored in parallel per batch. 3 is a safe default.'],
-  ['Two-stage scoring', 'Stage 1 runs all jobs through STAGE1_MODEL for a coarse P01-P10 sort. Stage 2 re-runs jobs at or above STAGE2_THRESHOLD through STAGE2_MODEL (with optional STAGE2_THINKING_BUDGET) for refined final scores. Jobs below the threshold keep their Stage 1 scores. Using the same model for both stages shares the cache and avoids extra cache creation cost.'],
   ['Notification email', 'If NOTIFY_EMAIL is blank, no email notifications are sent.'],
   ['P01 job alert email', 'Sent when the run finds at least one new P01-priority job. The email includes summary, visa signal, why, and job link.'],
   ['Critical failure email', 'Sent when the whole run fails or when a large share of jobs in the run fail to import or score.'],
@@ -254,13 +249,14 @@ function writeJobs(rows) {
   updates.forEach(function(update) {
     sheet.getRange(update.rowNumber, 1, 1, JOB_PRIORITY_COLUMNS.length).setValues([update.values]);
     _applyJobIdColumnFormat(sheet, update.rowNumber, 1);
+    _applyDataRowFormat(sheet, update.rowNumber, 1);
   });
 
   if (appends.length) {
     var startRow = Math.max(sheet.getLastRow() + 1, JOB_PRIORITY_DATA_START_ROW);
     sheet.getRange(startRow, 1, appends.length, JOB_PRIORITY_COLUMNS.length).setValues(appends);
     _applyJobIdColumnFormat(sheet, startRow, appends.length);
-    // Assign row numbers back so any future write (e.g. Stage 2) updates in-place
+    _applyDataRowFormat(sheet, startRow, appends.length);
     appendedJobs.forEach(function(job, i) {
       job.existingRowNumber = startRow + i;
     });
@@ -410,14 +406,11 @@ function migrateRawDataToDedicatedSheet() {
 }
 
 function replaceAllJobs(rows, opts) {
-  var skipFormatting = opts && opts.skipFormatting;
   var skipRawDataSync = opts && opts.skipRawDataSync;
 
   var sheet = _getJobPrioritySheet();
   var existingLastRow = sheet.getLastRow();
   var clearRowCount = Math.max(existingLastRow - JOB_PRIORITY_DATA_START_ROW + 1, 0);
-
-  var userFormatting = skipFormatting ? null : _captureRowFormattingByJobId(sheet, existingLastRow);
 
   if (!skipRawDataSync && rows && rows.length) {
     _upsertRawDataRows(rows);
@@ -430,6 +423,12 @@ function replaceAllJobs(rows, opts) {
       clearRowCount,
       JOB_PRIORITY_COLUMNS.length
     ).clearContent();
+    sheet.getRange(
+      JOB_PRIORITY_DATA_START_ROW,
+      1,
+      clearRowCount,
+      JOB_PRIORITY_VISIBLE_COLUMNS.length
+    ).clearFormat();
   }
 
   if (rows && rows.length) {
@@ -442,86 +441,18 @@ function replaceAllJobs(rows, opts) {
     ).setValues(outputRows);
 
     _applyJobIdColumnFormat(sheet, JOB_PRIORITY_DATA_START_ROW, outputRows.length);
-
-    if (!skipFormatting) {
-      _restoreRowFormattingByJobId(sheet, rows, userFormatting);
-    } else {
-      // Just clear any stale explicit formatting so conditional formatting rules apply cleanly
-      sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, outputRows.length, JOB_PRIORITY_VISIBLE_COLUMNS.length).clearFormat();
-    }
+    _applyDataRowFormat(sheet, JOB_PRIORITY_DATA_START_ROW, outputRows.length);
   }
 
   _applyStatusValidation(sheet);
 }
 
-function _captureRowFormattingByJobId(sheet, lastRow) {
-  var result = {};
-  if (!lastRow || lastRow < JOB_PRIORITY_DATA_START_ROW) return result;
-
-  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
-  var visibleColCount = JOB_PRIORITY_VISIBLE_COLUMNS.length;
-  var dataRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, rowCount, visibleColCount);
-  var jobIdValues = sheet.getRange(
-    JOB_PRIORITY_DATA_START_ROW,
-    JOB_PRIORITY_COLUMN_INDEX.job_id,
-    rowCount,
-    1
-  ).getValues();
-
-  var backgrounds = dataRange.getBackgrounds();
-  var fontColors = dataRange.getFontColors();
-  var fontWeights = dataRange.getFontWeights();
-
-  jobIdValues.forEach(function(idRow, i) {
-    var jobId = _stringifyField(idRow[0]);
-    if (!jobId) return;
-    result[jobId] = {
-      backgrounds: backgrounds[i],
-      fontColors: fontColors[i],
-      fontWeights: fontWeights[i]
-    };
-  });
-
-  return result;
-}
-
-function _restoreRowFormattingByJobId(sheet, rows, formattingByJobId) {
-  if (!rows || !rows.length || !formattingByJobId) return;
-
-  var visibleColCount = JOB_PRIORITY_VISIBLE_COLUMNS.length;
-  var defaultBackground = '#ffffff';
-  var defaultFontColor = '#000000';
-  var defaultFontWeight = 'normal';
-
-  // Clear all explicit formatting on the data region so conditional formatting rules take effect.
-  // Applying explicit white/black/normal values (even "defaults") overrides conditional formatting
-  // in Google Sheets, which is why rows appeared uniformly formatted after a dedup write.
-  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, rows.length, visibleColCount).clearFormat();
-
-  // Re-apply only genuinely custom (non-default) row formatting
-  rows.forEach(function(job, i) {
-    var jobId = _stringifyField(job.jobId);
-    var fmt = jobId ? formattingByJobId[jobId] : null;
-    if (!fmt) return;
-
-    var hasCustomBg = fmt.backgrounds.some(function(bg) {
-      return bg && bg.toLowerCase() !== defaultBackground;
-    });
-    var hasCustomColor = fmt.fontColors.some(function(c) {
-      return c && c.toLowerCase() !== defaultFontColor;
-    });
-    var hasCustomWeight = fmt.fontWeights.some(function(w) {
-      return w && w.toLowerCase() !== defaultFontWeight;
-    });
-
-    if (!hasCustomBg && !hasCustomColor && !hasCustomWeight) return;
-
-    var rowNumber = JOB_PRIORITY_DATA_START_ROW + i;
-    var range = sheet.getRange(rowNumber, 1, 1, visibleColCount);
-    if (hasCustomBg) range.setBackgrounds([fmt.backgrounds]);
-    if (hasCustomColor) range.setFontColors([fmt.fontColors]);
-    if (hasCustomWeight) range.setFontWeights([fmt.fontWeights]);
-  });
+function _applyDataRowFormat(sheet, startRow, numRows) {
+  var range = sheet.getRange(startRow, 1, numRows, JOB_PRIORITY_VISIBLE_COLUMNS.length);
+  range
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle')
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
 }
 
 function deduplicateExistingJobRows() {
@@ -848,7 +779,6 @@ function _getRawDataSheet() {
 }
 
 function _setupJobPrioritySheet(sheet) {
-  var existingColumnWidths = _captureJobPriorityColumnWidths(sheet);
 
   _ensureSheetDimensions(sheet, JOB_PRIORITY_COLUMNS.length, JOB_PRIORITY_DATA_START_ROW);
   _remapJobPriorityDataIfNeeded(sheet);
@@ -900,8 +830,6 @@ function _setupJobPrioritySheet(sheet) {
   ).setNumberFormat('0');
 
   _applyStatusValidation(sheet);
-  _applyColumnWidths(sheet, existingColumnWidths);
-  _applyWrappedColumns(sheet);
   _applyStatusFormattingRules(sheet);
 }
 function _setupRawDataSheet(sheet) {
@@ -1092,8 +1020,12 @@ function _applyStatusValidation(sheet) {
 
 function _applyStatusFormattingRules(sheet) {
   var existingRules = sheet.getConditionalFormatRules() || [];
-  var formula = '=AND($' + _columnToLetter(JOB_PRIORITY_COLUMN_INDEX.status) + JOB_PRIORITY_DATA_START_ROW + '<>"",$' +
-    _columnToLetter(JOB_PRIORITY_COLUMN_INDEX.status) + JOB_PRIORITY_DATA_START_ROW + '<>"New")';
+  var statusCol = '$' + _columnToLetter(JOB_PRIORITY_COLUMN_INDEX.status);
+  var statusRow = JOB_PRIORITY_DATA_START_ROW;
+  // Only Applied and Skip rows are greyed — Opened/Tailoring/New stay white.
+  var formula = '=OR(' + statusCol + statusRow + '="Applied",' + statusCol + statusRow + '="Skip")';
+  // Old formula used in prior versions — filter it out alongside the new one.
+  var oldFormula = '=AND(' + statusCol + statusRow + '<>"",' + statusCol + statusRow + '<>"New")';
   var targetRange = sheet.getRange(
     JOB_PRIORITY_DATA_START_ROW,
     1,
@@ -1103,9 +1035,9 @@ function _applyStatusFormattingRules(sheet) {
   var filteredRules = existingRules.filter(function(rule) {
     try {
       var booleanCondition = rule.getBooleanCondition();
-      return !(booleanCondition && booleanCondition.getCriteriaType() === SpreadsheetApp.BooleanCriteria.CUSTOM_FORMULA &&
-        booleanCondition.getCriteriaValues() &&
-        booleanCondition.getCriteriaValues()[0] === formula);
+      if (!booleanCondition || booleanCondition.getCriteriaType() !== SpreadsheetApp.BooleanCriteria.CUSTOM_FORMULA) return true;
+      var ruleFormula = booleanCondition.getCriteriaValues() && booleanCondition.getCriteriaValues()[0];
+      return ruleFormula !== formula && ruleFormula !== oldFormula;
     } catch (error) {
       return true;
     }
@@ -1123,75 +1055,6 @@ function _applyStatusFormattingRules(sheet) {
   sheet.setConditionalFormatRules(filteredRules);
 }
 
-function _captureJobPriorityColumnWidths(sheet) {
-  var widthByHeader = {};
-  var maxColumns = sheet.getMaxColumns();
-
-  if (maxColumns < 1 || sheet.getMaxRows() < JOB_PRIORITY_HEADER_ROW) {
-    return widthByHeader;
-  }
-
-  var existingHeaders = sheet.getRange(JOB_PRIORITY_HEADER_ROW, 1, 1, maxColumns).getValues()[0] || [];
-
-  existingHeaders.forEach(function(header, index) {
-    var key = _stringifyField(header);
-    if (!key) {
-      return;
-    }
-    widthByHeader[key] = sheet.getColumnWidth(index + 1);
-  });
-
-  return widthByHeader;
-}
-
-function _applyColumnWidths(sheet, existingColumnWidths) {
-  var widthByColumnName = {
-    rank: 60,
-    priority: 70,
-    score: 70,
-    us_visa: 90,
-    company: 170,
-    title: 240,
-    title_level: 110,
-    jd_implied_level: 130,
-    status: 110,
-    location: 150,
-    posted: 110,
-    applicants: 95,
-    job_link: 90,
-    summary: 260,
-    why: 300,
-    us_visa_reason: 200
-  };
-
-  Object.keys(widthByColumnName).forEach(function(columnName) {
-    var columnIndex = JOB_PRIORITY_COLUMN_INDEX[columnName];
-    if (!columnIndex) return;
-    var width = existingColumnWidths && existingColumnWidths[columnName]
-      ? existingColumnWidths[columnName]
-      : widthByColumnName[columnName];
-    sheet.setColumnWidth(columnIndex, width);
-  });
-}
-
-function _applyWrappedColumns(sheet) {
-  [JOB_PRIORITY_COLUMN_INDEX.summary, JOB_PRIORITY_COLUMN_INDEX.why]
-    .forEach(function(columnIndex) {
-      sheet.getRange(
-        JOB_PRIORITY_DATA_START_ROW,
-        columnIndex,
-        Math.max(sheet.getMaxRows() - JOB_PRIORITY_DATA_START_ROW + 1, 1),
-        1
-      ).setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
-    });
-
-  sheet.getRange(
-    JOB_PRIORITY_DATA_START_ROW,
-    JOB_PRIORITY_COLUMN_INDEX.us_visa_reason,
-    Math.max(sheet.getMaxRows() - JOB_PRIORITY_DATA_START_ROW + 1, 1),
-    1
-  ).setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
-}
 
 function _toSheetRow(job) {
   var jobUrl = _buildLinkedInJobUrlFromJobId(job.jobId) || job.jobLink || job.sourceUrl || '';
@@ -1542,6 +1405,66 @@ function _toRawDataRow(rawData) {
 
 function _hasAnyRawPayload(record) {
   return !!_stringifyField(record && record.rawRef);
+}
+
+function pruneRawData(days) {
+  var sheet = _getRawDataSheet();
+  if (!sheet) {
+    return 0;
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return 0;
+  }
+
+  var maxCols = sheet.getMaxColumns();
+  var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
+  var rawRefColIndex = headers.indexOf('raw_ref');
+  if (rawRefColIndex === -1) rawRefColIndex = 1;
+
+  var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
+  var cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+
+  var rowsToDelete = [];
+
+  values.forEach(function(row, offset) {
+    var rawRef = row[rawRefColIndex];
+    if (!rawRef) return;
+
+    var parsed;
+    try {
+      parsed = JSON.parse(rawRef);
+    } catch (e) {
+      return;
+    }
+
+    // Use publishedAt as the anchor for resolving postedTime relative offsets.
+    // _derivePostedDate tries postedTime first (e.g. "54 minutes ago" → anchor - 54min),
+    // then falls back to publishedAt/postedAt/createdAt/listedAt directly.
+    var anchorStr = parsed.publishedAt || parsed.postedAt || parsed.createdAt || parsed.listedAt || '';
+    if (!anchorStr) return;
+
+    var anchorDate = new Date(anchorStr);
+    if (isNaN(anchorDate.getTime())) return;
+
+    var postedDate = _derivePostedDate(parsed, parsed.postedTime || '', anchorDate);
+    if (!postedDate || isNaN(postedDate.getTime())) {
+      postedDate = anchorDate;
+    }
+
+    if (postedDate < cutoff) {
+      rowsToDelete.push(offset + 2); // 1-based sheet row (data starts at row 2)
+    }
+  });
+
+  // Delete in reverse order so row numbers stay valid
+  for (var i = rowsToDelete.length - 1; i >= 0; i--) {
+    sheet.deleteRow(rowsToDelete[i]);
+  }
+
+  return rowsToDelete.length;
 }
 
 function _clearMainSheetRawPayloadColumns(sheet, rowCount) {

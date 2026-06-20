@@ -9,15 +9,11 @@ function loadRuntimeConfig() {
     aiProvider: 'gemini',
     geminiApiRoute: String(settings.GEMINI_API_ROUTE || 'developer').toLowerCase(),
     scoringModel: String(settings.SCORING_MODEL || 'gemini-2.5-flash'),
-    stage1Model: String(settings.STAGE1_MODEL || settings.SCORING_MODEL || 'gemini-2.5-flash'),
-    stage2Model: String(settings.STAGE2_MODEL || settings.SCORING_MODEL || 'gemini-2.5-flash'),
-    stage2Threshold: _normalizePriority(settings.STAGE2_THRESHOLD || 'P05') || 'P05',
-    stage2ThinkingBudget: Math.max(0, parseInt(settings.STAGE2_THINKING_BUDGET || '0', 10) || 0),
     scoringParallelRequests: _normalizePositiveInteger(settings.SCORING_PARALLEL_REQUESTS || 3, 1, 100),
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
-    promptVersion: 'v2',
+    promptVersion: 'v7',
     targetProfile: String(
       settings.TARGET_PROFILE ||
       _defaultTargetProfile()
@@ -144,59 +140,6 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     processed: (activeRunState.handledJobIds.length + rowsToWriteWithoutScoring.length) + ' / ' + activeRunState.totalJobsCount
   });
 
-  // === Resume pending Stage 2 jobs first before scoring new jobs ===
-  var pendingStage2JobIds = activeRunState.pendingStage2JobIds || [];
-  if (pendingStage2JobIds.length > 0) {
-    var pendingJobs = pendingStage2JobIds.map(function(id) {
-      var existing = existingIndex.byJobId[id];
-      if (!existing) return null;
-      var job = _buildCandidateJob(_normalizeJob(existing, '', config.runStartedAt), existing);
-      return job;
-    }).filter(Boolean);
-
-    if (pendingJobs.length > 0) {
-      _emitProgress(progressCallback, { status: 'Stage 2: Resuming', processed: '' });
-      var stage2Resume = _runStage2Only(pendingJobs, config, progressCallback);
-      rows = rows.concat(stage2Resume.rows);
-      executionScoredJobsCount += stage2Resume.scoredJobsCount;
-      executionFailedJobsCount += stage2Resume.failedJobsCount;
-      errors = errors.concat(stage2Resume.errors);
-      stage2Resume.rows.forEach(function(j) { handledThisExecution.push(j.jobId); });
-      (stage2Resume.failedJobIds || []).forEach(function(id) { handledThisExecution.push(id); });
-      activeRunState.pendingStage2JobIds = stage2Resume.pendingStage2JobIds;
-
-      if (stage2Resume.hitExecutionBudget) {
-        activeRunState.handledJobIds = _appendUniqueStrings(activeRunState.handledJobIds || [], handledThisExecution);
-        activeRunState.scoredJobsCount = Number(activeRunState.scoredJobsCount || 0) + executionScoredJobsCount;
-        activeRunState.failedJobsCount = Number(activeRunState.failedJobsCount || 0) + executionFailedJobsCount + importFailedJobsCount;
-        activeRunState.importFailedJobsCount = Number(activeRunState.importFailedJobsCount || 0) + importFailedJobsCount;
-        activeRunState.errors = _appendErrors(activeRunState.errors || [], errors);
-        activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
-        activeRunState.updatedAt = new Date().toISOString();
-        return {
-          rows: rows,
-          newJobsCount: activeRunState.newJobsCount,
-          aJobsCount: activeRunState.aJobsCount,
-          duplicateJobsCount: duplicateJobsCount,
-          scoredJobsCount: activeRunState.scoredJobsCount,
-          failedJobsCount: activeRunState.failedJobsCount,
-          importFailedJobsCount: activeRunState.importFailedJobsCount,
-          processedCount: activeRunState.processedCount,
-          rawScrapedCount: activeRunState.rawScrapedCount,
-          uniqueRolesCount: activeRunState.totalJobsCount,
-          totalScoreableCount: activeRunState.totalScoreableCount,
-          totalJobsCount: activeRunState.totalJobsCount,
-          errors: activeRunState.errors || [],
-          hasMore: true,
-          activeRunState: activeRunState,
-          newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
-        };
-      }
-    } else {
-      activeRunState.pendingStage2JobIds = [];
-    }
-  }
-
   if (scoreableJobsForThisExecution.length) {
     var scoringResult = _scoreJobsInBatches(scoreableJobsForThisExecution, config, progressCallback, activeRunState.totalJobsCount, activeRunState.handledJobIds.length + rowsToWriteWithoutScoring.length);
     rows = rows.concat(scoringResult.rows);
@@ -217,11 +160,6 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
       return !job.existingRowNumber && _isTopPriority(job.priority);
     }).map(function(job) { return job.jobId; });
 
-    // Accumulate any Stage 2 jobs that didn't get refined (budget hit during Stage 2)
-    activeRunState.pendingStage2JobIds = _appendUniqueStrings(
-      activeRunState.pendingStage2JobIds || [],
-      scoringResult.pendingStage2JobIds || []
-    );
   }
 
   activeRunState.handledJobIds = _appendUniqueStrings(activeRunState.handledJobIds || [], handledThisExecution);
@@ -235,7 +173,6 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
   activeRunState.processedCount = Math.min(activeRunState.totalJobsCount, activeRunState.handledJobIds.length);
   activeRunState.updatedAt = new Date().toISOString();
 
-  var hasPendingStage2 = (activeRunState.pendingStage2JobIds || []).length > 0;
   return {
     rows: rows,
     newJobsCount: activeRunState.newJobsCount,
@@ -250,7 +187,7 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     totalScoreableCount: activeRunState.totalScoreableCount,
     totalJobsCount: activeRunState.totalJobsCount,
     errors: activeRunState.errors || [],
-    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount || hasPendingStage2,
+    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount,
     activeRunState: activeRunState,
     newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
   };
@@ -260,7 +197,6 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
   var activeRunState = config.activeRunState || {};
   var targetJobIds = activeRunState.targetJobIds || [];
   var handledJobIdsMap = _buildLookup(activeRunState.handledJobIds || []);
-  var pendingStage2Map = _buildLookup(activeRunState.pendingStage2JobIds || []);
   var rows = [];
   var errors = [];
   var jobsToScore = [];
@@ -281,43 +217,8 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     toScoreCount: activeRunState.totalScoreableCount || 0
   });
 
-  // === Resume pending Stage 2 jobs first before starting new Stage 1 work ===
-  var pendingStage2JobIds = activeRunState.pendingStage2JobIds || [];
-  if (pendingStage2JobIds.length > 0) {
-    var pendingJobs = pendingStage2JobIds.map(function(id) {
-      var existing = existingIndex.byJobId[id];
-      if (!existing) return null;
-      var job = _refreshStoredJobForReevaluation(existing);
-      job.existingRowNumber = existing.rowNumber;
-      return job;
-    }).filter(Boolean);
-
-    if (pendingJobs.length > 0) {
-      _emitProgress(progressCallback, { status: 'Stage 2: Resuming', processed: '' });
-      var stage2Resume = _runStage2Only(pendingJobs, config, progressCallback);
-      rows = rows.concat(stage2Resume.rows);
-      executionScoredJobsCount += stage2Resume.scoredJobsCount;
-      executionFailedJobsCount += stage2Resume.failedJobsCount;
-      errors = errors.concat(stage2Resume.errors);
-      stage2Resume.rows.forEach(function(j) { handledThisExecution.push(j.jobId); });
-      (stage2Resume.failedJobIds || []).forEach(function(id) { handledThisExecution.push(id); });
-      activeRunState.pendingStage2JobIds = stage2Resume.pendingStage2JobIds;
-      pendingStage2Map = _buildLookup(stage2Resume.pendingStage2JobIds);
-
-      if (stage2Resume.hitExecutionBudget) {
-        // Budget exhausted on Stage 2 resume alone — save and yield, no Stage 1 this execution
-        _finalizeExecutionState(activeRunState, skippedThisExecution, handledThisExecution, errors, executionScoredJobsCount, executionFailedJobsCount, newTopPriorityJobIds, executionTopPriorityCount);
-        return _buildReevaluationResult(rows, activeRunState, true);
-      }
-    } else {
-      activeRunState.pendingStage2JobIds = [];
-      pendingStage2Map = {};
-    }
-  }
-
-  // === Stage 1: queue jobs that haven't been handled and aren't awaiting Stage 2 ===
   targetJobIds.forEach(function(jobId) {
-    if (handledJobIdsMap[jobId] || pendingStage2Map[jobId]) {
+    if (handledJobIdsMap[jobId]) {
       return;
     }
 
@@ -375,7 +276,6 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     executionScoredJobsCount += scoringResult.scoredJobsCount;
     executionFailedJobsCount += scoringResult.failedJobsCount;
     errors = errors.concat(scoringResult.errors);
-    // Pending Stage 2 jobs are NOT added to handledThisExecution — they stay in the queue
     handledThisExecution = handledThisExecution
       .concat(scoringResult.rows.map(function(job) { return job.jobId; }))
       .concat(scoringResult.failedJobIds || []);
@@ -385,17 +285,10 @@ function reevaluateExistingJobs(config, existingIndex, progressCallback) {
     newTopPriorityJobIds = scoringResult.rows.filter(function(job) {
       return _isTopPriority(job.priority);
     }).map(function(job) { return job.jobId; });
-
-    // Accumulate any Stage 2 jobs that didn't get refined (budget hit during Stage 2)
-    activeRunState.pendingStage2JobIds = _appendUniqueStrings(
-      activeRunState.pendingStage2JobIds || [],
-      scoringResult.pendingStage2JobIds || []
-    );
   }
 
   _finalizeExecutionState(activeRunState, skippedThisExecution, handledThisExecution, errors, executionScoredJobsCount, executionFailedJobsCount, newTopPriorityJobIds, executionTopPriorityCount);
-  var hasPendingStage2 = (activeRunState.pendingStage2JobIds || []).length > 0;
-  return _buildReevaluationResult(rows, activeRunState, hasPendingStage2);
+  return _buildReevaluationResult(rows, activeRunState);
 }
 
 function _finalizeExecutionState(activeRunState, skippedThisExecution, handledThisExecution, errors, executionScoredJobsCount, executionFailedJobsCount, newTopPriorityJobIds, executionTopPriorityCount) {
@@ -412,7 +305,7 @@ function _finalizeExecutionState(activeRunState, skippedThisExecution, handledTh
   activeRunState.updatedAt = new Date().toISOString();
 }
 
-function _buildReevaluationResult(rows, activeRunState, hasPendingStage2) {
+function _buildReevaluationResult(rows, activeRunState) {
   return {
     rows: rows,
     newJobsCount: '',
@@ -427,16 +320,10 @@ function _buildReevaluationResult(rows, activeRunState, hasPendingStage2) {
     totalScoreableCount: activeRunState.totalScoreableCount,
     totalJobsCount: activeRunState.totalJobsCount,
     errors: activeRunState.errors || [],
-    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount || hasPendingStage2,
+    hasMore: activeRunState.processedCount < activeRunState.totalJobsCount,
     activeRunState: activeRunState,
     newTopPriorityJobIds: activeRunState.newTopPriorityJobIds || []
   };
-}
-
-function _priorityIsAtOrAbove(priority, threshold) {
-  var p = parseInt((priority || 'P10').slice(1), 10);
-  var t = parseInt((threshold || 'P05').slice(1), 10);
-  return p <= t;
 }
 
 function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCount, initialProcessedCount, statusLabel) {
@@ -450,7 +337,7 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
   var resolvedStatusLabel = statusLabel || 'Scoring jobs';
   var hitExecutionBudget = false;
 
-  // Initialize Gemini context cache once per stage (keyed by _activeModel via fingerprint)
+  // Initialize Gemini context cache once per run (keyed by model + prompt fingerprint)
   if (!config._scoringCacheAttempted) {
     config._scoringCacheAttempted = true;
     config._scoringCacheName = _getOrCreateScoringCache(config) || '';
@@ -503,10 +390,13 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
 
     // Adaptive rate-limit pacing: if SCORING_RPM_LIMIT is set, sleep only the time
     // remaining in the rate window — batch execution time already counts toward it.
+    // With no RPM limit, enforce a 1 s minimum to avoid quota exhaustion.
     var hasMoreBatches = (start + batch.length) < jobs.length;
-    if (hasMoreBatches && config.scoringRpmLimit > 0) {
-      var windowMs = Math.floor(60000 * batch.length / config.scoringRpmLimit);
+    if (hasMoreBatches) {
       var elapsed = Date.now() - batchStartedAt;
+      var windowMs = config.scoringRpmLimit > 0
+        ? Math.floor(60000 * batch.length / config.scoringRpmLimit)
+        : 1000;
       var sleepMs = windowMs - elapsed;
       if (sleepMs > 0) {
         Utilities.sleep(sleepMs);
@@ -531,126 +421,9 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
 }
 
 function _scoreJobsInBatches(jobs, config, progressCallback, totalJobsCount, initialProcessedCount, statusLabel) {
-  // Stage 1 — coarse sort using stage1Model across all jobs
-  config._activeModel = config.stage1Model;
-  config._isStage2 = false;
   config._scoringCacheAttempted = false;
   config._scoringCacheName = '';
-
-  var stage1Label = (jobs.length > 0 && config.stage1Model !== config.stage2Model)
-    ? 'Stage 1: ' + (statusLabel || 'Scoring jobs')
-    : (statusLabel || 'Scoring jobs');
-
-  var stage1 = _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCount, initialProcessedCount || 0, stage1Label);
-
-  if (stage1.hitExecutionBudget) {
-    // Stage 1 incomplete — no Stage 2 possible yet; no pending Stage 2 either
-    return {
-      rows: stage1.rows,
-      pendingStage2JobIds: [],
-      scoredJobsCount: stage1.scoredJobsCount,
-      failedJobsCount: stage1.failedJobsCount,
-      processedCount: stage1.processedCount,
-      errors: stage1.errors,
-      failedJobIds: stage1.failedJobIds,
-      hitExecutionBudget: true
-    };
-  }
-
-  // Partition Stage 1 results: jobs at or above threshold go to Stage 2
-  var toRefine = stage1.rows.filter(function(j) {
-    return _priorityIsAtOrAbove(j.priority, config.stage2Threshold);
-  });
-  var done = stage1.rows.filter(function(j) {
-    return !_priorityIsAtOrAbove(j.priority, config.stage2Threshold);
-  });
-
-  if (toRefine.length === 0) {
-    return {
-      rows: stage1.rows,
-      pendingStage2JobIds: [],
-      scoredJobsCount: stage1.scoredJobsCount,
-      failedJobsCount: stage1.failedJobsCount,
-      processedCount: stage1.processedCount,
-      errors: stage1.errors,
-      failedJobIds: stage1.failedJobIds,
-      hitExecutionBudget: false
-    };
-  }
-
-  // Stage 2 — re-score promising subset with stage2Model (+ optional thinking)
-  config._activeModel = config.stage2Model;
-  config._isStage2 = true;
-  // Different model needs its own cache; same model reuses Stage 1 cache automatically via fingerprint match
-  if (config.stage2Model !== config.stage1Model) {
-    config._scoringCacheAttempted = false;
-    config._scoringCacheName = '';
-  }
-
-  var stage2Label = 'Stage 2: ' + (statusLabel || 'Scoring jobs');
-
-  // Stage 2 gets its own counter (1 / N where N = subset size) so display never shows > 100%
-  var stage2 = _runSingleStageScoringLoop(toRefine, config, progressCallback, toRefine.length, 0, stage2Label);
-
-  if (stage2.hitExecutionBudget) {
-    // Stage 2 interrupted — track which qualifying jobs didn't get refined yet
-    var refinedMap = {};
-    stage2.rows.forEach(function(j) { refinedMap[j.jobId] = true; });
-    var pendingStage2JobIds = toRefine
-      .filter(function(j) { return !refinedMap[j.jobId]; })
-      .map(function(j) { return j.jobId; });
-
-    return {
-      rows: stage2.rows.concat(done),
-      pendingStage2JobIds: pendingStage2JobIds,
-      scoredJobsCount: stage1.scoredJobsCount + stage2.scoredJobsCount,
-      failedJobsCount: stage1.failedJobsCount + stage2.failedJobsCount,
-      processedCount: stage1.processedCount,
-      errors: stage1.errors.concat(stage2.errors),
-      failedJobIds: stage1.failedJobIds.concat(stage2.failedJobIds),
-      hitExecutionBudget: true
-    };
-  }
-
-  // Merge: Stage 2 refined results + Stage 1 P(threshold+1)–P10 results that were not re-scored.
-  // processedCount = Stage 1 total — Stage 2 jobs are refinements, not additional jobs.
-  return {
-    rows: stage2.rows.concat(done),
-    pendingStage2JobIds: [],
-    scoredJobsCount: stage1.scoredJobsCount + stage2.scoredJobsCount,
-    failedJobsCount: stage1.failedJobsCount + stage2.failedJobsCount,
-    processedCount: stage1.processedCount,
-    errors: stage1.errors.concat(stage2.errors),
-    failedJobIds: stage1.failedJobIds.concat(stage2.failedJobIds),
-    hitExecutionBudget: false
-  };
-}
-
-// Runs Stage 2 only on a pre-loaded set of jobs (resume path after a timeout mid-Stage 2).
-// Returns refined rows + any job IDs that still didn't complete if budget hit again.
-function _runStage2Only(jobs, config, progressCallback) {
-  config._activeModel = config.stage2Model;
-  config._isStage2 = true;
-  config._scoringCacheAttempted = false;
-  config._scoringCacheName = '';
-
-  var stage2 = _runSingleStageScoringLoop(jobs, config, progressCallback, jobs.length, 0, 'Stage 2: Scoring jobs');
-
-  var refinedMap = {};
-  stage2.rows.forEach(function(j) { refinedMap[j.jobId] = true; });
-  var pendingStage2JobIds = jobs
-    .filter(function(j) { return !refinedMap[j.jobId]; })
-    .map(function(j) { return j.jobId; });
-
-  return {
-    rows: stage2.rows,
-    pendingStage2JobIds: pendingStage2JobIds,
-    scoredJobsCount: stage2.scoredJobsCount,
-    failedJobsCount: stage2.failedJobsCount,
-    errors: stage2.errors,
-    failedJobIds: stage2.failedJobIds,
-    hitExecutionBudget: stage2.hitExecutionBudget
-  };
+  return _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCount, initialProcessedCount || 0, statusLabel || 'Scoring jobs');
 }
 
 function _scoreSingleJobWithRetry(job, config, initialResponse) {
@@ -658,12 +431,32 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
     return _parseScoreResponseByProvider(initialResponse, config.aiProvider);
   } catch (firstError) {
     Logger.log(firstError);
-    // Retry without cache in case the cached content expired or is invalid
-    var retryConfig = config._scoringCacheName
-      ? _cloneConfigWithoutCache(config)
-      : config;
-    var retryResponse = _executeSingleScoreRequest(_buildScoreRequest(job, retryConfig));
 
+    var isRateLimit = firstError.message && firstError.message.indexOf('429') !== -1;
+    var noCache = config._scoringCacheName
+      ? Object.assign({}, config, { _scoringCacheName: '' })
+      : config;
+
+    if (isRateLimit) {
+      // Exponential backoff for 429 RESOURCE_EXHAUSTED: wait before each retry
+      var backoffDelays = [10000, 30000, 90000];
+      var lastErr = firstError;
+      for (var i = 0; i < backoffDelays.length; i++) {
+        Utilities.sleep(backoffDelays[i]);
+        try {
+          var rateLimitResp = _executeSingleScoreRequest(_buildScoreRequest(job, noCache));
+          return _parseScoreResponseByProvider(rateLimitResp, config.aiProvider);
+        } catch (retryErr) {
+          lastErr = retryErr;
+          Logger.log('Rate-limit retry ' + (i + 1) + ' failed: ' + _truncate(retryErr.message, 120));
+          if (retryErr.message.indexOf('429') === -1) break;
+        }
+      }
+      throw new Error('Rate-limit retries exhausted. Last error: ' + _truncate(lastErr.message, 200));
+    }
+
+    // Non-429: retry once without cache (original behavior)
+    var retryResponse = _executeSingleScoreRequest(_buildScoreRequest(job, noCache));
     try {
       return _parseScoreResponseByProvider(retryResponse, config.aiProvider);
     } catch (retryError) {
@@ -673,13 +466,6 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
       );
     }
   }
-}
-
-function _cloneConfigWithoutCache(config) {
-  var clone = {};
-  Object.keys(config).forEach(function(key) { clone[key] = config[key]; });
-  clone._scoringCacheName = '';
-  return clone;
 }
 
 function _executeScoreRequests(requests) {
@@ -1165,14 +951,10 @@ function _buildScoreRequest(job, config) {
 }
 
 function _buildGeminiScoreRequest(job, config) {
-  var activeModel = config._activeModel || config.scoringModel;
   var generationConfig = {
     temperature: 0.2,
     responseMimeType: 'application/json'
   };
-  if (config._isStage2 && config.stage2ThinkingBudget > 0) {
-    generationConfig.thinkingConfig = { thinkingBudget: config.stage2ThinkingBudget };
-  }
   var payload;
 
   if (config._scoringCacheName) {
@@ -1199,7 +981,7 @@ function _buildGeminiScoreRequest(job, config) {
       url: 'https://aiplatform.googleapis.com/v1/projects/' +
         encodeURIComponent(config.vertexProjectId) +
         '/locations/' + encodeURIComponent(config.vertexLocation) +
-        '/publishers/google/models/' + encodeURIComponent(activeModel) +
+        '/publishers/google/models/' + encodeURIComponent(config.scoringModel) +
         ':generateContent',
       method: 'post',
       contentType: 'application/json',
@@ -1211,7 +993,7 @@ function _buildGeminiScoreRequest(job, config) {
 
   generationConfig.responseJsonSchema = _getScoreResponseSchema();
   return {
-    url: 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(activeModel) + ':generateContent',
+    url: 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(config.scoringModel) + ':generateContent',
     method: 'post',
     contentType: 'application/json',
     headers: { 'x-goog-api-key': config.geminiApiKey },
@@ -1295,8 +1077,7 @@ function _buildScoringPrompt(job, config) {
 }
 
 function _getScoringCacheFingerprint(config) {
-  var model = config._activeModel || config.scoringModel;
-  return _sha1(model + '|' + config.promptVersion + '|' + _buildStaticScoringContent(config));
+  return _sha1(config.scoringModel + '|' + config.promptVersion + '|' + _buildStaticScoringContent(config));
 }
 
 function _loadScoringCacheState() {
@@ -1339,14 +1120,13 @@ function _getOrCreateScoringCache(config) {
 }
 
 function _createGeminiCachedContent(config) {
-  var activeModel = config._activeModel || config.scoringModel;
   var staticContent = _buildStaticScoringContent(config);
   var payload;
   var request;
 
   if (config.geminiApiRoute === 'vertex') {
     payload = {
-      model: 'projects/' + config.vertexProjectId + '/locations/' + config.vertexLocation + '/publishers/google/models/' + activeModel,
+      model: 'projects/' + config.vertexProjectId + '/locations/' + config.vertexLocation + '/publishers/google/models/' + config.scoringModel,
       contents: [{ role: 'user', parts: [{ text: staticContent }] }],
       ttl: SCORING_CACHE_TTL_SECONDS + 's'
     };
@@ -1361,7 +1141,7 @@ function _createGeminiCachedContent(config) {
     };
   } else {
     payload = {
-      model: 'models/' + activeModel,
+      model: 'models/' + config.scoringModel,
       contents: [{ role: 'user', parts: [{ text: staticContent }] }],
       ttl: SCORING_CACHE_TTL_SECONDS + 's'
     };
@@ -1568,161 +1348,6 @@ function _resolveDefaultableSetting(value, defaultFn) {
   }
 
   return text;
-}
-
-function _defaultScoringInstructions() {
-  return [
-    'You are the hiring manager who owns this exact role and team. Judge whether you would hire this candidate for this role. Do NOT evaluate like an ATS, recruiter, or HR keyword screen — look past missing keywords, exact-year thresholds, or exact title labels when the candidate\'s substance and transferable depth clearly cover the role.',
-    '',
-    'Objective:',
-    'Score the realistic probability that this candidate gets hired for this exact role, judged as the hiring manager who owns it — based on whether the candidate can do the job, has defensible and relevant proof, and stands out against typical applicants.',
-    '',
-    'Substance over keywords: reward demonstrated impact, judgment, and transferable depth. Do not reward keyword-matching by itself, and do not penalize missing jargon/buzzwords when the underlying substance is present.',
-    '',
-    'The target profile above is the candidate\'s resume. Infer employers, roles, approximate start/end dates, and tenure directly from it. When dates are missing, estimate tenure and recency from context (ordering, "present", durations).',
-    '',
-    'Use only the real job title, company, metadata, and raw JD. Ignore prior AI summaries or prior scores.',
-    '',
-    'Return strict JSON only with exactly these keys:',
-    'score, priority, us_visa_sponsorship_potential, us_visa_reason, summary, why.',
-    '',
-    'Rules:',
-    '- score: integer 0-100',
-    '- priority: P01, P02, P03, P04, P05, P06, P07, P08, P09, or P10',
-    '- us_visa_sponsorship_potential: Likely (90%), Possible (70%), Unclear (50%), Unlikely (20%), or No (0%) — copy the label verbatim, including the percentage',
-    '- us_visa_reason: one short sentence explaining the evidence for the visa label',
-    '- summary and why: one short sentence each',
-    '- No markdown, no extra keys, no extra commentary.',
-    '',
-    'Evaluate mainly on:',
-    '1. proof/evidence match',
-    '2. domain advantage',
-    '3. seniority fit',
-    '4. product ownership/scope',
-    '5. practical pursuit value',
-    '',
-    'Choose priority bucket first, then score inside that bucket.',
-    '',
-    'Strong proof means the JD maps directly to 2+ candidate proof points: identity/fraud/KYC verification, biometric/liveness authentication, payment authentication, API verification scaling, bank/fintech client product work, risk decisioning, conversion/fraud tradeoffs, integration friction reduction, product expansion/revenue growth, platform standardization, or Lumi-style AI workflow product.',
-    '',
-    'Direct domain means fintech infrastructure, banking tech, payments, fraud/risk, identity verification, authentication, biometric/liveness, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification, or regulated financial workflows.',
-    '',
-    'Adjacent domain means AI workflow, agentic AI, API/developer platform, technical platform PM, B2B SaaS, data product, security/governance, enterprise workflow, or regulated non-financial workflow.',
-    '',
-    'Weak domain means generic AI, generic SaaS, internal tools, cloud support, procurement/supply-chain, healthcare clinical systems, logistics, staffing/marketplaces, consumer growth, media, ads, gaming, investment product, operations, strategy, product marketing, pure engineering, sales, or support.',
-    '',
-    'Proof credibility and tenure:',
-    '- Weight each candidate proof point by tenure depth at the employer where it was earned.',
-    '- Anchor proof = earned over ~18+ months and deep. Full weight.',
-    '- Supporting proof = ~12-18 months, or somewhat dated. Partial weight.',
-    '- Thin proof = under ~12 months, or a coaching/side/short engagement. Secondary signal only.',
-    '- P01-P03 require at least one anchor proof point that maps directly to the JD. Thin proof alone maxes at P05.',
-    '',
-    'Recency:',
-    '- Experience within roughly the last 5-6 years carries the most weight. Progressively discount experience older than ~6 years.',
-    '- The candidate\'s most-recent role gets a recency uplift even if its tenure is thin — it signals current direction and fresh skills, so prioritize it above older thin proof and never dismiss it.',
-    '- This uplift does not override the tenure rule: a thin recent role still cannot by itself anchor P01-P03. Depth wins for anchoring (a ~4-year role outranks a ~6-month recent stint); recency wins for tie-breaking and positioning.',
-    '',
-    'Hard disqualifiers (hiring-manager judgment, not checkbox):',
-    '- Cap only on a genuine capability gap a hiring manager would actually reject on: the candidate cannot do the core of the job, or lacks a fundamentally required, non-transferable skill/specialty the role is built around (or a required license/certification). Cap at P06 regardless of other fit.',
-    '- Do NOT cap on mechanical gates: a missing exact-years threshold, an absent buzzword, or a non-matching title — if transferable depth clearly covers the work, the hiring manager would still proceed.',
-    '- Work-authorization/visa is never a disqualifier here; it stays informational in the visa fields only.',
-    '',
-    'Domain transferability:',
-    '- Transfers well from the candidate\'s fintech wedge (treat as near-direct): regtech, insurtech, security/identity, anti-fraud, risk/compliance, payments-adjacent, API/verification platforms, govtech identity.',
-    '- Transfers poorly (treat as weak even if PM craft overlaps): gaming, clinical/healthcare delivery, ad-tech, consumer social, marketplace ops, logistics.',
-    '',
-    'Convergence and breadth:',
-    '- When a JD maps to several distinct, credible proof points, or to proof spanning more than one relevant role, treat it as stronger than a single-point hit: push toward the top of the allowed bucket, and allow a one-bucket uplift when the convergence is clear.',
-    '- Weight convergence by credibility: anchor/supporting proofs count fully; stacking multiple thin proofs does NOT substitute for a missing anchor and cannot lift into P01-P03.',
-    '- Convergence concentrated in the recent ~5-6 year window counts more than the same breadth scattered across older experience.',
-    '',
-    'Seniority fit (two-sided):',
-    '- Penalize the gap between the candidate\'s proven level and the role\'s implied level in both directions.',
-    '- Over-qualified (candidate clearly senior to the role) reduces hire odds (flight-risk / comp-mismatch); not a top bucket.',
-    '- Under-qualified (role clearly above demonstrated scope) reduces hire odds.',
-    '- Best odds when the role\'s implied level matches the candidate\'s proven level (PM / Senior PM).',
-    '',
-    'Differentiation and scarcity:',
-    '- Reward rare, hard-to-replicate proof few applicants would have — it raises hire odds.',
-    '- Penalize generic matches many applicants meet equally — lower hire odds even when keywords align. Qualified is not the same as standout.',
-    '',
-    'Priority buckets:',
-    '- P01: rare bullseye; direct domain + strong proof + PM/Senior PM fit + clear ownership + reliable JD. Score 95-100.',
-    '- P02: very strong fit; direct domain + strong proof with one minor gap. Score 90-94.',
-    '- P03: strong fit with one meaningful gap; direct domain with moderate proof or adjacent domain with unusually strong proof. Score 85-89.',
-    '- P04: good adjacent PM fit, not top wedge. Score 80-84.',
-    '- P05: adjacent but credible, weaker domain or proof. Score 75-79.',
-    '- P06: possible backup. Score 70-74.',
-    '- P07: low hire odds, generic PM or weak domain. Score 60-69.',
-    '- P08: poor fit or wrong product area. Score 50-59.',
-    '- P09: clear mismatch. Score 35-49.',
-    '- P10: hard skip: entry-level, internship, new-grad, pure engineering, pure sales/support/admin, or obvious non-target. Score 0-34.',
-    '',
-    'Caps:',
-    '- P01/P02 require both direct domain and strong proof.',
-    '- If proof is weak, max P07.',
-    '- If proof is moderate, max P04 unless domain is direct.',
-    '- If domain is only adjacent, max P03 and usually P04-P06.',
-    '- Generic AI/platform/SaaS/data/cloud-support roles max P04 unless strongly mapped to fintech/payments/fraud/identity/authentication/API verification or Lumi-style AI workflow.',
-    '- Famous company alone max P05.',
-    '- Financial-institution customer segment does not make the product fintech.',
-    '- Staff/Principal/Group/Director/VP+ max P04 unless direct-domain, IC/product-scope heavy, and unusually strong.',
-    '- Banking-industry VP exception: at banks and large financial institutions (e.g. JPMorganChase, Goldman Sachs, Capital One, Citi, Wells Fargo, Bank of America, Morgan Stanley), "Vice President" is a mid-level seniority band, NOT a tech-industry executive VP. A title like "Vice President, Product Manager" or "Product Manager - Vice President" is an individual-contributor PM/Senior-PM role, so do NOT apply the VP+ cap to it — score it as a normal PM/Senior-PM role on domain and proof. The VP+ cap still applies to true executive titles (Managing Director, Head of Product, Division/Group head). When unsure, read the JD body: IC/product-execution scope with no large team of PM reports means treat as PM/Senior-PM regardless of the VP band in the title.',
-    '- Recruiter/hiring-network/generic/duplicated/unclear-employer JD max P05 unless direct-domain proof is clear.',
-    '- Pure strategy, product marketing, sales, support, account management, admin, or operations max P07 unless clear product ownership exists.',
-    '',
-    'Batch calibration:',
-    'For ~1,000 scraped PM jobs, P01 should be rare, P02 selective, P03 strong but not bullseye, most decent jobs should fall into P04-P06, and weak/non-target jobs should fall into P07-P10.',
-    '',
-    'Visa (US H-1B / employment sponsorship):',
-    '- Visa output is informational only. Do not use visa to increase or decrease score or priority.',
-    '- Each label includes a probability anchor in parentheses; the percentage is an informational reading aid (it is NOT used in scoring or priority). Copy the label string verbatim, including the percentage.',
-    '- Pick the single label that matches the strongest evidence in the JD. The labels are ordered; do not let Possible and Unclear overlap — Possible requires a positive (even if soft) sponsorship signal, Unclear means the JD is simply silent.',
-    '- Likely (90%) = the JD explicitly states sponsorship is available/offered, OR mentions visa/H-1B/green-card/relocation support, OR the employer has a well-known strong sponsorship track record.',
-    '- Possible (70%) = no explicit statement, but a concrete positive signal exists: large/global employer, prior H-1B sponsorship history for similar roles, "open to all candidates", or international-friendly language.',
-    '- Unclear (50%) = the JD gives no sponsorship signal either way (silent). This is the default when there is no explicit statement.',
-    '- Unlikely (20%) = no sponsorship signal AND context points against it: small/early-stage company, government/defense, contractor/staffing, or a role type that rarely sponsors.',
-    '- No (0%) = the JD explicitly says no sponsorship, "must be authorized to work without sponsorship now or in the future", or requires citizenship / security clearance.',
-    '- Do not treat "US applicants only", US location eligibility, or US pay-transparency language by itself as No.',
-    '- us_visa_reason must cite the concrete signal that drove the label (quote or paraphrase the JD phrase, or name the employer/context signal). When the label is Unclear because the JD is silent, still give a best-guess estimate in the reason — e.g. "JD silent; large global fintech, sponsorship plausible" or "JD silent; small early-stage startup, sponsorship doubtful".',
-    '',
-    'Level classification:',
-    'title_level: Read the job title string only — ignore the JD body. Map to one of: APM, PM, Senior-PM, Staff-PM, Principal-PM, Manager, Senior-Manager, Group-PM, Director, Senior-Director, VP, Head-of-Product, Founding-PM, Unknown.',
-    '- Banking VP titles: when the employer is a bank/large financial institution AND the title pairs "Vice President" with "Product Manager" (e.g. "Vice President, Product Manager" or "Product Manager - Vice President"), map title_level to PM or Senior-PM (per any Senior/Sr qualifier), NOT VP — at banks VP is a seniority band equivalent to a tech Senior-PM, not an executive rank.',
-    'jd_implied_level: Read the JD body only — ignore the job title. Infer the actual scope and seniority from content signals:',
-    '- "first PM", "build from scratch", "wear many hats", seed/Series A stage → Founding-PM',
-    '- Manages 5+ PMs, owns org-wide roadmap, sets product strategy across groups → Group-PM or Director',
-    '- Explicit "manage a team of PMs" or "manage PMs" → Manager or Senior-Manager',
-    '- Cross-functional leadership, no direct reports, sets technical/product direction → Staff-PM or Principal-PM',
-    '- Mentors ICs, leads initiatives, owns a significant product surface → Senior-PM',
-    '- Clear IC scope, defined product area, execution-focused → PM',
-    '- Entry-level signals, "associate", rotational, new-grad → APM',
-    '- Cannot determine from JD content → Unknown',
-    '',
-    'Return only valid JSON.'
-  ].join('\n');
-}
-
-function _defaultTargetProfile() {
-  return [
-    'Candidate target profile:',
-    '',
-    'Experienced product manager / product leader with 10+ years of experience, most recently Senior Product Manager / Associate Product Director level, with Yale SOM and NUS MBA training.',
-    '',
-    'Primary interview wedge:',
-    'fintech infrastructure, banking technology, payments, fraud/risk, identity verification, authentication, biometric/liveness verification, eKYC/KYC, onboarding, risk decisioning, payment authentication, API-based verification platforms, and regulated financial workflows for banks/fintechs.',
-    '',
-    'Strong proof points:',
-    'scaled API-based identity/risk verification from ~500K to ~2M daily verifications across cloud and on-prem; launched biometric payment authentication across 9 tier-1 banks; owned fraud/risk, KYC, liveness, authentication, and API verification products; improved verification/authentication conversion; reduced integration friction; defined ML product/model requirements; supported ~40% YoY ARR/API growth; standardized platform deployments across markets.',
-    '',
-    'Secondary/adjacent fit:',
-    'AI workflow, agentic AI, API/developer platforms, technical platform PM, B2B SaaS, data products, security/governance, and enterprise workflow. Lumi supports AI workflow and product-building evidence, but should not be treated as equivalent to large-scale enterprise AI platform PM experience.',
-    '',
-    'Direct fit requires the role itself to own payments, fraud/risk, identity, authentication, KYC, onboarding, risk decisioning, API verification, or financial infrastructure. Do not treat a financial-services customer segment or famous employer as direct domain fit.',
-    '',
-    'Prioritize PM and Senior PM roles. Treat Staff, Principal, Director, VP+, entry-level, pure engineering, pure strategy, product marketing, sales, account management, support, operations, healthcare clinical systems, procurement, supply chain, ads, gaming, marketplace operations, and investment-product roles as lower priority unless the JD has unusually strong product ownership and proof mapping.'
-  ].join(' ');
 }
 
 function _toFetchOptions(request) {
