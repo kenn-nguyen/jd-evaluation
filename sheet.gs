@@ -5,13 +5,12 @@ var DEDUP_ARCHIVE_SHEET_NAME = 'Dedup_Archive';
 var RAW_DATA_SHEET_NAME = 'Raw_Data';
 var JOB_PRIORITY_HEADER_ROW = 6;
 var JOB_PRIORITY_DATA_START_ROW = 7;
-var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Opened', 'Tailoring', 'Applied', 'Skip'];
+var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Assigned', 'Applied', 'Skip'];
 var JOB_PRIORITY_STATUS_SORT_ORDER = {
   New: 0,
-  Opened: 1,
-  Tailoring: 2,
-  Applied: 3,
-  Skip: 4
+  Assigned: 1,
+  Applied: 2,
+  Skip: 3
 };
 var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'rank',
@@ -36,7 +35,8 @@ var JOB_PRIORITY_HIDDEN_COLUMNS = [
   'imported_at',
   'scored_at',
   'scoring_fingerprint',
-  'merged_job_ids'
+  'merged_job_ids',
+  'jd_fingerprint'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
 var RAW_DATA_COLUMNS = ['job_id', 'raw_ref'];
@@ -47,6 +47,23 @@ var JOB_PRIORITY_COLUMN_INDEX = (function() {
   }
   return map;
 })();
+var ASSIGNED_SHEET_NAME = 'Assigned';
+var ASSIGNED_STATUS_OPTIONS = ['Pending', 'Applied', 'Failed'];
+var ASSIGNED_COLUMNS = [
+  'status', 'rank', 'priority', 'score', 'us_visa',
+  'company', 'title', 'location', 'job_link',
+  'summary', 'why', 'us_visa_reason', 'posted',
+  'notes', 'updated_at', 'applied_at',
+  'job_id'
+];
+var ASSIGNED_COLUMN_INDEX = (function() {
+  var map = {};
+  for (var i = 0; i < ASSIGNED_COLUMNS.length; i += 1) {
+    map[ASSIGNED_COLUMNS[i]] = i + 1;
+  }
+  return map;
+})();
+var ASSIGNED_DATA_START_ROW = 2;
 var SETTINGS_DEFAULT_ROWS = [
   ['setting_key', 'setting_value', 'notes'],
   ['APIFY_TOKEN', '', 'Apify API token. You can paste it here directly, or still use Script Properties as a fallback.'],
@@ -65,6 +82,9 @@ var SETTINGS_DEFAULT_ROWS = [
   ['RUN_INTERVAL_HOURS', '4', 'How often the pipeline runs (hours). Supported values: 1, 2, 4, 6, 8, 12.'],
   ['QUIET_START_HOUR', '19', 'Hour to stop running, 0-23 Pacific Time. Default 19 = 7pm PT.'],
   ['QUIET_END_HOUR', '5', 'Hour to resume running, 0-23 Pacific Time. Default 5 = 5am PT. Set both to 0 to disable quiet hours.'],
+  ['AUTO_ASSIGN_PRIORITIES', 'P01,P02,P03', 'Comma-separated priorities to auto-assign to the Assigned sheet after each run. E.g. P01,P02,P03'],
+  ['AUTO_ASSIGN_VISA', 'Likely (90%),Possible (70%)', 'Comma-separated visa signals to auto-assign. Valid values: Likely (90%), Possible (70%), Unclear (50%), Unlikely (20%), No (0%)'],
+  ['AUTO_ASSIGN_EXCLUDE_COMPANIES', '', 'Comma-separated company names to skip during auto-assign (case-insensitive). E.g. Google,Meta'],
 ];
 var HELP_ROWS = [
   ['Job Priority Help', ''],
@@ -102,11 +122,14 @@ function setupJobPriorityWorkbook() {
   var settingsSheet = _getOrCreateSheet(spreadsheet, SETTINGS_SHEET_NAME);
   var helpSheet = _getOrCreateSheet(spreadsheet, HELP_SHEET_NAME);
   var rawDataSheet = _getOrCreateSheet(spreadsheet, RAW_DATA_SHEET_NAME);
+  var assignedSheet = _getOrCreateSheet(spreadsheet, ASSIGNED_SHEET_NAME);
 
   _setupJobPrioritySheet(jobSheet);
   _setupSettingsSheet(settingsSheet);
   _setupHelpSheet(helpSheet);
   _setupRawDataSheet(rawDataSheet);
+  _setupAssignedSheet(assignedSheet);
+  _protectSheetsForAssignee(spreadsheet);
 }
 
 function ensureWorkbookReadyForRuntime() {
@@ -229,20 +252,21 @@ function writeJobs(rows) {
 
   var sheet = _getJobPrioritySheet();
   _upsertRawDataRows(rows);
-  var updates = [];
-  var appends = [];
-  var appendedJobs = [];
 
   rows.forEach(function(job) {
-    var rowValues = _toSheetRow(job);
+    if (!job.jdFingerprint && job.jobDescription) {
+      job.jdFingerprint = _jdContentHash(job.jobDescription);
+    }
+  });
+
+  var updates = [];
+  var newJobs = [];
+
+  rows.forEach(function(job) {
     if (job.existingRowNumber) {
-      updates.push({
-        rowNumber: job.existingRowNumber,
-        values: rowValues
-      });
+      updates.push({ rowNumber: job.existingRowNumber, values: _toSheetRow(job), job: job });
     } else {
-      appends.push(rowValues);
-      appendedJobs.push(job);
+      newJobs.push(job);
     }
   });
 
@@ -250,19 +274,136 @@ function writeJobs(rows) {
     sheet.getRange(update.rowNumber, 1, 1, JOB_PRIORITY_COLUMNS.length).setValues([update.values]);
     _applyJobIdColumnFormat(sheet, update.rowNumber, 1);
     _applyDataRowFormat(sheet, update.rowNumber, 1);
+    sheet.getRange(update.rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_link)
+      .setRichTextValue(_buildJobLinkRichText(update.job.jobId, update.job.mergedJobIds));
   });
 
-  if (appends.length) {
+  var appendedJobs = [];
+
+  if (newJobs.length) {
+    var jdHashIndex = _buildJdHashIndex(sheet);
+    var batchHashToIdx = {};
+
+    newJobs.forEach(function(job) {
+      var hash = job.jdFingerprint;
+
+      if (hash && jdHashIndex[hash]) {
+        _mergeNewJobIntoExistingRow(sheet, jdHashIndex[hash], job);
+        return;
+      }
+
+      if (hash && batchHashToIdx.hasOwnProperty(hash)) {
+        _mergeJobIntoBatchPrimary(appendedJobs[batchHashToIdx[hash]], job);
+        return;
+      }
+
+      if (hash) batchHashToIdx[hash] = appendedJobs.length;
+      appendedJobs.push(job);
+    });
+  }
+
+  if (appendedJobs.length) {
+    var appends = appendedJobs.map(_toSheetRow);
     var startRow = Math.max(sheet.getLastRow() + 1, JOB_PRIORITY_DATA_START_ROW);
     sheet.getRange(startRow, 1, appends.length, JOB_PRIORITY_COLUMNS.length).setValues(appends);
     _applyJobIdColumnFormat(sheet, startRow, appends.length);
     _applyDataRowFormat(sheet, startRow, appends.length);
-    appendedJobs.forEach(function(job, i) {
-      job.existingRowNumber = startRow + i;
-    });
+    _applyJobLinkRichTexts(sheet, startRow, appendedJobs);
+    appendedJobs.forEach(function(job, i) { job.existingRowNumber = startRow + i; });
   }
 
   _applyStatusValidation(sheet);
+
+  var assignedJobs = rows.filter(function(job) {
+    return _stringifyField(job.status) === 'Assigned';
+  });
+  if (assignedJobs.length) _syncAssignedRowsForJobs(assignedJobs);
+}
+
+function _buildJdHashIndex(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return {};
+  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var col = JOB_PRIORITY_COLUMN_INDEX.jd_fingerprint;
+  var values = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, col, rowCount, 1).getValues();
+  var index = {};
+  values.forEach(function(row, i) {
+    var hash = _stringifyField(row[0]);
+    if (hash) index[hash] = JOB_PRIORITY_DATA_START_ROW + i;
+  });
+  return index;
+}
+
+function _mergeNewJobIntoExistingRow(sheet, rowNumber, newJob) {
+  var values = sheet.getRange(rowNumber, 1, 1, JOB_PRIORITY_COLUMNS.length).getValues()[0];
+  var updates = {};
+
+  var locIdx = JOB_PRIORITY_COLUMN_INDEX.location - 1;
+  var existingLoc = _stringifyField(values[locIdx]).trim();
+  var newLoc = _stringifyField(newJob.location).trim();
+  if (newLoc && existingLoc.toLowerCase().indexOf(newLoc.toLowerCase()) === -1) {
+    updates[JOB_PRIORITY_COLUMN_INDEX.location] = existingLoc ? existingLoc + ' | ' + newLoc : newLoc;
+  }
+
+  if (newJob.applicants) {
+    updates[JOB_PRIORITY_COLUMN_INDEX.applicants] = newJob.applicants;
+  }
+
+  if (newJob.posted) {
+    updates[JOB_PRIORITY_COLUMN_INDEX.posted] = newJob.posted;
+  }
+
+  var primaryId = _stringifyField(values[JOB_PRIORITY_COLUMN_INDEX.job_id - 1]);
+  var newJobId = _stringifyField(newJob.jobId);
+  var finalPrimaryId = primaryId;
+  if (newJobId && newJobId !== primaryId) {
+    var existing = _stringifyField(values[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids - 1]);
+    var idList = existing ? existing.split(/,\s*/) : [];
+    // Promote the incoming (newer) job ID to canonical; retire the old one into merged_job_ids
+    finalPrimaryId = newJobId;
+    updates[JOB_PRIORITY_COLUMN_INDEX.job_id] = newJobId;
+    if (idList.indexOf(primaryId) === -1 && primaryId) idList.push(primaryId);
+    updates[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids] = idList.join(', ');
+  }
+
+  Object.keys(updates).forEach(function(col) {
+    var range = sheet.getRange(rowNumber, Number(col), 1, 1);
+    if (Number(col) === JOB_PRIORITY_COLUMN_INDEX.job_id) range.setNumberFormat('@');
+    range.setValue(updates[col]);
+  });
+
+  var finalMergedIds = updates.hasOwnProperty(JOB_PRIORITY_COLUMN_INDEX.merged_job_ids)
+    ? updates[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids]
+    : _stringifyField(values[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids - 1]);
+  sheet.getRange(rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_link)
+    .setRichTextValue(_buildJobLinkRichText(finalPrimaryId, finalMergedIds));
+}
+
+function _mergeJobIntoBatchPrimary(primary, secondary) {
+  var existingLoc = _stringifyField(primary.location).trim();
+  var newLoc = _stringifyField(secondary.location).trim();
+  if (newLoc && existingLoc.toLowerCase().indexOf(newLoc.toLowerCase()) === -1) {
+    primary.location = existingLoc ? existingLoc + ' | ' + newLoc : newLoc;
+  }
+
+  if (!primary.applicants && secondary.applicants) {
+    primary.applicants = secondary.applicants;
+  }
+
+  if (!primary.posted && secondary.posted) {
+    primary.posted = secondary.posted;
+  }
+
+  var primaryId = _stringifyField(primary.jobId);
+  var secondaryId = _stringifyField(secondary.jobId);
+  if (secondaryId && secondaryId !== primaryId) {
+    var existing = _stringifyField(primary.mergedJobIds) || '';
+    var idList = existing ? existing.split(/,\s*/) : [];
+    if (idList.indexOf(secondaryId) === -1) {
+      idList.push(secondaryId);
+      primary.mergedJobIds = idList.join(', ');
+    }
+  }
 }
 
 function getRawDataIndex() {
@@ -346,7 +487,8 @@ function repairJobLinksFromRawRefRows() {
 
   updates.forEach(function(update) {
     sheet.getRange(update.rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_id).setValue(update.jobId);
-    sheet.getRange(update.rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_link).setFormula(_buildJobLinkFormula(update.jobLink));
+    sheet.getRange(update.rowNumber, JOB_PRIORITY_COLUMN_INDEX.job_link)
+      .setRichTextValue(_buildJobLinkRichText(update.jobId, ''));
     recoveredJobIdCount += 1;
     updatedCount += 1;
   });
@@ -409,6 +551,16 @@ function replaceAllJobs(rows, opts) {
   var skipRawDataSync = opts && opts.skipRawDataSync;
 
   var sheet = _getJobPrioritySheet();
+
+  // Clear column-level filter criteria so the rewrite doesn't leave rows hidden
+  // behind stale filter values. The filter toggle stays; only per-column criteria clear.
+  var filter = sheet.getFilter();
+  if (filter) {
+    for (var col = 1; col <= JOB_PRIORITY_VISIBLE_COLUMNS.length; col++) {
+      try { filter.removeColumnFilterCriteria(col); } catch (e) {}
+    }
+  }
+
   var existingLastRow = sheet.getLastRow();
   var clearRowCount = Math.max(existingLastRow - JOB_PRIORITY_DATA_START_ROW + 1, 0);
 
@@ -432,6 +584,11 @@ function replaceAllJobs(rows, opts) {
   }
 
   if (rows && rows.length) {
+    rows.forEach(function(job) {
+      if (!job.jdFingerprint && job.jobDescription) {
+        job.jdFingerprint = _jdContentHash(job.jobDescription);
+      }
+    });
     var outputRows = rows.map(_toSheetRow);
     sheet.getRange(
       JOB_PRIORITY_DATA_START_ROW,
@@ -442,6 +599,12 @@ function replaceAllJobs(rows, opts) {
 
     _applyJobIdColumnFormat(sheet, JOB_PRIORITY_DATA_START_ROW, outputRows.length);
     _applyDataRowFormat(sheet, JOB_PRIORITY_DATA_START_ROW, outputRows.length);
+    _applyJobLinkRichTexts(sheet, JOB_PRIORITY_DATA_START_ROW, rows);
+
+    var assignedJobs = rows.filter(function(job) {
+      return _stringifyField(job.status) === 'Assigned';
+    });
+    if (assignedJobs.length) _syncAssignedRowsForJobs(assignedJobs);
   }
 
   _applyStatusValidation(sheet);
@@ -829,9 +992,44 @@ function _setupJobPrioritySheet(sheet) {
     1
   ).setNumberFormat('0');
 
+  _backfillJdFingerprints();
   _applyStatusValidation(sheet);
   _applyStatusFormattingRules(sheet);
 }
+
+function _backfillJdFingerprints() {
+  var sheet = _getJobPrioritySheet();
+  if (!sheet) return;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return;
+
+  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var jdFpCol = JOB_PRIORITY_COLUMN_INDEX.jd_fingerprint;
+  var rawDataIndex = getRawDataIndex();
+
+  var fpValues = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, jdFpCol, rowCount, 1).getValues();
+  var jobIdValues = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.job_id, rowCount, 1).getValues();
+  var jobLinkFormulas = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.job_link, rowCount, 1).getFormulas();
+
+  var updated = false;
+  fpValues.forEach(function(row, i) {
+    if (row[0]) return;
+    var rawJobId = _stringifyField(jobIdValues[i][0]);
+    var jobLinkUrl = _extractUrlFromHyperlinkFormula(_stringifyField(jobLinkFormulas[i][0]));
+    var jobId = _extractLinkedInJobId(rawJobId) || _extractLinkedInJobId(jobLinkUrl) || rawJobId;
+    var rawData = jobId ? rawDataIndex.byJobId[jobId] : null;
+    var jobDescription = _extractJobDescriptionFromRawRef(rawData && rawData.rawRef);
+    if (jobDescription) {
+      fpValues[i][0] = _jdContentHash(jobDescription);
+      updated = true;
+    }
+  });
+
+  if (updated) {
+    sheet.getRange(JOB_PRIORITY_DATA_START_ROW, jdFpCol, rowCount, 1).setValues(fpValues);
+  }
+}
+
 function _setupRawDataSheet(sheet) {
   _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
   sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
@@ -1057,8 +1255,6 @@ function _applyStatusFormattingRules(sheet) {
 
 
 function _toSheetRow(job) {
-  var jobUrl = _buildLinkedInJobUrlFromJobId(job.jobId) || job.jobLink || job.sourceUrl || '';
-
   return [
     '',
     job.priority || '',
@@ -1072,7 +1268,7 @@ function _toSheetRow(job) {
     job.location || '',
     job.posted || '',
     job.applicants || '',
-    _buildJobLinkFormula(jobUrl),
+    '',  // job_link — set separately as rich text via _applyJobLinkRichTexts
     job.summary || '',
     job.why || '',
     job.usVisaReason || '',
@@ -1080,16 +1276,49 @@ function _toSheetRow(job) {
     job.importedAt || '',
     job.scoredAt || '',
     job.scoringFingerprint || '',
-    job.mergedJobIds || ''
+    job.mergedJobIds || '',
+    job.jdFingerprint || ''
   ];
 }
 
-function _buildJobLinkFormula(url) {
-  if (!url) {
-    return '';
+function _buildJobLinkRichText(jobId, mergedJobIds) {
+  var ids = [];
+  var primaryId = _stringifyField(jobId).trim();
+  if (primaryId) ids.push(primaryId);
+  if (mergedJobIds) {
+    String(mergedJobIds).split(',').forEach(function(s) {
+      var id = s.trim();
+      if (id && ids.indexOf(id) === -1) ids.push(id);
+    });
   }
+  if (!ids.length) return SpreadsheetApp.newRichTextValue().setText('').build();
 
-  return '=HYPERLINK("' + String(url).replace(/"/g, '""') + '","Open")';
+  var isMultiple = ids.length > 1;
+  var text = '';
+  var links = [];
+  ids.forEach(function(id, i) {
+    if (i > 0) text += ' | ';
+    var start = text.length;
+    text += id;
+    var url = _buildLinkedInJobUrlFromJobId(id);
+    if (url) links.push({ start: start, end: text.length, url: url });
+    if (i === 0 && isMultiple) text += ' (latest)';
+  });
+
+  var builder = SpreadsheetApp.newRichTextValue().setText(text);
+  links.forEach(function(link) {
+    builder.setLinkUrl(link.start, link.end, link.url);
+  });
+  return builder.build();
+}
+
+function _applyJobLinkRichTexts(sheet, startRow, jobs) {
+  if (!jobs.length) return;
+  var col = JOB_PRIORITY_COLUMN_INDEX.job_link;
+  var richTexts = jobs.map(function(job) {
+    return [_buildJobLinkRichText(job.jobId, job.mergedJobIds)];
+  });
+  sheet.getRange(startRow, col, richTexts.length, 1).setRichTextValues(richTexts);
 }
 
 function _compareJobsForDisplay(left, right) {
@@ -1170,7 +1399,9 @@ function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
   // Always try the HYPERLINK formula as the authoritative source.
   var jobLinkFormula = formulas[JOB_PRIORITY_COLUMN_INDEX.job_link - 1] || '';
   var jobLinkUrl = _extractUrlFromHyperlinkFormula(jobLinkFormula) || '';
-  var jobId = _extractLinkedInJobId(rawJobId) || _extractLinkedInJobId(jobLinkUrl);
+  // Fall back to the raw string so non-LinkedIn job IDs can still look up Raw_Data
+  // (getRawDataIndex also uses _stringifyField(row[0]) as fallback — keep in sync).
+  var jobId = _extractLinkedInJobId(rawJobId) || _extractLinkedInJobId(jobLinkUrl) || rawJobId;
   var rawData = rawDataByJobId && jobId ? rawDataByJobId[jobId] : null;
   var rawRef = rawData ? (rawData.rawRef || '') : '';
   var company = row[JOB_PRIORITY_COLUMN_INDEX.company - 1];
@@ -1218,7 +1449,8 @@ function _sheetRowToJobRecord(row, formulas, rowNumber, rawDataByJobId) {
     sourceUrl: sourceUrl,
     scoringFingerprint: row[JOB_PRIORITY_COLUMN_INDEX.scoring_fingerprint - 1] || '',
     mergedJobIds: mergedJobIds,
-    rawRef: rawRef
+    rawRef: rawRef,
+    jdFingerprint: _stringifyField(row[JOB_PRIORITY_COLUMN_INDEX.jd_fingerprint - 1])
   };
 }
 
@@ -1532,4 +1764,180 @@ function _cloneJobRecord(job) {
     clone[key] = job[key];
   });
   return clone;
+}
+
+// ── Assigned sheet helpers ─────────────────────────────────────────────────
+
+function _getAssignedSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ASSIGNED_SHEET_NAME) || null;
+}
+
+function _getAssignedJobIdIndex(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < ASSIGNED_DATA_START_ROW) return {};
+  var rowCount = lastRow - ASSIGNED_DATA_START_ROW + 1;
+  var col = ASSIGNED_COLUMN_INDEX.job_id;
+  var values = sheet.getRange(ASSIGNED_DATA_START_ROW, col, rowCount, 1).getValues();
+  var index = {};
+  values.forEach(function(row, i) {
+    var id = _stringifyField(row[0]).trim();
+    if (id) index[id] = ASSIGNED_DATA_START_ROW + i;
+  });
+  return index;
+}
+
+function _formatNow() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+}
+
+function _buildAssignedRow(job, status) {
+  return [
+    status || 'Pending',
+    job.rank || '',
+    job.priority || '',
+    job.score === '' ? '' : (job.score !== undefined ? Number(job.score) : ''),
+    job.usVisaSponsorshipPotential || '',
+    job.company || '',
+    job.title || '',
+    job.location || '',
+    '',  // job_link — set separately as rich text
+    job.summary || '',
+    job.why || '',
+    job.usVisaReason || '',
+    job.posted || '',
+    '',  // notes
+    _formatNow(),  // updated_at
+    '',  // applied_at
+    job.jobId || ''
+  ];
+}
+
+function _setupAssignedSheet(sheet) {
+  _ensureSheetDimensions(sheet, ASSIGNED_COLUMNS.length, ASSIGNED_DATA_START_ROW);
+  sheet.getRange(1, 1, 1, ASSIGNED_COLUMNS.length).setValues([ASSIGNED_COLUMNS]);
+  sheet.getRange(1, 1, 1, ASSIGNED_COLUMNS.length)
+    .setFontWeight('bold')
+    .setBackground('#d9ead3');
+  sheet.setFrozenRows(1);
+
+  var statusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(ASSIGNED_STATUS_OPTIONS, true)
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.status,
+    Math.max(sheet.getMaxRows() - ASSIGNED_DATA_START_ROW + 1, 1), 1)
+    .setDataValidation(statusRule);
+
+  sheet.hideColumns(ASSIGNED_COLUMN_INDEX.job_id);
+
+  var colWidths = {
+    summary: 300, why: 250, us_visa_reason: 200,
+    title: 200, company: 150, location: 150,
+    notes: 200, job_link: 160
+  };
+  Object.keys(colWidths).forEach(function(col) {
+    if (ASSIGNED_COLUMN_INDEX[col]) {
+      sheet.setColumnWidth(ASSIGNED_COLUMN_INDEX[col], colWidths[col]);
+    }
+  });
+}
+
+function _pushJobsToAssignedSheet(jobs) {
+  if (!jobs || !jobs.length) return 0;
+  var assignedSheet = _getAssignedSheet();
+  if (!assignedSheet) return 0;
+
+  var existingIndex = _getAssignedJobIdIndex(assignedSheet);
+  var toAdd = jobs.filter(function(job) {
+    var id = _stringifyField(job.jobId).trim();
+    return id && !existingIndex[id];
+  });
+  if (!toAdd.length) return 0;
+
+  var startRow = Math.max(assignedSheet.getLastRow() + 1, ASSIGNED_DATA_START_ROW);
+  var rows = toAdd.map(function(job) { return _buildAssignedRow(job, 'Pending'); });
+  assignedSheet.getRange(startRow, 1, rows.length, ASSIGNED_COLUMNS.length).setValues(rows);
+
+  var richTexts = toAdd.map(function(job) {
+    return [_buildJobLinkRichText(job.jobId, job.mergedJobIds)];
+  });
+  assignedSheet.getRange(startRow, ASSIGNED_COLUMN_INDEX.job_link, richTexts.length, 1)
+    .setRichTextValues(richTexts);
+
+  var jobSheet = _getJobPrioritySheet();
+  toAdd.forEach(function(job) {
+    var rowNum = _findJobPriorityRowByJobId(_stringifyField(job.jobId));
+    if (rowNum) jobSheet.getRange(rowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Assigned');
+  });
+
+  return toAdd.length;
+}
+
+function _syncAssignedRowsForJobs(jobs) {
+  if (!jobs || !jobs.length) return;
+  var assignedSheet = _getAssignedSheet();
+  if (!assignedSheet) return;
+
+  var existingIndex = _getAssignedJobIdIndex(assignedSheet);
+  var now = _formatNow();
+
+  jobs.forEach(function(job) {
+    var id = _stringifyField(job.jobId).trim();
+    var rowNum = id ? existingIndex[id] : null;
+    if (!rowNum) return;
+
+    var updates = [
+      [ASSIGNED_COLUMN_INDEX.rank, job.rank || ''],
+      [ASSIGNED_COLUMN_INDEX.priority, job.priority || ''],
+      [ASSIGNED_COLUMN_INDEX.score, job.score === '' ? '' : (job.score !== undefined ? Number(job.score) : '')],
+      [ASSIGNED_COLUMN_INDEX.us_visa, job.usVisaSponsorshipPotential || ''],
+      [ASSIGNED_COLUMN_INDEX.summary, job.summary || ''],
+      [ASSIGNED_COLUMN_INDEX.why, job.why || ''],
+      [ASSIGNED_COLUMN_INDEX.us_visa_reason, job.usVisaReason || ''],
+      [ASSIGNED_COLUMN_INDEX.updated_at, now]
+    ];
+    updates.forEach(function(u) {
+      assignedSheet.getRange(rowNum, u[0]).setValue(u[1]);
+    });
+    assignedSheet.getRange(rowNum, ASSIGNED_COLUMN_INDEX.job_link)
+      .setRichTextValue(_buildJobLinkRichText(job.jobId, job.mergedJobIds));
+  });
+}
+
+function _removeFromAssignedSheet(assignedSheet, jobId) {
+  var id = _stringifyField(jobId).trim();
+  if (!id) return;
+  var index = _getAssignedJobIdIndex(assignedSheet);
+  var rowNum = index[id];
+  if (!rowNum) return;
+  assignedSheet.deleteRow(rowNum);
+}
+
+function _findJobPriorityRowByJobId(jobId) {
+  var id = _stringifyField(jobId).trim();
+  if (!id) return null;
+  var sheet = _getJobPrioritySheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return null;
+  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var values = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.job_id, rowCount, 1).getValues();
+  for (var i = 0; i < values.length; i++) {
+    if (_stringifyField(values[i][0]).trim() === id) return JOB_PRIORITY_DATA_START_ROW + i;
+  }
+  return null;
+}
+
+function _protectSheetsForAssignee(spreadsheet) {
+  var ownerEmail = Session.getEffectiveUser().getEmail();
+  var sheetsToProtect = [JOB_PRIORITY_SHEET_NAME, SETTINGS_SHEET_NAME, HELP_SHEET_NAME, RAW_DATA_SHEET_NAME];
+
+  sheetsToProtect.forEach(function(name) {
+    var sheet = spreadsheet.getSheetByName(name);
+    if (!sheet) return;
+    var existing = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+    existing.forEach(function(p) { p.remove(); });
+    var protection = sheet.protect().setDescription('Owner only');
+    protection.removeEditors(protection.getEditors());
+    if (ownerEmail) protection.addEditor(ownerEmail);
+  });
 }

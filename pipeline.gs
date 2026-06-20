@@ -13,7 +13,7 @@ function loadRuntimeConfig() {
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
-    promptVersion: 'v7',
+    promptVersion: 'v8',
     targetProfile: String(
       settings.TARGET_PROFILE ||
       _defaultTargetProfile()
@@ -33,7 +33,10 @@ function loadRuntimeConfig() {
     vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
     geminiApiKey: properties.getProperty('GEMINI_API_KEY'),
-    openAiApiKey: properties.getProperty('OPENAI_API_KEY')
+    openAiApiKey: properties.getProperty('OPENAI_API_KEY'),
+    autoAssignPriorities: _splitCsv(settings.AUTO_ASSIGN_PRIORITIES || 'P01,P02,P03'),
+    autoAssignVisa: _splitCsv(settings.AUTO_ASSIGN_VISA || 'Likely (90%),Possible (70%)'),
+    autoAssignExcludeCompanies: _splitCsv(settings.AUTO_ASSIGN_EXCLUDE_COMPANIES || '').map(function(s) { return s.toLowerCase(); }).filter(Boolean)
   };
 }
 
@@ -336,6 +339,7 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
   var batchSize = config.scoringParallelRequests;
   var resolvedStatusLabel = statusLabel || 'Scoring jobs';
   var hitExecutionBudget = false;
+  var runScoredByFingerprint = {};
 
   // Initialize Gemini context cache once per run (keyed by model + prompt fingerprint)
   if (!config._scoringCacheAttempted) {
@@ -344,58 +348,99 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
   }
 
   for (var start = 0; start < jobs.length; start += batchSize) {
+    if (start > 0 && _isCancelRequested()) {
+      _clearCancelRequest();
+      Logger.log('Run cancelled by user after ' + processedCount + ' jobs.');
+      break;
+    }
+
     if (start > 0 && _shouldYieldExecution(config)) {
       hitExecutionBudget = true;
       break;
     }
 
     var batch = jobs.slice(start, start + batchSize);
-    var requests = batch.map(function(job) {
-      return _buildScoreRequest(job, config);
-    });
-    var batchStartedAt = Date.now();
-    var responses = _executeScoreRequests(requests);
     var prevRowCount = rows.length;
 
-    batch.forEach(function(job, index) {
-      try {
-        var scoreResult = _scoreSingleJobWithRetry(job, config, responses[index]);
-        job.score = scoreResult.score;
-        job.priority = scoreResult.priority;
-        job.usVisaSponsorshipPotential = scoreResult.usVisaSponsorshipPotential;
-        job.usVisaReason = scoreResult.usVisaReason;
-        job.summary = scoreResult.summary;
-        job.why = scoreResult.why;
-        job.titleLevel = scoreResult.titleLevel;
-        job.jdImpliedLevel = scoreResult.jdImpliedLevel;
-        job.scoredAt = new Date();
-        job.scoringFingerprint = job.scoringFingerprint || _buildScoringFingerprint(job, config);
-
-        rows.push(job);
-        scoredJobsCount += 1;
-      } catch (scoreError) {
-        failedJobsCount += 1;
-        failedJobIds.push(job.jobId);
-        errors.push(_truncate('AI scoring failed for ' + (job.title || job.jobId) + ': ' + scoreError.message, 300));
-        Logger.log(scoreError);
+    // Split batch: jobs whose fingerprint was already scored this run vs jobs needing API calls
+    var toScore = [];
+    var reused = [];
+    batch.forEach(function(job) {
+      var fp = job.scoringFingerprint;
+      if (fp && runScoredByFingerprint[fp]) {
+        reused.push({ job: job, result: runScoredByFingerprint[fp] });
+      } else {
+        toScore.push(job);
       }
     });
+
+    // Apply reused scores (no API call needed)
+    reused.forEach(function(item) {
+      var r = item.result;
+      var job = item.job;
+      job.score = r.score;
+      job.priority = r.priority;
+      job.usVisaSponsorshipPotential = r.usVisaSponsorshipPotential;
+      job.usVisaReason = r.usVisaReason;
+      job.summary = r.summary;
+      job.why = r.why;
+      job.titleLevel = r.titleLevel;
+      job.jdImpliedLevel = r.jdImpliedLevel;
+      job.scoredAt = new Date();
+      rows.push(job);
+      scoredJobsCount += 1;
+    });
+
+    var batchStartedAt = Date.now();
+
+    if (toScore.length) {
+      var requests = toScore.map(function(job) {
+        return _buildScoreRequest(job, config);
+      });
+      var responses = _executeScoreRequests(requests);
+
+      toScore.forEach(function(job, index) {
+        try {
+          var scoreResult = _scoreSingleJobWithRetry(job, config, responses[index]);
+          job.score = scoreResult.score;
+          job.priority = scoreResult.priority;
+          job.usVisaSponsorshipPotential = scoreResult.usVisaSponsorshipPotential;
+          job.usVisaReason = scoreResult.usVisaReason;
+          job.summary = scoreResult.summary;
+          job.why = scoreResult.why;
+          job.titleLevel = scoreResult.titleLevel;
+          job.jdImpliedLevel = scoreResult.jdImpliedLevel;
+          job.scoredAt = new Date();
+          job.scoringFingerprint = job.scoringFingerprint || _buildScoringFingerprint(job, config);
+          if (job.scoringFingerprint) {
+            runScoredByFingerprint[job.scoringFingerprint] = scoreResult;
+          }
+
+          rows.push(job);
+          scoredJobsCount += 1;
+        } catch (scoreError) {
+          failedJobsCount += 1;
+          failedJobIds.push(job.jobId);
+          errors.push(_truncate('AI scoring failed for ' + (job.title || job.jobId) + ': ' + scoreError.message, 300));
+          Logger.log(scoreError);
+        }
+      });
+    }
 
     processedCount += batch.length;
     _emitProgress(progressCallback, {
       status: resolvedStatusLabel,
       processed: (initialProcessedCount + processedCount) + ' / ' + totalJobsCount,
-      rows: rows.slice(prevRowCount)  // flush this batch's results to the sheet immediately
+      rows: rows.slice(prevRowCount)
     });
 
-    // Adaptive rate-limit pacing: if SCORING_RPM_LIMIT is set, sleep only the time
-    // remaining in the rate window — batch execution time already counts toward it.
+    // Adaptive rate-limit pacing based on actual API calls made this batch.
     // With no RPM limit, enforce a 1 s minimum to avoid quota exhaustion.
     var hasMoreBatches = (start + batch.length) < jobs.length;
-    if (hasMoreBatches) {
+    if (hasMoreBatches && toScore.length) {
       var elapsed = Date.now() - batchStartedAt;
       var windowMs = config.scoringRpmLimit > 0
-        ? Math.floor(60000 * batch.length / config.scoringRpmLimit)
+        ? Math.floor(60000 * toScore.length / config.scoringRpmLimit)
         : 1000;
       var sleepMs = windowMs - elapsed;
       if (sleepMs > 0) {
@@ -433,6 +478,12 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
     Logger.log(firstError);
 
     var isRateLimit = firstError.message && firstError.message.indexOf('429') !== -1;
+    var isCacheMiss = !isRateLimit && firstError.message && firstError.message.indexOf('404') !== -1;
+    if (isCacheMiss) {
+      // Cache expired between trigger executions — clear it on the shared config so all
+      // subsequent jobs in this run skip the stale cache ID instead of each hitting a 404.
+      config._scoringCacheName = '';
+    }
     var noCache = config._scoringCacheName
       ? Object.assign({}, config, { _scoringCacheName: '' })
       : config;
@@ -638,6 +689,16 @@ function _getMaxJobsPerExecution(config) {
   var limit = explicit > 0 ? Math.min(explicit, computed) : computed;
 
   return Math.max(1, limit);
+}
+
+var CANCEL_REQUEST_KEY = 'PIPELINE_CANCEL_REQUESTED';
+
+function _isCancelRequested() {
+  return PropertiesService.getScriptProperties().getProperty(CANCEL_REQUEST_KEY) === 'true';
+}
+
+function _clearCancelRequest() {
+  PropertiesService.getScriptProperties().deleteProperty(CANCEL_REQUEST_KEY);
 }
 
 function _shouldYieldExecution(config) {
@@ -1064,6 +1125,18 @@ function _buildDynamicJobContent(job) {
   ].join('\n');
 }
 
+function _buildFingerprintJobContent(job) {
+  return [
+    'Company: ' + (job.company || ''),
+    'Title: ' + (job.title || ''),
+    'Contract type: ' + (job.contractType || ''),
+    'Experience level: ' + (job.experienceLevel || ''),
+    'Work type: ' + (job.workType || ''),
+    'Description:',
+    job.jobDescription || ''
+  ].join('\n');
+}
+
 function _buildScoringPrompt(job, config) {
   return [
     'Target profile:',
@@ -1245,7 +1318,8 @@ function _buildScoringFingerprint(job, config) {
     config.geminiApiRoute || '',
     config.scoringModel || '',
     config.promptVersion || '',
-    _buildScoringPrompt(job, config)
+    _buildStaticScoringContent(config),
+    _buildFingerprintJobContent(job)
   ].join('|'));
 }
 
@@ -1806,7 +1880,7 @@ function _precomputeJdFingerprints(records) {
   records.forEach(function(record) {
     var jd = _stringifyField(record.jobDescription);
     var bigrams = _buildWordBigrams(jd);
-    record._jdHash = _jdContentHash(jd);
+    record._jdHash = record.jdFingerprint || _jdContentHash(jd);
     record._bigrams = bigrams;
     record._bigramCount = Object.keys(bigrams).length;
     record._bigramSketch = _buildBigramSketch(bigrams);

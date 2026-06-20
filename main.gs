@@ -56,10 +56,13 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Jobs Pipeline')
     .addItem('Run Now', 'runJobImportAndScoring')
+    .addItem('Cancel Run', 'cancelRunPrompt')
     .addSeparator()
-    .addItem('Reevaluate Active Backlog', 'reevaluateActiveBacklog')
     .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
     .addItem('Rerun Raw Data', 'rerunAllFromRawData')
+    .addSeparator()
+    .addItem('Assign Selected Rows', 'assignSelectedRowsPrompt')
+    .addItem('Reassign by Rules', 'reassignJobsPrompt')
     .addSeparator()
     .addItem('Import Apify Run ID...', 'importApifyRunByIdPrompt')
     .addItem('Retry Apify Run ID...', 'resurrectApifyRunByIdPrompt')
@@ -79,17 +82,56 @@ function onInstall() {
 }
 
 function onEdit(e) {
-  if (!e || !e.range) {
-    return;
-  }
+  if (!e || !e.range) return;
 
   var sheet = e.range.getSheet();
-  if (!sheet || sheet.getName() !== JOB_PRIORITY_SHEET_NAME) {
-    return;
-  }
+  var sheetName = sheet.getName();
+  var row = e.range.getRow();
+  var col = e.range.getColumn();
 
-  if (e.range.getRow() < JOB_PRIORITY_DATA_START_ROW || e.range.getColumn() !== JOB_PRIORITY_COLUMN_INDEX.status) {
-    return;
+  if (sheetName === JOB_PRIORITY_SHEET_NAME) {
+    if (row < JOB_PRIORITY_DATA_START_ROW || col !== JOB_PRIORITY_COLUMN_INDEX.status) return;
+    try { _handleJobPriorityStatusEdit(sheet, row, e.value, e.oldValue); } catch (err) { Logger.log(err); }
+  } else if (sheetName === ASSIGNED_SHEET_NAME) {
+    if (row < ASSIGNED_DATA_START_ROW || col !== ASSIGNED_COLUMN_INDEX.status) return;
+    try { _handleAssignedStatusEdit(sheet, row, e.value); } catch (err) { Logger.log(err); }
+  }
+}
+
+function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
+  if (newValue === 'Assigned') {
+    var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+    var records = getExistingJobRecords();
+    var job = null;
+    for (var i = 0; i < records.length; i++) {
+      if (records[i].rowNumber === row) { job = records[i]; break; }
+    }
+    if (job) _pushJobsToAssignedSheet([job]);
+  } else if (oldValue === 'Assigned') {
+    var jobIdToRemove = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+    var assignedSheet = _getAssignedSheet();
+    if (assignedSheet && jobIdToRemove) _removeFromAssignedSheet(assignedSheet, jobIdToRemove);
+  }
+}
+
+function _handleAssignedStatusEdit(sheet, row, newValue) {
+  var jobId = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.job_id).getValue()).trim();
+  if (!jobId) return;
+
+  var jpRowNum = _findJobPriorityRowByJobId(jobId);
+  var jobSheet = _getJobPrioritySheet();
+  var now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+
+  if (newValue === 'Applied') {
+    if (jpRowNum) jobSheet.getRange(jpRowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Applied');
+    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.applied_at).setValue(now);
+    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
+  } else if (newValue === 'Failed') {
+    if (jpRowNum) jobSheet.getRange(jpRowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Skip');
+    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
+  } else if (newValue === 'Pending') {
+    if (jpRowNum) jobSheet.getRange(jpRowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Assigned');
+    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
   }
 }
 
@@ -229,6 +271,11 @@ function _runPipelineInternal(activeRunState, options) {
   lock.waitLock(30000);
 
   try {
+    // Only clear a stale cancel flag on a genuinely fresh start.
+    // Resumed executions (resume trigger fired mid-run) must NOT clear it —
+    // the user may have clicked Cancel while the previous slice was running.
+    var isFreshStart = !PropertiesService.getScriptProperties().getProperty(ACTIVE_RUN_STATE_PROPERTY_KEY);
+    if (isFreshStart) _clearCancelRequest();
     ensureWorkbookReadyForRuntime();
 
     // Clear any stale saved state only when a fresh initialActiveRunState was explicitly passed
@@ -305,23 +352,28 @@ function _runPipelineInternal(activeRunState, options) {
 
     sortAndRankJobs();
 
+    try {
+      tracker.update({ status: 'Deduplicating similar JDs' });
+      deduplicateSimilarJdRows();
+    } catch (dedupError) {
+      Logger.log(dedupError);
+    }
+
     _markTrackedExecutionFinished(result.activeRunState, 'completed');
     _clearActiveRunState();
     _removeResumeTriggers();
 
     if (options.postProcess) {
       try {
+        tracker.update({ status: 'Auto-assigning jobs' });
+        _autoAssignNewJobs(config);
+      } catch (assignError) { Logger.log('Auto-assign error: ' + assignError); }
+
+      try {
         tracker.update({ status: 'Pruning expired jobs' });
         pruneExpiredJobRows();
       } catch (pruneError) {
         Logger.log(pruneError);
-      }
-
-      try {
-        tracker.update({ status: 'Deduplicating similar JDs' });
-        deduplicateSimilarJdRows();
-      } catch (dedupError) {
-        Logger.log(dedupError);
       }
 
       result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
@@ -504,7 +556,7 @@ function reevaluateActiveBacklog() {
   var activeRunState = _buildReevaluationStateFromRecords(activeRecords, config, 'active backlog');
 
   if (!activeRunState.targetJobIds.length) {
-    SpreadsheetApp.getUi().alert('No eligible backlog rows were found. Reevaluation only targets New, Opened, and Tailoring rows.');
+    SpreadsheetApp.getUi().alert('No eligible backlog rows were found. Reevaluation only targets New and Assigned rows.');
     return;
   }
 
@@ -753,7 +805,7 @@ function _markTrackedExecutionFinished(activeRunState, outcome) {
 
 function _isReevaluationEligibleStatus(status) {
   var normalized = _stringifyField(status) || 'New';
-  return normalized === 'New' || normalized === 'Opened' || normalized === 'Tailoring';
+  return normalized === 'New' || normalized === 'Assigned';
 }
 
 function _hasScoringPayload(record) {
@@ -1079,6 +1131,70 @@ function _sendEmailSafely(message) {
   } catch (error) {
     Logger.log(error);
   }
+}
+
+function cancelRunPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  PropertiesService.getScriptProperties().setProperty(CANCEL_REQUEST_KEY, 'true');
+  ui.alert('Cancellation requested. The run will stop after the current batch finishes (usually within a few seconds).');
+}
+
+function _autoAssignNewJobs(config) {
+  if (!config) return;
+  var priorities = config.autoAssignPriorities || [];
+  var visas = config.autoAssignVisa || [];
+  var excludeCompanies = config.autoAssignExcludeCompanies || [];
+  if (!priorities.length) return;
+
+  var candidates = getExistingJobRecords().filter(function(r) {
+    return _stringifyField(r.status) === 'New'
+      && priorities.indexOf(_stringifyField(r.priority)) !== -1
+      && (visas.length === 0 || visas.indexOf(_stringifyField(r.usVisaSponsorshipPotential)) !== -1)
+      && excludeCompanies.indexOf((_stringifyField(r.company) || '').toLowerCase().trim()) === -1;
+  });
+  if (candidates.length) _pushJobsToAssignedSheet(candidates);
+}
+
+function assignSelectedRowsPrompt() {
+  ensureWorkbookReadyForRuntime();
+  var ui = SpreadsheetApp.getUi();
+  var jobSheet = _getJobPrioritySheet();
+  var range = jobSheet && jobSheet.getActiveRange();
+  if (!range) { ui.alert('Select one or more job rows first.'); return; }
+
+  var records = getExistingJobRecords();
+  var selectedRows = {};
+  for (var r = range.getRow(); r <= range.getLastRow(); r++) selectedRows[r] = true;
+  var selected = records.filter(function(rec) { return selectedRows[rec.rowNumber]; });
+  if (!selected.length) { ui.alert('No valid job rows selected.'); return; }
+
+  var assigned = _pushJobsToAssignedSheet(selected);
+  ui.alert(assigned > 0
+    ? assigned + ' job(s) assigned. Already-assigned jobs were skipped.'
+    : 'All selected jobs are already in the Assigned sheet.');
+}
+
+function reassignJobsPrompt() {
+  ensureWorkbookReadyForRuntime();
+  var ui = SpreadsheetApp.getUi();
+  var config = loadRuntimeConfig();
+  var priorities = config.autoAssignPriorities || [];
+  var visas = config.autoAssignVisa || [];
+  var excludeCompanies = config.autoAssignExcludeCompanies || [];
+
+  var candidates = getExistingJobRecords().filter(function(r) {
+    return _stringifyField(r.status) === 'New'
+      && priorities.indexOf(_stringifyField(r.priority)) !== -1
+      && (visas.length === 0 || visas.indexOf(_stringifyField(r.usVisaSponsorshipPotential)) !== -1)
+      && excludeCompanies.indexOf((_stringifyField(r.company) || '').toLowerCase().trim()) === -1;
+  });
+
+  if (!candidates.length) { ui.alert('No New jobs match the current auto-assign rules.'); return; }
+
+  var assigned = _pushJobsToAssignedSheet(candidates);
+  ui.alert(assigned > 0
+    ? assigned + ' job(s) assigned to the Assigned sheet.'
+    : 'All matching jobs are already in the Assigned sheet.');
 }
 
 
