@@ -581,28 +581,60 @@ function _tryApifyAccountsInOrder(config, runInputJson, progressCallback) {
   var props = PropertiesService.getScriptProperties();
   var accounts = config.apifyAccounts;
   var actorId = config.apifyActorId;
-  var startIndex = parseInt(props.getProperty('APIFY_NEXT_ACCOUNT_INDEX') || '0') % accounts.length;
 
-  var lastError;
-  for (var i = 0; i < accounts.length; i++) {
-    var idx = (startIndex + i) % accounts.length;
-    var token = accounts[idx];
-    try {
-      Logger.log('[Apify] Account ' + (idx + 1) + '/' + accounts.length);
-      _emitProgress(progressCallback, { status: 'Starting Apify (account ' + (idx + 1) + ')', processed: '' });
-      var runId = _startActorRun(actorId, runInputJson, token);
-      _emitProgress(progressCallback, { status: 'Waiting for Apify', processed: '' });
-      var runInfo = _waitForRunToFinish(runId, actorId, token, config);
-      if (!runInfo.defaultDatasetId) throw new Error('No datasetId returned from account ' + (idx + 1) + '.');
-      props.setProperty('APIFY_NEXT_ACCOUNT_INDEX', String((idx + 1) % accounts.length));
-      Logger.log('[Apify] Account ' + (idx + 1) + ' succeeded, run ' + runId);
-      return { token: token, taskId: actorId, runId: runId, datasetId: runInfo.defaultDatasetId };
-    } catch (err) {
-      Logger.log('[Apify] Account ' + (idx + 1) + ' failed: ' + err);
-      lastError = err;
+  // Always start from the last known working account.
+  var preferredIdx = parseInt(props.getProperty('APIFY_LAST_WORKING_INDEX') || '0') % accounts.length;
+  var token = accounts[preferredIdx];
+
+  Logger.log('[Apify] Account ' + (preferredIdx + 1) + '/' + accounts.length + ' (preferred)');
+  _emitProgress(progressCallback, { status: 'Starting Apify (account ' + (preferredIdx + 1) + ')', processed: '' });
+
+  try {
+    var runId = _startActorRun(actorId, runInputJson, token);
+    _emitProgress(progressCallback, { status: 'Waiting for Apify', processed: '' });
+    var runInfo = _waitForRunToFinish(runId, actorId, token, config);
+    if (!runInfo.defaultDatasetId) throw new Error('No datasetId returned from account ' + (preferredIdx + 1) + '.');
+    // Confirmed working — persist and reset rotation counter.
+    props.setProperty('APIFY_LAST_WORKING_INDEX', String(preferredIdx));
+    props.deleteProperty('APIFY_ROTATION_ATTEMPTS');
+    Logger.log('[Apify] Account ' + (preferredIdx + 1) + ' succeeded, run ' + runId);
+    return { token: token, taskId: actorId, runId: runId, datasetId: runInfo.defaultDatasetId };
+  } catch (err) {
+    Logger.log('[Apify] Account ' + (preferredIdx + 1) + ' failed: ' + err);
+
+    if (accounts.length <= 1) {
+      throw new Error('Only one Apify account configured and it failed: ' + err.message);
     }
+
+    // Guard against an infinite rotation loop — stop after trying every account once.
+    var rotationAttempts = parseInt(props.getProperty('APIFY_ROTATION_ATTEMPTS') || '0');
+    if (rotationAttempts >= accounts.length - 1) {
+      props.deleteProperty('APIFY_ROTATION_ATTEMPTS');
+      throw new Error('All ' + accounts.length + ' Apify accounts failed after full rotation. Last error: ' + err.message);
+    }
+
+    // Rotate to the next account, save it as preferred, then fire a fresh one-shot
+    // trigger rather than continuing here — gives the retry a clean 6-min time budget.
+    var nextIdx = (preferredIdx + 1) % accounts.length;
+    props.setProperty('APIFY_LAST_WORKING_INDEX', String(nextIdx));
+    props.setProperty('APIFY_ROTATION_ATTEMPTS', String(rotationAttempts + 1));
+    Logger.log('[Apify] Rotating to account ' + (nextIdx + 1) + '/' + accounts.length +
+      ' (attempt ' + (rotationAttempts + 1) + '/' + (accounts.length - 1) + '). Scheduling fresh retry...');
+    _scheduleApifyRotationRetry();
+
+    throw new Error(
+      '[Apify] Account ' + (preferredIdx + 1) + ' failed. Rotated to account ' + (nextIdx + 1) +
+      ' — retry scheduled in ~60 s.'
+    );
   }
-  throw new Error('All ' + accounts.length + ' Apify account(s) failed. Last error: ' + (lastError ? lastError.message : 'unknown'));
+}
+
+function _scheduleApifyRotationRetry() {
+  // Remove any stacked rotation retry triggers before creating a new one.
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'runApifyRotationRetry') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('runApifyRotationRetry').timeBased().after(60 * 1000).create();
 }
 
 function _buildApifyRunInput(config) {
@@ -615,8 +647,11 @@ function _buildApifyRunInput(config) {
     var lastRunIso = PropertiesService.getScriptProperties().getProperty('LAST_SUCCESSFUL_RUN_AT');
     if (lastRunIso) {
       var elapsed = Math.floor((Date.now() - new Date(lastRunIso).getTime()) / 1000);
+      var intervalSec = config.runIntervalHours * 3600;
       var maxSec = config.apifyMaxLookbackHours * 3600;
-      fTpr = Math.min(Math.max(elapsed, 3600), maxSec);
+      // Floor at the run interval so a recent manual run or rotation retry never
+      // shrinks the lookback window below what the schedule requires.
+      fTpr = Math.min(Math.max(elapsed, intervalSec), maxSec);
     } else {
       fTpr = 72 * 3600;
     }

@@ -5,15 +5,14 @@ var DEDUP_ARCHIVE_SHEET_NAME = 'Dedup_Archive';
 var RAW_DATA_SHEET_NAME = 'Raw_Data';
 var JOB_PRIORITY_HEADER_ROW = 6;
 var JOB_PRIORITY_DATA_START_ROW = 7;
-var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Failed', 'Flagged'];
+var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Flagged'];
 var JOB_PRIORITY_STATUS_SORT_ORDER = {
   Networking: 0,
-  New: 1,
-  Filled: 2,
-  Submitted: 3,
-  Skip: 4,
-  Failed: 5,
-  Flagged: 6
+  Filled: 1,
+  Flagged: 2,
+  New: 3,
+  Submitted: 4,
+  Skip: 5
 };
 var JOB_PRIORITY_OWNER_OPTIONS = ['Me', 'Assignee'];
 var ACTION_OPTIONS = ['Fill & Submit', 'Fill Only'];
@@ -598,7 +597,7 @@ function replaceAllJobs(rows, opts) {
   // behind stale filter values. The filter toggle stays; only per-column criteria clear.
   var filter = sheet.getFilter();
   if (filter) {
-    for (var col = 1; col <= JOB_PRIORITY_VISIBLE_COLUMNS.length; col++) {
+    for (var col = 1; col <= JOB_PRIORITY_COLUMNS.length; col++) {
       try { filter.removeColumnFilterCriteria(col); } catch (e) {}
     }
   }
@@ -715,8 +714,10 @@ function pruneExpiredJobRows(days) {
   var prunedCount = 0;
 
   records.forEach(function(record) {
-    // Always keep submitted jobs and active assignee work.
-    if (record.status === 'Submitted' || _stringifyField(record.owner) === 'Assignee') {
+    // Always keep: active outreach, last-mile items, and assignee work — never silently prune these.
+    var protectedStatus = record.status === 'Submitted' || record.status === 'Networking' ||
+                          record.status === 'Flagged';
+    if (protectedStatus || _stringifyField(record.owner) === 'Assignee') {
       keepRecords.push(record);
       return;
     }
@@ -737,7 +738,6 @@ function pruneExpiredJobRows(days) {
 
   if (prunedCount > 0) {
     replaceAllJobs(keepRecords);
-    sortAndRankJobs();
   }
 
   return {
@@ -934,20 +934,6 @@ function sortAndRankJobs() {
   var sortedRecords = getExistingJobRecords().sort(_compareJobsForDisplay);
   sortedRecords.forEach(function(record, i) { record.rank = i + 1; });
   replaceAllJobs(sortedRecords);
-
-  lastRow = sheet.getLastRow();
-
-  var rankValues = [];
-  for (var row = JOB_PRIORITY_DATA_START_ROW; row <= lastRow; row += 1) {
-    rankValues.push([row - JOB_PRIORITY_DATA_START_ROW + 1]);
-  }
-
-  sheet.getRange(
-    JOB_PRIORITY_DATA_START_ROW,
-    JOB_PRIORITY_COLUMN_INDEX.rank,
-    rankValues.length,
-    1
-  ).setValues(rankValues);
 }
 
 function updateRunSummary(summary) {
@@ -1347,11 +1333,10 @@ function _applyStatusFormattingRules(sheet) {
   var chipDefs = [
     { formula: '=' + statusCol + statusRow + '="New"',        bg: '#dbeafe', fg: '#1e40af' },
     { formula: '=' + statusCol + statusRow + '="Networking"', bg: '#fef9c3', fg: '#713f12' },
-    { formula: '=' + statusCol + statusRow + '="Filled"',     bg: '#fed7aa', fg: '#9a3412' },
+    { formula: '=' + statusCol + statusRow + '="Filled"',     bg: '#bfdbfe', fg: '#1e3a8a' },
+    { formula: '=' + statusCol + statusRow + '="Flagged"',    bg: '#fde68a', fg: '#92400e' },
     { formula: '=' + statusCol + statusRow + '="Submitted"',  bg: '#bbf7d0', fg: '#14532d' },
-    { formula: '=' + statusCol + statusRow + '="Skip"',       bg: '#e5e7eb', fg: '#374151' },
-    { formula: '=' + statusCol + statusRow + '="Failed"',     bg: '#fecaca', fg: '#991b1b' },
-    { formula: '=' + statusCol + statusRow + '="Flagged"',    bg: '#fde68a', fg: '#92400e' }
+    { formula: '=' + statusCol + statusRow + '="Skip"',       bg: '#e5e7eb', fg: '#374151' }
   ];
 
   var managedFormulas = [rowDimFormula, oldFormula].concat(chipDefs.map(function(c) { return c.formula; }));
@@ -1405,7 +1390,7 @@ function _applyStatusFormattingRules(sheet) {
 
 function _toSheetRow(job) {
   return [
-    '',
+    job.rank || '',
     job.priority || '',
     job.score === '' ? '' : Number(job.score),
     job.usVisaSponsorshipPotential || '',

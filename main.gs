@@ -2,6 +2,7 @@ var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
 var ACTIVE_RUN_STATE_PROPERTY_KEY = 'ACTIVE_JOB_IMPORT_RUN_STATE';
 var RESUME_TRIGGER_HANDLER = 'resumeJobImportAndScoring';
+var APIFY_ROTATION_RETRY_HANDLER = 'runApifyRotationRetry';
 var BACKUP_RESUME_TRIGGER_DELAY_MS = 7 * 60 * 1000;
 
 /**
@@ -137,14 +138,21 @@ function _handleJobPriorityOwnerEdit(sheet, row, newValue, oldValue) {
 }
 
 // Status column edited on Job_Priority: mirror down to her row when she owns it.
+// Special case: Skip = owner decided this job is dead — remove from Assigned unconditionally.
 function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
-  var owner = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.owner).getValue());
-  if (owner !== 'Assignee') return;
+  var nv = _stringifyField(newValue);
   var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
   var assignedSheet = _getAssignedSheet();
   if (!assignedSheet || !jobId) return;
+
+  if (nv === 'Skip') {
+    _removeFromAssignedSheet(assignedSheet, jobId);
+    return;
+  }
+
+  var owner = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.owner).getValue());
+  if (owner !== 'Assignee') return;
   var arow = _getAssignedJobIdIndex(assignedSheet)[jobId];
-  var nv = _stringifyField(newValue);
   if (arow && ASSIGNED_STATUS_OPTIONS.indexOf(nv) !== -1) {
     assignedSheet.getRange(arow, ASSIGNED_COLUMN_INDEX.status).setValue(nv);
   }
@@ -241,6 +249,16 @@ function resumeJobImportAndScoring() {
     return _runJobReevaluationInternal();
   }
   return _runJobImportAndScoringInternal();
+}
+
+// Fired by _scheduleApifyRotationRetry after account rotation. Bypasses quiet hours
+// (this is a continuation of a run that already started, not a fresh scheduled check).
+function runApifyRotationRetry() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === APIFY_ROTATION_RETRY_HANDLER) ScriptApp.deleteTrigger(t);
+  });
+  updateRunSummary({ status: 'Retrying with rotated Apify account...' });
+  _runJobImportAndScoringInternal();
 }
 
 function pruneOldDataPrompt() {
@@ -544,7 +562,8 @@ function createHourlyTrigger() {
 
 function removeHourlyTriggers() {
   ScriptApp.getProjectTriggers().forEach(function(trigger) {
-    if (trigger.getHandlerFunction() === 'runJobImportAndScoring' || trigger.getHandlerFunction() === RESUME_TRIGGER_HANDLER) {
+    var fn = trigger.getHandlerFunction();
+    if (fn === 'runJobImportAndScoring' || fn === RESUME_TRIGGER_HANDLER || fn === APIFY_ROTATION_RETRY_HANDLER) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
