@@ -1,5 +1,6 @@
 var SCORING_CACHE_STATE_KEY = 'GEMINI_SCORING_CACHE_STATE';
 var SCORING_CACHE_TTL_SECONDS = 18000;
+var APIFY_ACTOR_ID = 'cheap_scraper/linkedin-job-scraper';
 
 function loadRuntimeConfig() {
   var settings = getSettingsMap();
@@ -13,7 +14,7 @@ function loadRuntimeConfig() {
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
-    promptVersion: 'v8',
+    promptVersion: 'v9',
     targetProfile: String(
       settings.TARGET_PROFILE ||
       _defaultTargetProfile()
@@ -28,15 +29,30 @@ function loadRuntimeConfig() {
     executionSoftLimitMs: 300000,
     executionYieldBufferMs: 90000,
     executionDeadlineMs: Date.now() + 300000,
-    apifyToken: String(settings.APIFY_TOKEN || properties.getProperty('APIFY_TOKEN') || '').trim(),
-    apifyTaskIds: _splitCsv(settings.APIFY_TASK_IDS || properties.getProperty('APIFY_TASK_IDS')),
+    apifyActorId: APIFY_ACTOR_ID,
+    apifyAccounts: (function() {
+      var raw = String(settings.APIFY_ACCOUNTS || '').trim();
+      if (!raw) return [];
+      try {
+        return JSON.parse(raw).filter(function(a) { return typeof a === 'string' && a.trim(); });
+      } catch (e) {
+        throw new Error('APIFY_ACCOUNTS is not valid JSON: ' + e.message);
+      }
+    })(),
+    apifyRunInput: String(settings.APIFY_RUN_INPUT || '').trim() || null,
+    apifyLookbackHours: Number(settings.APIFY_LOOKBACK_HOURS) || 0,
+    apifyMaxLookbackHours: Number(settings.APIFY_MAX_LOOKBACK_HOURS) || 168,
     vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
     geminiApiKey: properties.getProperty('GEMINI_API_KEY'),
     openAiApiKey: properties.getProperty('OPENAI_API_KEY'),
-    autoAssignPriorities: _splitCsv(settings.AUTO_ASSIGN_PRIORITIES || 'P01,P02,P03'),
-    autoAssignVisa: _splitCsv(settings.AUTO_ASSIGN_VISA || 'Likely (90%),Possible (70%)'),
-    autoAssignExcludeCompanies: _splitCsv(settings.AUTO_ASSIGN_EXCLUDE_COMPANIES || '').map(function(s) { return s.toLowerCase(); }).filter(Boolean)
+    autoAssignPriorities: _splitCsv(settings.AUTO_ASSIGN_PRIORITIES || 'P04,P05'),
+    reservePriorities: _splitCsv(settings.AUTO_RESERVE_PRIORITIES || 'P01,P02,P03'),
+    reservedCompanies: _splitCsv(settings.RESERVED_COMPANIES || 'amazon,amazon web services (aws),amazon music,microsoft,microsoft ai,google,google deepmind,meta,apple,nvidia,nvidia ai,jpmorganchase,capital one,paypal,visa,mastercard,stripe,plaid,ramp,block,robinhood,coinbase,affirm,chime,databricks,snowflake,datadog,cloudflare,okta,servicenow,openai,anthropic,forter,socure,prove,sentilink,american express,bank of america,citi,wells fargo,goldman sachs,morgan stanley,bny,ubs,hsbc,intuit,adobe,airbnb,uber,salesforce,cisco,ebay,blackrock').map(function(s) { return s.toLowerCase(); }).filter(Boolean),
+    autoAssignVisa: _splitCsv(settings.AUTO_ASSIGN_VISA || 'Likely (90%),Possible (70%),Unclear (50%)'),
+    autoAssignExcludeCompanies: _splitCsv(settings.AUTO_ASSIGN_EXCLUDE_COMPANIES || 'hackajob,jobs via dice,trusting social,kompato ai').map(function(s) { return s.toLowerCase(); }).filter(Boolean),
+    autoAssignMinScore: parseInt(settings.AUTO_ASSIGN_MIN_SCORE, 10) || 0,
+    notifyAssigneeEmail: String(settings.NOTIFY_ASSIGNEE_EMAIL || '').trim()
   };
 }
 
@@ -44,8 +60,8 @@ function validateRuntimeConfig(config) {
   var options = arguments[1] || {};
   var requireApify = options.requireApify !== false;
 
-  if (requireApify && !config.apifyToken) {
-    throw new Error('Missing APIFY_TOKEN in the Settings sheet or Script Properties.');
+  if (requireApify && (!config.apifyAccounts || !config.apifyAccounts.length)) {
+    throw new Error('APIFY_ACCOUNTS is missing or empty in the Settings sheet.');
   }
 
   if (config.geminiApiRoute !== 'developer' && config.geminiApiRoute !== 'vertex') {
@@ -60,8 +76,8 @@ function validateRuntimeConfig(config) {
     throw new Error('VERTEX_PROJECT_ID is required in the Settings sheet for vertex route.');
   }
 
-  if (requireApify && (!config.activeRunState || !config.activeRunState.sources || !config.activeRunState.sources.length) && !config.apifyTaskIds.length) {
-    throw new Error('APIFY_TASK_IDS is required in the Settings sheet.');
+  if (requireApify && (!config.activeRunState || !config.activeRunState.sources || !config.activeRunState.sources.length) && !config.apifyAccounts.length) {
+    throw new Error('APIFY_ACCOUNTS is required in the Settings sheet.');
   }
 }
 
@@ -386,6 +402,10 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
       job.why = r.why;
       job.titleLevel = r.titleLevel;
       job.jdImpliedLevel = r.jdImpliedLevel;
+      job.levelNormalized = r.levelNormalized;
+      job.requiresPeopleMgmt = r.requiresPeopleMgmt;
+      job.requiredYoePm = r.requiredYoePm;
+      job.requiredYoeTotal = r.requiredYoeTotal;
       job.scoredAt = new Date();
       rows.push(job);
       scoredJobsCount += 1;
@@ -410,6 +430,10 @@ function _runSingleStageScoringLoop(jobs, config, progressCallback, totalJobsCou
           job.why = scoreResult.why;
           job.titleLevel = scoreResult.titleLevel;
           job.jdImpliedLevel = scoreResult.jdImpliedLevel;
+          job.levelNormalized = scoreResult.levelNormalized;
+          job.requiresPeopleMgmt = scoreResult.requiresPeopleMgmt;
+          job.requiredYoePm = scoreResult.requiredYoePm;
+          job.requiredYoeTotal = scoreResult.requiredYoeTotal;
           job.scoredAt = new Date();
           job.scoringFingerprint = job.scoringFingerprint || _buildScoringFingerprint(job, config);
           if (job.scoringFingerprint) {
@@ -547,33 +571,59 @@ function _runTasksAndFetchItems(config, progressCallback) {
 }
 
 function _startTaskSources(config, progressCallback) {
-  var sources = [];
+  var runInputJson = _buildApifyRunInput(config);
+  var source = _tryApifyAccountsInOrder(config, runInputJson, progressCallback);
+  PropertiesService.getScriptProperties().setProperty('LAST_SUCCESSFUL_RUN_AT', new Date().toISOString());
+  return [source];
+}
 
-  config.apifyTaskIds.forEach(function(taskId) {
-    _emitProgress(progressCallback, {
-      status: 'Starting Apify task',
-      processed: ''
-    });
-    var runId = _startTaskRun(taskId, config);
-    _emitProgress(progressCallback, {
-      status: 'Waiting for Apify',
-      processed: ''
-    });
-    var runInfo = _waitForRunToFinish(runId, taskId, config);
-    var datasetId = runInfo.defaultDatasetId;
+function _tryApifyAccountsInOrder(config, runInputJson, progressCallback) {
+  var props = PropertiesService.getScriptProperties();
+  var accounts = config.apifyAccounts;
+  var actorId = config.apifyActorId;
+  var startIndex = parseInt(props.getProperty('APIFY_NEXT_ACCOUNT_INDEX') || '0') % accounts.length;
 
-    if (!datasetId) {
-      throw new Error('Task ' + taskId + ' run ' + runId + ' finished without defaultDatasetId.');
+  var lastError;
+  for (var i = 0; i < accounts.length; i++) {
+    var idx = (startIndex + i) % accounts.length;
+    var token = accounts[idx];
+    try {
+      Logger.log('[Apify] Account ' + (idx + 1) + '/' + accounts.length);
+      _emitProgress(progressCallback, { status: 'Starting Apify (account ' + (idx + 1) + ')', processed: '' });
+      var runId = _startActorRun(actorId, runInputJson, token);
+      _emitProgress(progressCallback, { status: 'Waiting for Apify', processed: '' });
+      var runInfo = _waitForRunToFinish(runId, actorId, token, config);
+      if (!runInfo.defaultDatasetId) throw new Error('No datasetId returned from account ' + (idx + 1) + '.');
+      props.setProperty('APIFY_NEXT_ACCOUNT_INDEX', String((idx + 1) % accounts.length));
+      Logger.log('[Apify] Account ' + (idx + 1) + ' succeeded, run ' + runId);
+      return { token: token, taskId: actorId, runId: runId, datasetId: runInfo.defaultDatasetId };
+    } catch (err) {
+      Logger.log('[Apify] Account ' + (idx + 1) + ' failed: ' + err);
+      lastError = err;
     }
+  }
+  throw new Error('All ' + accounts.length + ' Apify account(s) failed. Last error: ' + (lastError ? lastError.message : 'unknown'));
+}
 
-    sources.push({
-      taskId: taskId,
-      runId: runId,
-      datasetId: datasetId
-    });
-  });
+function _buildApifyRunInput(config) {
+  if (!config.apifyRunInput) return null;
 
-  return sources;
+  var fTpr;
+  if (config.apifyLookbackHours > 0) {
+    fTpr = config.apifyLookbackHours * 3600;
+  } else {
+    var lastRunIso = PropertiesService.getScriptProperties().getProperty('LAST_SUCCESSFUL_RUN_AT');
+    if (lastRunIso) {
+      var elapsed = Math.floor((Date.now() - new Date(lastRunIso).getTime()) / 1000);
+      var maxSec = config.apifyMaxLookbackHours * 3600;
+      fTpr = Math.min(Math.max(elapsed, 3600), maxSec);
+    } else {
+      fTpr = 72 * 3600;
+    }
+  }
+
+  Logger.log('[Apify] f_tpr = r' + fTpr + 's (' + Math.round(fTpr / 3600) + 'h)');
+  return config.apifyRunInput.replace(/\{f_tpr\}/gi, 'r' + String(fTpr));
 }
 
 function _fetchItemsForSources(sources, config, progressCallback) {
@@ -583,10 +633,11 @@ function _fetchItemsForSources(sources, config, progressCallback) {
       status: 'Fetching jobs',
       processed: ''
     });
+    var token = source.token || config.apifyAccounts[0] || '';
     var responseItems = _fetchDatasetItemsById(
       source.datasetId,
-      config,
-      'task ' + source.taskId + ' run ' + source.runId
+      'task ' + source.taskId + ' run ' + source.runId,
+      token
     );
     responseItems.forEach(function(item) {
       allItems.push({
@@ -712,28 +763,34 @@ function _shouldYieldExecution(config) {
   return (Date.now() + bufferMs) >= deadlineMs;
 }
 
-function _startTaskRun(taskId, config) {
+function _startActorRun(actorId, runInputJson, token) {
+  var options = { method: 'post', muteHttpExceptions: true };
+  if (runInputJson) {
+    options.contentType = 'application/json';
+    options.payload = runInputJson;
+  }
   var response = UrlFetchApp.fetch(
-    'https://api.apify.com/v2/actor-tasks/' + encodeURIComponent(taskId) + '/runs?token=' + encodeURIComponent(config.apifyToken),
-    {
-      method: 'post',
-      muteHttpExceptions: true
-    }
+    'https://api.apify.com/v2/acts/' + encodeURIComponent(actorId) + '/runs?token=' + encodeURIComponent(token),
+    options
   );
-  var runInfo = _parseApifyObjectResponse(response, 'task run start ' + taskId);
+  var runInfo = _parseApifyObjectResponse(response, 'actor run start ' + actorId);
 
   if (!runInfo.id) {
-    throw new Error('Task ' + taskId + ' did not return a run id.');
+    throw new Error('Actor ' + actorId + ' did not return a run id.');
   }
 
   return runInfo.id;
 }
 
-function _waitForRunToFinish(runId, sourceLabel, config) {
+function _waitForRunToFinish(runId, sourceLabel, token, config) {
   var deadline = Date.now() + (config.apifyRunWaitSeconds * 1000);
 
   while (Date.now() <= deadline) {
-    var runInfo = _getRunInfo(runId, config);
+    if (_isCancelRequested()) {
+      _clearCancelRequest();
+      throw new Error('Apify wait cancelled by user.');
+    }
+    var runInfo = _getRunInfo(runId, token);
     var status = String(runInfo.status || '');
 
     if (_isRunStatusSuccess(status)) {
@@ -756,18 +813,18 @@ function _waitForRunToFinish(runId, sourceLabel, config) {
   );
 }
 
-function _getRunInfo(runId, config) {
+function _getRunInfo(runId, token) {
   var response = UrlFetchApp.fetch(
-    'https://api.apify.com/v2/actor-runs/' + encodeURIComponent(runId) + '?token=' + encodeURIComponent(config.apifyToken),
+    'https://api.apify.com/v2/actor-runs/' + encodeURIComponent(runId) + '?token=' + encodeURIComponent(token),
     { muteHttpExceptions: true }
   );
 
   return _parseApifyObjectResponse(response, 'run ' + runId);
 }
 
-function _resurrectApifyRun(runId, config) {
+function _resurrectApifyRun(runId, token) {
   var response = UrlFetchApp.fetch(
-    'https://api.apify.com/v2/actor-runs/' + encodeURIComponent(runId) + '/resurrect?token=' + encodeURIComponent(config.apifyToken),
+    'https://api.apify.com/v2/actor-runs/' + encodeURIComponent(runId) + '/resurrect?token=' + encodeURIComponent(token),
     {
       method: 'post',
       muteHttpExceptions: true
@@ -777,13 +834,34 @@ function _resurrectApifyRun(runId, config) {
   return _parseApifyObjectResponse(response, 'resurrect run ' + runId);
 }
 
-function _fetchDatasetItemsById(datasetId, config, sourceLabel) {
+function _fetchDatasetItemsById(datasetId, sourceLabel, token) {
   var response = UrlFetchApp.fetch(
-    'https://api.apify.com/v2/datasets/' + encodeURIComponent(datasetId) + '/items?clean=true&format=json&token=' + encodeURIComponent(config.apifyToken),
+    'https://api.apify.com/v2/datasets/' + encodeURIComponent(datasetId) + '/items?clean=true&format=json&token=' + encodeURIComponent(token),
     { muteHttpExceptions: true }
   );
 
   return _parseApifyArrayResponse(response, sourceLabel);
+}
+
+function _getDatasetMetadata(datasetId, token) {
+  var url = 'https://api.apify.com/v2/datasets/' + encodeURIComponent(datasetId) +
+            (token ? '?token=' + encodeURIComponent(token) : '');
+  var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  return _parseApifyObjectResponse(response, 'dataset ' + datasetId);
+}
+
+function _listActorRuns(actorId, token, limit) {
+  var url = 'https://api.apify.com/v2/acts/' + encodeURIComponent(actorId) +
+            '/runs?status=SUCCEEDED&sortBy=startedAt&desc=1&limit=' + limit +
+            (token ? '&token=' + encodeURIComponent(token) : '');
+  var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  var code = response.getResponseCode();
+  if (code >= 300) return [];
+  try {
+    var parsed = JSON.parse(response.getContentText());
+    var data = parsed.data || parsed;
+    return Array.isArray(data.items) ? data.items : [];
+  } catch (e) { return []; }
 }
 
 function _parseApifyArrayResponse(response, sourceLabel) {
@@ -1308,8 +1386,18 @@ function _normalizeScorePayload(parsedContent) {
     summary: _truncate(_stringifyField(parsedContent.summary), 200),
     why: _truncate(_stringifyField(parsedContent.why), 300),
     titleLevel: _normalizeJobLevel(parsedContent.title_level),
-    jdImpliedLevel: _normalizeJobLevel(parsedContent.jd_implied_level)
+    jdImpliedLevel: _normalizeJobLevel(parsedContent.jd_implied_level),
+    levelNormalized: _normalizeJobLevel(parsedContent.level_normalized),
+    requiresPeopleMgmt: parsedContent.requires_people_mgmt === true || String(parsedContent.requires_people_mgmt).toLowerCase() === 'true',
+    requiredYoePm: _normalizeYoe(parsedContent.required_yoe_pm),
+    requiredYoeTotal: _normalizeYoe(parsedContent.required_yoe_total)
   };
+}
+
+function _normalizeYoe(value) {
+  var n = parseInt(value, 10);
+  if (isNaN(n) || n < 0) return '';
+  return n;
 }
 
 function _buildScoringFingerprint(job, config) {
@@ -1364,10 +1452,29 @@ function _getScoreResponseSchema() {
       jd_implied_level: {
         type: 'string',
         enum: ['APM', 'PM', 'Senior-PM', 'Staff-PM', 'Principal-PM', 'Manager', 'Senior-Manager', 'Group-PM', 'Director', 'Senior-Director', 'VP', 'Head-of-Product', 'Founding-PM', 'Unknown'],
-        description: 'Actual seniority implied by the JD body — ignore the job title for this field.'
+        description: 'IC scope/seniority implied by the JD body only — ignore the job title; do NOT encode people-management here.'
+      },
+      level_normalized: {
+        type: 'string',
+        enum: ['APM', 'PM', 'Senior-PM', 'Staff-PM', 'Principal-PM', 'Manager', 'Senior-Manager', 'Group-PM', 'Director', 'Senior-Director', 'VP', 'Head-of-Product', 'Founding-PM', 'Unknown'],
+        description: 'Real market level after reconciling title_level and jd_implied_level THROUGH the company leveling regime (deflate big-tech / inflate startup / bank-VP band).'
+      },
+      requires_people_mgmt: {
+        type: 'boolean',
+        description: 'True only if the JD requires managing/leading/growing a team of PMs or direct reports (drives the hard veto). False for IC work.'
+      },
+      required_yoe_pm: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Minimum years of product-management-specific experience the JD requires; 0 if unspecified.'
+      },
+      required_yoe_total: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Minimum years of overall/general experience the JD requires; 0 if unspecified.'
       }
     },
-    required: ['score', 'priority', 'us_visa_sponsorship_potential', 'us_visa_reason', 'summary', 'why', 'title_level', 'jd_implied_level']
+    required: ['score', 'priority', 'us_visa_sponsorship_potential', 'us_visa_reason', 'summary', 'why', 'title_level', 'jd_implied_level', 'level_normalized', 'requires_people_mgmt', 'required_yoe_pm', 'required_yoe_total']
   };
 }
 
@@ -1555,10 +1662,11 @@ function _buildCandidateJob(job, existing) {
     return candidate;
   }
 
-  preservedJobId = _extractLinkedInJobId(candidate.jobId) ||
-    _extractLinkedInJobId(existing.jobId) ||
-    _stringifyField(candidate.jobId) ||
-    _stringifyField(existing.jobId);
+  // Stable PK: existing sheet ID is canonical; incoming Apify ID is only a fallback for new rows.
+  preservedJobId = _extractLinkedInJobId(existing.jobId) ||
+    _extractLinkedInJobId(candidate.jobId) ||
+    _stringifyField(existing.jobId) ||
+    _stringifyField(candidate.jobId);
 
   candidate.existingRowNumber = existing.rowNumber;
   candidate.jobId = preservedJobId || '';
@@ -1592,7 +1700,16 @@ function _buildCandidateJob(job, existing) {
   candidate.why = existing.why || '';
   candidate.titleLevel = existing.titleLevel || '';
   candidate.jdImpliedLevel = existing.jdImpliedLevel || '';
+  candidate.levelNormalized = existing.levelNormalized || '';
+  candidate.requiresPeopleMgmt = existing.requiresPeopleMgmt;
+  candidate.requiredYoePm = existing.requiredYoePm;
+  candidate.requiredYoeTotal = existing.requiredYoeTotal;
   candidate.scoringFingerprint = existing.scoringFingerprint || '';
+  // User-managed fields — never overwrite with Apify data; always carry forward from the sheet
+  candidate.owner = existing.owner || '';
+  candidate.action = existing.action || '';
+  candidate.referralContact = existing.referralContact || '';
+  candidate.mergedJobIds = existing.mergedJobIds || '';
 
   return candidate;
 }

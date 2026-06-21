@@ -53,32 +53,43 @@ function _createProgressTracker(initialState) {
 }
 
 function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Jobs Pipeline')
-    .addItem('Run Now', 'runJobImportAndScoring')
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Jobs Pipeline')
+    .addItem('Run Now', 'runJobImportAndScoringNow')
     .addItem('Cancel Run', 'cancelRunPrompt')
-    .addSeparator()
-    .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
-    .addItem('Rerun Raw Data', 'rerunAllFromRawData')
     .addSeparator()
     .addItem('Assign Selected Rows', 'assignSelectedRowsPrompt')
     .addItem('Reassign by Rules', 'reassignJobsPrompt')
     .addSeparator()
-    .addItem('Import Apify Run ID...', 'importApifyRunByIdPrompt')
-    .addItem('Retry Apify Run ID...', 'resurrectApifyRunByIdPrompt')
-    .addSeparator()
-    .addItem('Create Run Trigger', 'createRunTrigger')
-    .addItem('Remove Run Triggers', 'removeHourlyTriggers')
-    .addSeparator()
-    .addItem('Prune Raw Data...', 'pruneRawDataPrompt')
-    .addSeparator()
-    .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
-    .addItem('Validate Config', 'validateConfiguration')
+    .addSubMenu(ui.createMenu('Scoring')
+      .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
+      .addItem('Rerun Raw Data', 'rerunAllFromRawData'))
+    .addSubMenu(ui.createMenu('Apify Tools')
+      .addItem('Import Run ID...', 'importApifyRunByIdPrompt')
+      .addItem('Import Dataset ID...', 'importApifyDatasetByIdPrompt')
+      .addItem('Import Last N Runs...', 'importLastNActorRunsPrompt'))
+    .addSubMenu(ui.createMenu('Triggers')
+      .addItem('Create Run Trigger', 'createRunTrigger')
+      .addItem('Remove Run Triggers', 'removeHourlyTriggers'))
+    .addItem('Sort & Rank Sheets', 'sortBothSheetsNow')
+    .addSubMenu(ui.createMenu('Maintenance')
+      .addItem('Prune Old Data...', 'pruneOldDataPrompt')
+      .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
+      .addItem('Restore Job Links', 'restoreJobLinks')
+      .addItem('Validate Config', 'validateConfiguration'))
     .addToUi();
 }
 
 function onInstall() {
   onOpen();
+}
+
+function sortBothSheetsNow() {
+  ensureWorkbookReadyForRuntime();
+  sortAndRankJobs();
+  var assignedSheet = _getAssignedSheet();
+  if (assignedSheet) _sortAssignedSheet(assignedSheet);
+  SpreadsheetApp.getUi().alert('Sort & Rank complete.');
 }
 
 function onEdit(e) {
@@ -90,51 +101,107 @@ function onEdit(e) {
   var col = e.range.getColumn();
 
   if (sheetName === JOB_PRIORITY_SHEET_NAME) {
-    if (row < JOB_PRIORITY_DATA_START_ROW || col !== JOB_PRIORITY_COLUMN_INDEX.status) return;
-    try { _handleJobPriorityStatusEdit(sheet, row, e.value, e.oldValue); } catch (err) { Logger.log(err); }
+    if (row < JOB_PRIORITY_DATA_START_ROW) return;
+    try {
+      if (col === JOB_PRIORITY_COLUMN_INDEX.owner) {
+        _handleJobPriorityOwnerEdit(sheet, row, e.value, e.oldValue);
+      } else if (col === JOB_PRIORITY_COLUMN_INDEX.status) {
+        _handleJobPriorityStatusEdit(sheet, row, e.value, e.oldValue);
+      } else if (col === JOB_PRIORITY_COLUMN_INDEX.action) {
+        _handleJobPriorityActionEdit(sheet, row);
+      }
+    } catch (err) { Logger.log(err); }
   } else if (sheetName === ASSIGNED_SHEET_NAME) {
     if (row < ASSIGNED_DATA_START_ROW || col !== ASSIGNED_COLUMN_INDEX.status) return;
     try { _handleAssignedStatusEdit(sheet, row, e.value); } catch (err) { Logger.log(err); }
   }
 }
 
-function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
-  if (newValue === 'Assigned') {
+function _jobRecordFromJobPriorityRow(sheet, row) {
+  var values = sheet.getRange(row, 1, 1, JOB_PRIORITY_COLUMNS.length).getValues()[0];
+  var formulas = sheet.getRange(row, 1, 1, JOB_PRIORITY_COLUMNS.length).getFormulas()[0];
+  return _sheetRowToJobRecord(values, formulas, row, {});
+}
+
+// Owner column edited on Job_Priority: create or remove the assignee's mirror row.
+function _handleJobPriorityOwnerEdit(sheet, row, newValue, oldValue) {
+  var nv = _stringifyField(newValue);
+  if (nv === 'Assignee') {
+    var job = _jobRecordFromJobPriorityRow(sheet, row);
+    if (job) _pushJobsToAssignedSheet([job]); // resets to New, applies action default, re-sorts queue
+  } else if (_stringifyField(oldValue) === 'Assignee') {
     var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
-    var records = getExistingJobRecords();
-    var job = null;
-    for (var i = 0; i < records.length; i++) {
-      if (records[i].rowNumber === row) { job = records[i]; break; }
-    }
-    if (job) _pushJobsToAssignedSheet([job]);
-  } else if (oldValue === 'Assigned') {
-    var jobIdToRemove = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
     var assignedSheet = _getAssignedSheet();
-    if (assignedSheet && jobIdToRemove) _removeFromAssignedSheet(assignedSheet, jobIdToRemove);
+    if (assignedSheet && jobId) _removeFromAssignedSheet(assignedSheet, jobId);
   }
 }
 
+// Status column edited on Job_Priority: mirror down to her row when she owns it.
+function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
+  var owner = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.owner).getValue());
+  if (owner !== 'Assignee') return;
+  var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+  var assignedSheet = _getAssignedSheet();
+  if (!assignedSheet || !jobId) return;
+  var arow = _getAssignedJobIdIndex(assignedSheet)[jobId];
+  var nv = _stringifyField(newValue);
+  if (arow && ASSIGNED_STATUS_OPTIONS.indexOf(nv) !== -1) {
+    assignedSheet.getRange(arow, ASSIGNED_COLUMN_INDEX.status).setValue(nv);
+  }
+}
+
+// Action column edited on Job_Priority: mirror down to her row.
+function _handleJobPriorityActionEdit(sheet, row) {
+  var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+  var action = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.action).getValue());
+  var assignedSheet = _getAssignedSheet();
+  if (!assignedSheet || !jobId) return;
+  var arow = _getAssignedJobIdIndex(assignedSheet)[jobId];
+  if (arow) assignedSheet.getRange(arow, ASSIGNED_COLUMN_INDEX.action).setValue(action);
+}
+
+// Status edited on the Assigned sheet: mirror up, handle bounce-backs and terminal cleanup.
 function _handleAssignedStatusEdit(sheet, row, newValue) {
   var jobId = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.job_id).getValue()).trim();
   if (!jobId) return;
 
-  var jpRowNum = _findJobPriorityRowByJobId(jobId);
+  var nv = _stringifyField(newValue);
+  var jpRow = _findJobPriorityRowByJobId(jobId);
   var jobSheet = _getJobPrioritySheet();
-  var now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+  var now = _formatNow();
+  var action = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.action).getValue());
 
-  if (newValue === 'Applied') {
-    if (jpRowNum) jobSheet.getRange(jpRowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Applied');
+  sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
+
+  if (nv === 'Submitted') {
+    if (jpRow) jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Submitted');
     sheet.getRange(row, ASSIGNED_COLUMN_INDEX.applied_at).setValue(now);
-    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
-  } else if (newValue === 'Failed') {
-    if (jpRowNum) jobSheet.getRange(jpRowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Skip');
-    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
-  } else if (newValue === 'Pending') {
-    if (jpRowNum) jobSheet.getRange(jpRowNum, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Assigned');
-    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.updated_at).setValue(now);
+  } else if (nv === 'Filled') {
+    if (action === 'Fill Only') {
+      // Bounce back to you to submit.
+      if (jpRow) {
+        jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Filled');
+        jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.owner).setValue('Me');
+        jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.status).setNote('↩ Filled by assignee — ready for you to submit');
+      }
+      _notifyOwnerBounceBack(jobId, 'filled and ready for you to submit', '');
+    } else if (jpRow) {
+      jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Filled');
+    }
+  } else if (nv === 'Flagged') {
+    var note = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.notes).getValue());
+    if (jpRow) {
+      jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.status).setValue('Flagged');
+      jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.owner).setValue('Me');
+      if (note) jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.referral_contact).setValue('⚑ ' + note);
+    }
+    _notifyOwnerBounceBack(jobId, 'flagged for your review', note);
+  } else if (nv === 'New') {
+    if (jpRow) jobSheet.getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.status).setValue('New');
   }
 }
 
+// Called by the time-based trigger — respects quiet hours.
 function runJobImportAndScoring() {
   var activeRunState = _loadActiveRunState();
 
@@ -149,6 +216,7 @@ function runJobImportAndScoring() {
     var quietEnd = _parseHourSetting(settings.QUIET_END_HOUR, 5);
     if (_isInQuietHours(quietStart, quietEnd)) {
       Logger.log('Skipping run: quiet hours active (' + quietStart + ':00 – ' + quietEnd + ':00 PT).');
+      updateRunSummary({ status: 'Skipped (quiet hours ' + quietStart + ':00–' + quietEnd + ':00)' });
       return;
     }
   }
@@ -156,33 +224,48 @@ function runJobImportAndScoring() {
   return _runJobImportAndScoringInternal();
 }
 
-function resumeJobImportAndScoring() {
+// Called by "Run Now" menu — bypasses quiet hours so the user always gets an immediate run.
+function runJobImportAndScoringNow() {
+  updateRunSummary({ status: 'Starting...' });
   var activeRunState = _loadActiveRunState();
   if (activeRunState && activeRunState.mode === 'reevaluate') {
     return _runJobReevaluationInternal();
   }
-
   return _runJobImportAndScoringInternal();
 }
 
-function pruneRawDataPrompt() {
-  var ui = SpreadsheetApp.getUi();
-  var response = ui.prompt('Prune Raw Data', 'Delete Raw_Data rows with a posted date older than how many days?\n(Leave blank for 30)', ui.ButtonSet.OK_CANCEL);
-
-  if (response.getSelectedButton() !== ui.Button.OK) {
-    return;
+function resumeJobImportAndScoring() {
+  var activeRunState = _loadActiveRunState();
+  if (!activeRunState) return; // Nothing to resume — don't start fresh
+  if (activeRunState.mode === 'reevaluate') {
+    return _runJobReevaluationInternal();
   }
+  return _runJobImportAndScoringInternal();
+}
+
+function pruneOldDataPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Prune Old Data', 'Delete rows older than how many days from Job_Priority, Raw_Data, and Assigned?\n(Leave blank for 90)', ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
 
   var input = String(response.getResponseText() || '').trim();
-  var days = input === '' ? 30 : parseInt(input, 10);
+  var days = input === '' ? 90 : parseInt(input, 10);
 
   if (isNaN(days) || days <= 0) {
     ui.alert('Invalid input. Please enter a positive number of days.');
     return;
   }
 
-  var deleted = pruneRawData(days);
-  ui.alert('Pruned ' + deleted + ' row' + (deleted === 1 ? '' : 's') + ' older than ' + days + ' days from Raw_Data.');
+  var jpDeleted = pruneExpiredJobRows(days);
+  var rawDeleted = pruneRawData(days);
+  var assignedDeleted = pruneAssignedRows(days);
+
+  ui.alert(
+    'Deleted ' + (jpDeleted.prunedCount || 0) + ' from Job_Priority, ' +
+    rawDeleted + ' from Raw_Data, ' +
+    assignedDeleted + ' from Assigned.\n(Submitted rows in Job_Priority and active/flagged rows in Assigned are never pruned.)'
+  );
 }
 
 function importApifyRunByIdPrompt() {
@@ -350,14 +433,14 @@ function _runPipelineInternal(activeRunState, options) {
       return result;
     }
 
-    sortAndRankJobs();
-
     try {
       tracker.update({ status: 'Deduplicating similar JDs' });
       deduplicateSimilarJdRows();
     } catch (dedupError) {
       Logger.log(dedupError);
     }
+
+    sortAndRankJobs();
 
     _markTrackedExecutionFinished(result.activeRunState, 'completed');
     _clearActiveRunState();
@@ -366,15 +449,8 @@ function _runPipelineInternal(activeRunState, options) {
     if (options.postProcess) {
       try {
         tracker.update({ status: 'Auto-assigning jobs' });
-        _autoAssignNewJobs(config);
+        _routeNewJobs(config);
       } catch (assignError) { Logger.log('Auto-assign error: ' + assignError); }
-
-      try {
-        tracker.update({ status: 'Pruning expired jobs' });
-        pruneExpiredJobRows();
-      } catch (pruneError) {
-        Logger.log(pruneError);
-      }
 
       result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
     }
@@ -488,7 +564,7 @@ function validateConfiguration() {
     'Model: ' + config.scoringModel + '\n' +
     'Parallel AI requests: ' + config.scoringParallelRequests + '\n' +
     'Notify email: ' + (config.notifyEmail || '(disabled)') + '\n' +
-    'Apify task count: ' + config.apifyTaskIds.length + '\n' +
+    'Apify accounts: ' + config.apifyAccounts.length + '\n' +
     'Apify wait seconds: ' + config.apifyRunWaitSeconds
   );
 }
@@ -514,6 +590,7 @@ function deduplicateSimilarJds() {
   ensureWorkbookReadyForRuntime();
 
   var result = deduplicateSimilarJdRows();
+  sortAndRankJobs();
   var message = result.removedRowCount
     ? (
       'Similar-JD deduplication completed.\n' +
@@ -531,6 +608,7 @@ function deduplicateExistingJobs() {
   ensureWorkbookReadyForRuntime();
 
   var result = deduplicateExistingJobRows();
+  sortAndRankJobs();
   var message = result.removedRowCount
     ? (
       'Deduplication completed.\n' +
@@ -805,7 +883,7 @@ function _markTrackedExecutionFinished(activeRunState, outcome) {
 
 function _isReevaluationEligibleStatus(status) {
   var normalized = _stringifyField(status) || 'New';
-  return normalized === 'New' || normalized === 'Assigned';
+  return normalized === 'New' || normalized === 'Networking';
 }
 
 function _hasScoringPayload(record) {
@@ -910,22 +988,34 @@ function _getJobsByJobIds(jobIds) {
   return jobs.sort(_compareJobsForDisplay);
 }
 
+function _findTokenForRunId(runId, config) {
+  var accounts = config.apifyAccounts;
+  for (var i = 0; i < accounts.length; i++) {
+    try {
+      var info = _getRunInfo(runId, accounts[i]);
+      if (info && info.id) return accounts[i];
+    } catch (e) { /* try next */ }
+  }
+  throw new Error('Run ' + runId + ' not found in any of your ' + accounts.length + ' Apify accounts.');
+}
+
 function _buildActiveRunStateFromApifyRunId(runId, shouldResurrect) {
   var config = loadRuntimeConfig();
   validateRuntimeConfig(config);
+  var token = _findTokenForRunId(runId, config);
   var runInfo;
   var sourceLabel;
 
   if (shouldResurrect) {
-    runInfo = _resurrectApifyRun(runId, config);
-    runInfo = _waitForRunToFinish(runId, 'run ' + runId, config);
+    runInfo = _resurrectApifyRun(runId, token);
+    runInfo = _waitForRunToFinish(runId, 'run ' + runId, token, config);
   } else {
-    runInfo = _getRunInfo(runId, config);
+    runInfo = _getRunInfo(runId, token);
     if (runInfo.status && !_isRunStatusSuccess(String(runInfo.status || ''))) {
       if (_isRunStatusFailure(String(runInfo.status || ''))) {
-        throw new Error('Run ' + runId + ' ended with status ' + runInfo.status + '. Use Retry Apify Run ID... if you want to rerun that Apify job.');
+        throw new Error('Run ' + runId + ' ended with status ' + runInfo.status + '. The run cannot be imported in this state.');
       }
-      runInfo = _waitForRunToFinish(runId, 'run ' + runId, config);
+      runInfo = _waitForRunToFinish(runId, 'run ' + runId, token, config);
     }
   }
 
@@ -942,7 +1032,8 @@ function _buildActiveRunStateFromApifyRunId(runId, shouldResurrect) {
       {
         taskId: sourceLabel,
         runId: runId,
-        datasetId: runInfo.defaultDatasetId
+        datasetId: runInfo.defaultDatasetId,
+        token: token
       }
     ],
     rawScrapedCount: 0,
@@ -1133,26 +1224,107 @@ function _sendEmailSafely(message) {
   }
 }
 
-function cancelRunPrompt() {
-  var ui = SpreadsheetApp.getUi();
-  PropertiesService.getScriptProperties().setProperty(CANCEL_REQUEST_KEY, 'true');
-  ui.alert('Cancellation requested. The run will stop after the current batch finishes (usually within a few seconds).');
+// Emailed during a pipeline run (authorized context) when new jobs land in the assignee's queue.
+function _notifyAssigneeOfNewJobs(config, count) {
+  if (!config || !config.notifyAssigneeEmail || !count) return;
+  _sendEmailSafely({
+    to: config.notifyAssigneeEmail,
+    subject: count + ' new job(s) in your queue',
+    body: count + ' new job(s) have been assigned to you in the Assigned sheet. Please review and apply.'
+  });
 }
 
-function _autoAssignNewJobs(config) {
-  if (!config) return;
-  var priorities = config.autoAssignPriorities || [];
-  var visas = config.autoAssignVisa || [];
-  var excludeCompanies = config.autoAssignExcludeCompanies || [];
-  if (!priorities.length) return;
-
-  var candidates = getExistingJobRecords().filter(function(r) {
-    return _stringifyField(r.status) === 'New'
-      && priorities.indexOf(_stringifyField(r.priority)) !== -1
-      && (visas.length === 0 || visas.indexOf(_stringifyField(r.usVisaSponsorshipPotential)) !== -1)
-      && excludeCompanies.indexOf((_stringifyField(r.company) || '').toLowerCase().trim()) === -1;
+// Best-effort owner alert on a bounce-back. Called from onEdit (a simple trigger), so MailApp may be
+// unauthorized and silently fail — the in-sheet cell note added by the caller is the reliable signal.
+function _notifyOwnerBounceBack(jobId, reason, note) {
+  var config;
+  try { config = loadRuntimeConfig(); } catch (e) { return; }
+  if (!config || !config.notifyEmail) return;
+  var body = 'Job ' + jobId + ' has been ' + reason + ' and is now in your lane.';
+  if (note) body += '\n\nNote from assignee: ' + note;
+  _sendEmailSafely({
+    to: config.notifyEmail,
+    subject: 'Job needs your attention: ' + reason,
+    body: body
   });
-  if (candidates.length) _pushJobsToAssignedSheet(candidates);
+}
+
+function cancelRunPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  _removeResumeTriggers();
+  _clearActiveRunState();
+  PropertiesService.getScriptProperties().setProperty(CANCEL_REQUEST_KEY, 'true');
+  updateRunSummary({ status: 'Cancelled' });
+  ui.alert('Run cancelled. All run state and continuation triggers have been cleared.');
+}
+
+// Routes blank-Owner New jobs into lanes. Sticky: never touches a row that already has an Owner.
+// Returns { assigned, reserved, skipped }.
+function _routeNewJobs(config) {
+  var counts = { assigned: 0, reserved: 0, skipped: 0 };
+  if (!config) return counts;
+
+  var reservePriorities = config.reservePriorities || [];
+  var assigneePriorities = config.autoAssignPriorities || [];
+  var reservedCompanies = config.reservedCompanies || [];
+  var excludeCompanies = config.autoAssignExcludeCompanies || [];
+  var visas = config.autoAssignVisa || [];
+  var minScore = config.autoAssignMinScore || 0;
+
+  var jobSheet = _getJobPrioritySheet();
+  if (!jobSheet) return counts;
+  var lastRow = jobSheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return counts;
+
+  var records = getExistingJobRecords();
+  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var ownerColVals = jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.owner, numRows, 1).getValues();
+  var statusColVals = jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, numRows, 1).getValues();
+  var actionColVals = jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.action, numRows, 1).getValues();
+  var assigneeJobs = [];
+
+  records.forEach(function(r) {
+    var idx = r.rowNumber - JOB_PRIORITY_DATA_START_ROW;
+    if (idx < 0 || idx >= numRows) return;
+    if (_stringifyField(ownerColVals[idx][0])) return;              // sticky: already owned
+    if (_stringifyField(statusColVals[idx][0] || 'New') !== 'New') return;
+
+    var priority = _stringifyField(r.priority);
+    var company = (_stringifyField(r.company) || '').toLowerCase().trim();
+
+    // Hard exclude → skip
+    if (excludeCompanies.indexOf(company) !== -1) {
+      ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
+    }
+    // Reserved company or top priority → my lane (networking)
+    if (reservedCompanies.indexOf(company) !== -1 || reservePriorities.indexOf(priority) !== -1) {
+      ownerColVals[idx][0] = 'Me'; counts.reserved++; return;
+    }
+    // Assignee band → her lane if it clears visa + score
+    if (assigneePriorities.indexOf(priority) !== -1) {
+      var visaOk = visas.length === 0 || visas.indexOf(_stringifyField(r.usVisaSponsorshipPotential)) !== -1;
+      var scoreOk = true;
+      if (minScore > 0) { var s = Number(r.score); scoreOk = !isNaN(s) && s >= minScore; }
+      if (visaOk && scoreOk) {
+        ownerColVals[idx][0] = 'Assignee'; actionColVals[idx][0] = 'Fill & Submit';
+        r.owner = 'Assignee'; r.action = 'Fill & Submit';
+        assigneeJobs.push(r); counts.assigned++; return;
+      }
+      ownerColVals[idx][0] = 'Me'; counts.reserved++; return;       // in-band but filtered out → owner decides
+    }
+    // Everything else (P06+) → skip
+    ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++;
+  });
+
+  jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.owner, numRows, 1).setValues(ownerColVals);
+  jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, numRows, 1).setValues(statusColVals);
+  jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.action, numRows, 1).setValues(actionColVals);
+
+  if (assigneeJobs.length) {
+    _pushJobsToAssignedSheet(assigneeJobs);
+    if (config.notifyAssigneeEmail) _notifyAssigneeOfNewJobs(config, assigneeJobs.length);
+  }
+  return counts;
 }
 
 function assignSelectedRowsPrompt() {
@@ -1178,23 +1350,102 @@ function reassignJobsPrompt() {
   ensureWorkbookReadyForRuntime();
   var ui = SpreadsheetApp.getUi();
   var config = loadRuntimeConfig();
-  var priorities = config.autoAssignPriorities || [];
-  var visas = config.autoAssignVisa || [];
-  var excludeCompanies = config.autoAssignExcludeCompanies || [];
 
-  var candidates = getExistingJobRecords().filter(function(r) {
-    return _stringifyField(r.status) === 'New'
-      && priorities.indexOf(_stringifyField(r.priority)) !== -1
-      && (visas.length === 0 || visas.indexOf(_stringifyField(r.usVisaSponsorshipPotential)) !== -1)
-      && excludeCompanies.indexOf((_stringifyField(r.company) || '').toLowerCase().trim()) === -1;
+  var counts = _routeNewJobs(config);
+  var total = counts.assigned + counts.reserved + counts.skipped;
+  if (!total) { ui.alert('No unrouted New jobs to route.'); return; }
+
+  ui.alert(
+    'Routed ' + total + ' new job(s):\n' +
+    '• ' + counts.assigned + ' → assignee lane\n' +
+    '• ' + counts.reserved + ' → your lane (networking)\n' +
+    '• ' + counts.skipped + ' → skipped (low priority/excluded)'
+  );
+}
+
+function _findTokenForDatasetId(datasetId, config) {
+  var accounts = config.apifyAccounts;
+  for (var i = 0; i < accounts.length; i++) {
+    try {
+      var meta = _getDatasetMetadata(datasetId, accounts[i]);
+      if (meta && meta.id) return accounts[i];
+    } catch (e) { /* try next */ }
+  }
+  // Try without token (public datasets)
+  try {
+    var meta = _getDatasetMetadata(datasetId, '');
+    if (meta && meta.id) return '';
+  } catch (e) {}
+  throw new Error('Dataset ' + datasetId + ' not accessible with any of your ' + accounts.length + ' Apify accounts.');
+}
+
+function importApifyDatasetByIdPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Import Apify Dataset', 'Enter the Apify dataset ID to import:', ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+  var datasetId = response.getResponseText().trim();
+  if (!datasetId) { ui.alert('No dataset ID entered.'); return; }
+
+  var config = loadRuntimeConfig();
+  validateRuntimeConfig(config);
+  var token = _findTokenForDatasetId(datasetId, config);
+
+  var state = {
+    version: 1,
+    runStartedAt: new Date().toISOString(),
+    sources: [{ taskId: datasetId, runId: '', datasetId: datasetId, token: token }],
+    rawScrapedCount: 0, totalJobsCount: 0, totalScoreableCount: 0,
+    processedCount: 0, newJobsCount: 0, aJobsCount: 0,
+    failedJobsCount: 0, scoredJobsCount: 0, importFailedJobsCount: 0,
+    handledJobIds: [], pendingStage2JobIds: [], newTopPriorityJobIds: [], errors: []
+  };
+  _runJobImportAndScoringInternal(state);
+}
+
+function importLastNActorRunsPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('Import Last N Runs', 'How many recent successful runs to import? (Leave blank for 5):', ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+  var raw = response.getResponseText().trim();
+  var n = raw ? parseInt(raw, 10) : 5;
+  if (isNaN(n) || n < 1) { ui.alert('Please enter a positive number.'); return; }
+
+  var config = loadRuntimeConfig();
+  validateRuntimeConfig(config);
+  var accounts = config.apifyAccounts;
+  var actorId = config.apifyActorId;
+
+  var allRuns = [];
+  for (var i = 0; i < accounts.length; i++) {
+    var runs = _listActorRuns(actorId, accounts[i], n);
+    for (var j = 0; j < runs.length; j++) {
+      runs[j]._token = accounts[i];
+    }
+    allRuns = allRuns.concat(runs);
+  }
+
+  allRuns.sort(function(a, b) {
+    return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
   });
 
-  if (!candidates.length) { ui.alert('No New jobs match the current auto-assign rules.'); return; }
+  var topRuns = allRuns.slice(0, n).filter(function(r) { return r.defaultDatasetId; });
+  if (!topRuns.length) { ui.alert('No successful runs with datasets found.'); return; }
 
-  var assigned = _pushJobsToAssignedSheet(candidates);
-  ui.alert(assigned > 0
-    ? assigned + ' job(s) assigned to the Assigned sheet.'
-    : 'All matching jobs are already in the Assigned sheet.');
+  var sources = topRuns.map(function(r) {
+    return { taskId: actorId, runId: r.id, datasetId: r.defaultDatasetId, token: r._token };
+  });
+
+  ui.alert('Importing ' + topRuns.length + ' run(s). This may take a moment…');
+  var state = {
+    version: 1,
+    runStartedAt: new Date().toISOString(),
+    sources: sources,
+    rawScrapedCount: 0, totalJobsCount: 0, totalScoreableCount: 0,
+    processedCount: 0, newJobsCount: 0, aJobsCount: 0,
+    failedJobsCount: 0, scoredJobsCount: 0, importFailedJobsCount: 0,
+    handledJobIds: [], pendingStage2JobIds: [], newTopPriorityJobIds: [], errors: []
+  };
+  _runJobImportAndScoringInternal(state);
 }
 
 
