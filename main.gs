@@ -3,6 +3,7 @@ var CRITICAL_FAILURE_MIN_COUNT = 5;
 var ACTIVE_RUN_STATE_PROPERTY_KEY = 'ACTIVE_JOB_IMPORT_RUN_STATE';
 var RESUME_TRIGGER_HANDLER = 'resumeJobImportAndScoring';
 var APIFY_ROTATION_RETRY_HANDLER = 'runApifyRotationRetry';
+var MANUAL_IMPORT_HANDLER = 'runManualDetailImport';
 var BACKUP_RESUME_TRIGGER_DELAY_MS = 7 * 60 * 1000;
 
 /**
@@ -57,26 +58,21 @@ function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('Jobs Pipeline')
     .addItem('Run Now', 'runJobImportAndScoringNow')
+    .addItem('Import Jobs Manually…', 'importJobsManuallyPrompt')
     .addItem('Cancel Run', 'cancelRunPrompt')
     .addSeparator()
     .addItem('Assign Selected Rows', 'assignSelectedRowsPrompt')
     .addItem('Reassign by Rules', 'reassignJobsPrompt')
     .addSeparator()
-    .addSubMenu(ui.createMenu('Scoring')
-      .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
-      .addItem('Rerun Raw Data', 'rerunAllFromRawData'))
-    .addSubMenu(ui.createMenu('Apify Tools')
-      .addItem('Import Run ID...', 'importApifyRunByIdPrompt')
-      .addItem('Import Dataset ID...', 'importApifyDatasetByIdPrompt')
-      .addItem('Import Last N Runs...', 'importLastNActorRunsPrompt'))
+    .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
+    .addItem('Sort & Rank Sheets', 'sortBothSheetsNow')
     .addSubMenu(ui.createMenu('Triggers')
       .addItem('Create Run Trigger', 'createRunTrigger')
       .addItem('Remove Run Triggers', 'removeHourlyTriggers'))
-    .addItem('Sort & Rank Sheets', 'sortBothSheetsNow')
     .addSubMenu(ui.createMenu('Maintenance')
       .addItem('Prune Old Data...', 'pruneOldDataPrompt')
+      .addItem('Skip All No-Visa Jobs', 'skipNoVisaJobsPrompt')
       .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
-      .addItem('Restore Job Links', 'restoreJobLinks')
       .addItem('Validate Config', 'validateConfiguration'))
     .addToUi();
 }
@@ -88,6 +84,9 @@ function onInstall() {
 function sortBothSheetsNow() {
   ensureWorkbookReadyForRuntime();
   sortAndRankJobs();
+  // Flush ensures writes from _syncAssignedRowsForJobs (which uses its own sheet reference)
+  // are committed before _sortAssignedSheet reads via a different sheet reference.
+  SpreadsheetApp.flush();
   var assignedSheet = _getAssignedSheet();
   if (assignedSheet) _sortAssignedSheet(assignedSheet);
   SpreadsheetApp.getUi().alert('Sort & Rank complete.');
@@ -258,6 +257,101 @@ function runApifyRotationRetry() {
     if (t.getHandlerFunction() === APIFY_ROTATION_RETRY_HANDLER) ScriptApp.deleteTrigger(t);
   });
   updateRunSummary({ status: 'Retrying with rotated Apify account...' });
+  _runJobImportAndScoringInternal();
+}
+
+// Opens a native Sheets prompt to paste LinkedIn job URLs or raw IDs for manual import.
+// Using ui.prompt() avoids HtmlService multi-account auth issues in Chrome.
+function importJobsManuallyPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt(
+    'Import Jobs Manually',
+    'Paste LinkedIn job URLs or raw job IDs, separated by commas or new lines.\n' +
+    'Examples:  4419588092   or   https://www.linkedin.com/jobs/view/4419588092/',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  var text = String(response.getResponseText() || '').trim();
+  if (!text) { ui.alert('Nothing entered.'); return; }
+
+  ensureWorkbookReadyForRuntime();
+
+  // Split on newlines AND commas; trim; drop blanks.
+  var tokens = text.split(/[\s,]+/)
+    .map(function(s) { return s.trim(); })
+    .filter(function(s) { return s; });
+
+  // Parse each token — collect valid job IDs and anything unrecognisable.
+  var seen = {};
+  var validIds = [];
+  var invalidTokens = [];
+  tokens.forEach(function(tok) {
+    var jobId = _extractLinkedInJobId(tok);
+    if (!jobId) { invalidTokens.push(tok); return; }
+    if (seen[jobId]) return;          // dedupe within the paste
+    seen[jobId] = true;
+    validIds.push(jobId);
+  });
+
+  // Check valid IDs against the JP sheet — split into already-tracked vs truly new.
+  var existingIndex = getExistingJobIndex();
+  var duplicateIds = [];
+  var newIds = [];
+  validIds.forEach(function(id) {
+    // Also check merged_job_ids via byJobId (the index already resolves merged records).
+    if (existingIndex.byJobId[id]) {
+      duplicateIds.push(id);
+    } else {
+      newIds.push(id);
+    }
+  });
+
+  // Build a human-readable summary for the user.
+  var lines = [];
+  if (invalidTokens.length) {
+    lines.push('⚠ Could not parse (' + invalidTokens.length + '):');
+    invalidTokens.forEach(function(t) { lines.push('  • ' + t); });
+  }
+  if (duplicateIds.length) {
+    lines.push('');
+    lines.push('⏭ Already in Job_Priority — skipped (' + duplicateIds.length + '):');
+    duplicateIds.forEach(function(id) { lines.push('  • ' + id); });
+  }
+
+  if (!newIds.length) {
+    lines.unshift('Nothing new to import.');
+    ui.alert(lines.join('\n'));
+    return;
+  }
+
+  if (_loadActiveRunState()) {
+    ui.alert('A run is already in progress. Wait for it to finish, then try again.');
+    return;
+  }
+
+  var state = _createEmptyImportRunState(new Date());
+  state.importKind = 'detail';
+  state.detailJobIds = newIds;
+  _saveActiveRunState(state);
+
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === MANUAL_IMPORT_HANDLER) ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger(MANUAL_IMPORT_HANDLER).timeBased().after(1000).create();
+  updateRunSummary({ status: 'Queued manual import of ' + newIds.length + ' job(s)…' });
+
+  lines.unshift('Watch the status board on Job_Priority for progress.');
+  lines.unshift('✓ ' + newIds.length + ' new job(s) queued for Apify import.');
+  ui.alert(lines.join('\n'));
+}
+
+// Background trigger handler: loads the saved detail-import state and runs the pipeline.
+function runManualDetailImport() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === MANUAL_IMPORT_HANDLER) ScriptApp.deleteTrigger(t);
+  });
+  // No-arg → loads the saved activeRunState (importKind='detail', detailUrls=[...]).
   _runJobImportAndScoringInternal();
 }
 
@@ -451,30 +545,60 @@ function _runPipelineInternal(activeRunState, options) {
       return result;
     }
 
-    try {
-      tracker.update({ status: 'Deduplicating similar JDs' });
-      deduplicateSimilarJdRows();
-    } catch (dedupError) {
-      Logger.log(dedupError);
-    }
-
-    sortAndRankJobs();
-
-    _markTrackedExecutionFinished(result.activeRunState, 'completed');
-    _clearActiveRunState();
-    _removeResumeTriggers();
-
+    // Scoring complete. Run auto-assign first (fast).
     if (options.postProcess) {
       try {
         tracker.update({ status: 'Auto-assigning jobs' });
         _routeNewJobs(config);
       } catch (assignError) { Logger.log('Auto-assign error: ' + assignError); }
-
       result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
     }
 
+    // Try dedup and sort inline if there is enough execution time left.
+    // If not, defer each to its own fresh trigger execution (2000-row sheets
+    // need up to 90 s for dedup + 40 s for sort).
+    var execDeadlineMs = Number((config && config.executionDeadlineMs) || 0);
+    var hasTimeForDedup = !execDeadlineMs || (Date.now() + 90000 < execDeadlineMs);
+
+    if (hasTimeForDedup) {
+      try {
+        tracker.update({ status: 'Deduplicating similar JDs' });
+        deduplicateSimilarJdRows();
+      } catch (dedupError) { Logger.log(dedupError); }
+    }
+
+    var hasTimeForSort = !execDeadlineMs || (Date.now() + 40000 < execDeadlineMs);
+
+    if (hasTimeForDedup && hasTimeForSort) {
+      // Everything fits — finish inline, no extra trigger needed.
+      sortAndRankJobs();
+      _markTrackedExecutionFinished(result.activeRunState, 'completed');
+      _clearActiveRunState();
+      _removeResumeTriggers();
+
+      tracker.update({
+        status: 'Completed',
+        processed: result.processedCount + ' / ' + result.totalJobsCount,
+        scrapedCount: result.rawScrapedCount,
+        uniqueRolesCount: result.uniqueRolesCount,
+        toScoreCount: result.totalScoreableCount,
+        newJobsCount: result.newJobsCount,
+        aJobsCount: result.aJobsCount,
+        failedJobsCount: result.failedJobsCount,
+        scoredJobsCount: result.scoredJobsCount,
+        errorMessage: result.errors.length ? _truncate(result.errors.join(' | '), 500) : ''
+      });
+
+      if (options.notify) {
+        _sendCompletionNotifications(config, result, tracker.get());
+      }
+
+      return result;
+    }
+
+    // Not enough time — notify now, then defer remaining step(s) to a trigger.
     tracker.update({
-      status: 'Completed',
+      status: 'Scored — finishing in next execution',
       processed: result.processedCount + ' / ' + result.totalJobsCount,
       scrapedCount: result.rawScrapedCount,
       uniqueRolesCount: result.uniqueRolesCount,
@@ -490,13 +614,28 @@ function _runPipelineInternal(activeRunState, options) {
       _sendCompletionNotifications(config, result, tracker.get());
     }
 
+    _markTrackedExecutionFinished(result.activeRunState, 'yielded');
+    // If dedup ran inline but sort didn't, skip straight to the sort phase.
+    result.activeRunState.postPhase = hasTimeForDedup ? 'sort' : 'dedup';
+    _saveActiveRunState(result.activeRunState);
+    _scheduleResumeTrigger();
+
     return result;
   } catch (error) {
     var errorMsg = error && error.message ? error.message : String(error);
     // Do NOT wipe saved state on timeout — the backup trigger needs it to resume.
     var isTimeout = errorMsg.indexOf('Exceeded maximum execution time') !== -1 ||
-                    errorMsg.indexOf('Script execution time') !== -1;
-    if (!isTimeout) {
+                    errorMsg.indexOf('Script execution time') !== -1 ||
+                    // Graceful exit from _waitForRunToFinish when approaching the 6-min wall.
+                    // importAndScoreJobs normally catches this and returns hasMore:true, but
+                    // this is a safety net in case it escapes.
+                    errorMsg.indexOf('APIFY_WAIT_PENDING:') !== -1;
+    // Apify account rotation already scheduled its own retry trigger and saved the rotated
+    // index; preserve the active run state so the retry (esp. a detail import carrying its URLs)
+    // can resume instead of starting from scratch.
+    var isRotationRetry = errorMsg.indexOf('retry scheduled') !== -1;
+    var preserveState = isTimeout || isRotationRetry;
+    if (!preserveState) {
       _clearActiveRunState();
       _removeResumeTriggers();
       if (options.notify) {
@@ -504,7 +643,7 @@ function _runPipelineInternal(activeRunState, options) {
       }
     }
     tracker.update({
-      status: isTimeout ? 'Continuing in next execution' : 'Failed',
+      status: preserveState ? 'Continuing in next execution' : 'Failed',
       errorMessage: _truncate(errorMsg, 500)
     });
     throw error;
@@ -518,6 +657,15 @@ function _runPipelineInternal(activeRunState, options) {
 function _runJobImportAndScoringInternal(initialActiveRunState) {
   var executionStartedAt = new Date();
   var activeRunState = initialActiveRunState || _loadActiveRunState() || _createEmptyImportRunState(executionStartedAt);
+
+  // Dedup and sort each run as a separate trigger execution after scoring finishes.
+  if (activeRunState && activeRunState.postPhase === 'dedup') {
+    return _runDedupPhase(activeRunState);
+  }
+  if (activeRunState && activeRunState.postPhase === 'sort') {
+    return _runSortPhase(activeRunState);
+  }
+
   return _runPipelineInternal(activeRunState, {
     pipelineFn: importAndScoreJobs,
     initialStatus: 'Starting Apify task',
@@ -526,6 +674,44 @@ function _runJobImportAndScoringInternal(initialActiveRunState) {
     notify: true,
     _hadInitialState: !!initialActiveRunState
   });
+}
+
+function _runDedupPhase(state) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    // Set a backup trigger first — if dedup itself times out the next execution resumes here.
+    _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
+    updateRunSummary({ status: 'Deduplicating similar JDs…' });
+    try {
+      deduplicateSimilarJdRows();
+    } catch (e) {
+      Logger.log('[Dedup] ' + e);
+    }
+    state.postPhase = 'sort';
+    _saveActiveRunState(state);
+    _scheduleResumeTrigger(); // 1 s — fires sort phase immediately
+    updateRunSummary({ status: 'Sort & Rank queued…' });
+  } finally {
+    if (lock.hasLock()) lock.releaseLock();
+  }
+}
+
+function _runSortPhase(state) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    // Set a backup trigger first — if sort itself times out the next execution resumes here.
+    _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
+    updateRunSummary({ status: 'Sorting and ranking…' });
+    sortAndRankJobs();
+    _markTrackedExecutionFinished(state, 'completed');
+    _clearActiveRunState();
+    _removeResumeTriggers(); // clears the backup set above
+    updateRunSummary({ status: 'Completed' });
+  } finally {
+    if (lock.hasLock()) lock.releaseLock();
+  }
 }
 
 function _runJobReevaluationInternal(initialActiveRunState) {
@@ -1289,6 +1475,7 @@ function _routeNewJobs(config) {
   var excludeCompanies = config.autoAssignExcludeCompanies || [];
   var visas = config.autoAssignVisa || [];
   var minScore = config.autoAssignMinScore || 0;
+  var autoSkipVisaNo = config.autoSkipVisaNo !== false;
 
   var jobSheet = _getJobPrioritySheet();
   if (!jobSheet) return counts;
@@ -1311,6 +1498,11 @@ function _routeNewJobs(config) {
     var priority = _stringifyField(r.priority);
     var company = (_stringifyField(r.company) || '').toLowerCase().trim();
 
+    // Visa hard block → skip regardless of priority/company. The role explicitly does not
+    // sponsor, so the candidate cannot take it; networking won't change a no-sponsorship policy.
+    if (autoSkipVisaNo && _stringifyField(r.usVisaSponsorshipPotential) === 'No (0%)') {
+      ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
+    }
     // Hard exclude → skip
     if (excludeCompanies.indexOf(company) !== -1) {
       ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
@@ -1344,6 +1536,49 @@ function _routeNewJobs(config) {
     if (config.notifyAssigneeEmail) _notifyAssigneeOfNewJobs(config, assigneeJobs.length);
   }
   return counts;
+}
+
+// One-time sweep: force every Job_Priority row scored "No (0%)" to status Skip,
+// including already-owned/assigned rows. This deliberately overrides the sticky
+// guard in _routeNewJobs (which only touches New + unowned rows).
+function skipNoVisaJobsPrompt() {
+  ensureWorkbookReadyForRuntime();
+  var ui = SpreadsheetApp.getUi();
+  var jobSheet = _getJobPrioritySheet();
+  if (!jobSheet) { ui.alert('Job_Priority sheet not found.'); return; }
+
+  var lastRow = jobSheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) { ui.alert('No job rows found.'); return; }
+
+  var records = getExistingJobRecords();
+  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var statusColVals = jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, numRows, 1).getValues();
+
+  var toSkip = [];
+  records.forEach(function(r) {
+    var idx = r.rowNumber - JOB_PRIORITY_DATA_START_ROW;
+    if (idx < 0 || idx >= numRows) return;
+    if (_stringifyField(r.usVisaSponsorshipPotential) !== 'No (0%)') return;
+    if (_stringifyField(statusColVals[idx][0]) === 'Skip') return; // already skipped
+    toSkip.push(idx);
+  });
+
+  if (!toSkip.length) { ui.alert('No "No (0%)" jobs need skipping — all already Skip or none found.'); return; }
+
+  var resp = ui.alert(
+    'Skip All No-Visa Jobs',
+    'Found ' + toSkip.length + ' job(s) scored "No (0%)" that are not yet Skip.\n\n' +
+    'This will set their status to Skip, including rows already owned or assigned. Proceed?',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp !== ui.Button.OK) return;
+
+  toSkip.forEach(function(idx) { statusColVals[idx][0] = 'Skip'; });
+  jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, numRows, 1).setValues(statusColVals);
+
+  SpreadsheetApp.flush();
+  sortAndRankJobs();
+  ui.alert('Set ' + toSkip.length + ' job(s) to Skip and re-sorted.');
 }
 
 function assignSelectedRowsPrompt() {

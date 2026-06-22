@@ -1,10 +1,15 @@
 var SCORING_CACHE_STATE_KEY = 'GEMINI_SCORING_CACHE_STATE';
 var SCORING_CACHE_TTL_SECONDS = 18000;
 var APIFY_ACTOR_ID = 'cheap_scraper/linkedin-job-scraper';
+var APIFY_JOB_DETAIL_ACTOR_ID = 'apimaestro/linkedin-job-detail';
+// Prefix for the error thrown by _waitForRunToFinish when the Apps Script execution deadline
+// is near. Callers check for this to yield gracefully instead of rotating Apify accounts.
+var APIFY_WAIT_PENDING_PREFIX = 'APIFY_WAIT_PENDING:';
 
 function loadRuntimeConfig() {
   var settings = getSettingsMap();
   var properties = PropertiesService.getScriptProperties();
+  var _apifyAccountsBundle = _getApifyAccounts();
 
   return {
     aiProvider: 'gemini',
@@ -14,7 +19,7 @@ function loadRuntimeConfig() {
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
-    promptVersion: 'v9',
+    promptVersion: 'v10',
     targetProfile: String(
       settings.TARGET_PROFILE ||
       _defaultTargetProfile()
@@ -26,19 +31,21 @@ function loadRuntimeConfig() {
     quietEndHour: _parseHourSetting(settings.QUIET_END_HOUR, 5),
     apifyPollIntervalMs: 5000,
     apifyRunWaitSeconds: 240,
-    executionSoftLimitMs: 300000,
-    executionYieldBufferMs: 90000,
-    executionDeadlineMs: Date.now() + 300000,
+    // The hard Apps Script kill is 360 s. The deadline below is set AFTER the lock wait,
+    // so it is already conservative vs the true start. We use ~330 s of budget and yield
+    // ~40 s before it — leaving headroom for the post-loop write + saveState + trigger.
+    // A hard kill is still survivable: handledJobIds is checkpointed and the backup
+    // trigger resumes mid-batch. Bigger budget + smaller buffer = fewer trigger handoffs,
+    // and each handoff costs 1-3 min of real wall-clock, so this is the main speed lever.
+    executionSoftLimitMs: 330000,
+    executionYieldBufferMs: 40000,
+    executionDeadlineMs: Date.now() + 330000,
     apifyActorId: APIFY_ACTOR_ID,
-    apifyAccounts: (function() {
-      var raw = String(settings.APIFY_ACCOUNTS || '').trim();
-      if (!raw) return [];
-      try {
-        return JSON.parse(raw).filter(function(a) { return typeof a === 'string' && a.trim(); });
-      } catch (e) {
-        throw new Error('APIFY_ACCOUNTS is not valid JSON: ' + e.message);
-      }
-    })(),
+    apifyDetailActorId: APIFY_JOB_DETAIL_ACTOR_ID,
+    apifyAccounts: _apifyAccountsBundle.batch,
+    apifyDetailAccounts: _apifyAccountsBundle.detail,
+    apifyAccountLabels: _apifyAccountsBundle.labels,
+    apifyJobDetailInput: String(settings.APIFY_JOB_DETAIL_INPUT || '').trim() || '{"urls": [{urls}]}',
     apifyRunInput: String(settings.APIFY_RUN_INPUT || '').trim() || null,
     apifyLookbackHours: Number(settings.APIFY_LOOKBACK_HOURS) || 0,
     apifyMaxLookbackHours: Number(settings.APIFY_MAX_LOOKBACK_HOURS) || 168,
@@ -49,7 +56,8 @@ function loadRuntimeConfig() {
     autoAssignPriorities: _splitCsv(settings.AUTO_ASSIGN_PRIORITIES || 'P04,P05'),
     reservePriorities: _splitCsv(settings.AUTO_RESERVE_PRIORITIES || 'P01,P02,P03'),
     reservedCompanies: _splitCsv(settings.RESERVED_COMPANIES || 'amazon,amazon web services (aws),amazon music,microsoft,microsoft ai,google,google deepmind,meta,apple,nvidia,nvidia ai,jpmorganchase,capital one,paypal,visa,mastercard,stripe,plaid,ramp,block,robinhood,coinbase,affirm,chime,databricks,snowflake,datadog,cloudflare,okta,servicenow,openai,anthropic,forter,socure,prove,sentilink,american express,bank of america,citi,wells fargo,goldman sachs,morgan stanley,bny,ubs,hsbc,intuit,adobe,airbnb,uber,salesforce,cisco,ebay,blackrock').map(function(s) { return s.toLowerCase(); }).filter(Boolean),
-    autoAssignVisa: _splitCsv(settings.AUTO_ASSIGN_VISA || 'Likely (90%),Possible (70%),Unclear (50%)'),
+    autoAssignVisa: _splitCsv(settings.AUTO_ASSIGN_VISA || 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)'),
+    autoSkipVisaNo: String(settings.AUTO_SKIP_VISA_NO || 'TRUE').toUpperCase() === 'TRUE',
     autoAssignExcludeCompanies: _splitCsv(settings.AUTO_ASSIGN_EXCLUDE_COMPANIES || 'hackajob,jobs via dice,trusting social,kompato ai').map(function(s) { return s.toLowerCase(); }).filter(Boolean),
     autoAssignMinScore: parseInt(settings.AUTO_ASSIGN_MIN_SCORE, 10) || 0,
     notifyAssigneeEmail: String(settings.NOTIFY_ASSIGNEE_EMAIL || '').trim()
@@ -59,9 +67,14 @@ function loadRuntimeConfig() {
 function validateRuntimeConfig(config) {
   var options = arguments[1] || {};
   var requireApify = options.requireApify !== false;
+  var isDetailImport = config.activeRunState && config.activeRunState.importKind === 'detail';
 
-  if (requireApify && (!config.apifyAccounts || !config.apifyAccounts.length)) {
-    throw new Error('APIFY_ACCOUNTS is missing or empty in the Settings sheet.');
+  if (isDetailImport) {
+    if (!config.apifyDetailAccounts || !config.apifyDetailAccounts.length) {
+      throw new Error('No Detail Key is set on any active account in the Apify_Accounts sheet. Add the apimaestro/linkedin-job-detail token to at least one active account.');
+    }
+  } else if (requireApify && (!config.apifyAccounts || !config.apifyAccounts.length)) {
+    throw new Error('No active account with a Batch Key found in the Apify_Accounts sheet (or legacy APIFY_ACCOUNTS setting).');
   }
 
   if (config.geminiApiRoute !== 'developer' && config.geminiApiRoute !== 'vertex') {
@@ -76,15 +89,41 @@ function validateRuntimeConfig(config) {
     throw new Error('VERTEX_PROJECT_ID is required in the Settings sheet for vertex route.');
   }
 
-  if (requireApify && (!config.activeRunState || !config.activeRunState.sources || !config.activeRunState.sources.length) && !config.apifyAccounts.length) {
-    throw new Error('APIFY_ACCOUNTS is required in the Settings sheet.');
+  if (!isDetailImport && requireApify && (!config.activeRunState || !config.activeRunState.sources || !config.activeRunState.sources.length) && !config.apifyAccounts.length) {
+    throw new Error('No active account with a Batch Key found in the Apify_Accounts sheet.');
   }
 }
 
 function importAndScoreJobs(config, existingIndex, progressCallback) {
   var activeRunState = _getOrCreateActiveRunState(config, progressCallback);
   config.activeRunState = activeRunState;
-  var sourceItems = _fetchApifyItems(config, progressCallback);
+
+  var sourceItems;
+  try {
+    sourceItems = _fetchApifyItems(config, progressCallback);
+  } catch (fetchErr) {
+    // Graceful execution-limit yield from _waitForRunToFinish.
+    // The runId is already persisted in PropertiesService; _runPipelineInternal will
+    // save state and schedule a resume trigger when it sees hasMore: true.
+    if (String(fetchErr.message).indexOf(APIFY_WAIT_PENDING_PREFIX) === 0) {
+      return {
+        hasMore: true,
+        activeRunState: activeRunState,
+        rows: [],
+        processedCount: activeRunState.processedCount || 0,
+        rawScrapedCount: activeRunState.rawScrapedCount || 0,
+        totalJobsCount: activeRunState.totalJobsCount || 0,
+        uniqueRolesCount: activeRunState.uniqueRolesCount || 0,
+        totalScoreableCount: activeRunState.totalScoreableCount || 0,
+        newJobsCount: 0,
+        aJobsCount: 0,
+        failedJobsCount: 0,
+        scoredJobsCount: 0,
+        errors: ['Apify run still in progress — resuming in next execution.']
+      };
+    }
+    throw fetchErr;
+  }
   var normalizedJobs = [];
   var rows = [];
   var errors = [];
@@ -109,7 +148,10 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
 
   sourceItems.forEach(function(sourceItem) {
     try {
-      normalizedJobs.push(_normalizeJob(sourceItem.item, sourceItem.sourceLabel, config.runStartedAt));
+      var normalized = sourceItem.format === 'detail'
+        ? _normalizeJobDetail(sourceItem.item, sourceItem.sourceLabel, config.runStartedAt)
+        : _normalizeJob(sourceItem.item, sourceItem.sourceLabel, config.runStartedAt);
+      normalizedJobs.push(normalized);
     } catch (itemError) {
       importFailedJobsCount += 1;
       errors.push(_truncate('Job import/scoring failed: ' + itemError.message, 300));
@@ -504,9 +546,10 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
     var isRateLimit = firstError.message && firstError.message.indexOf('429') !== -1;
     var isCacheMiss = !isRateLimit && firstError.message && firstError.message.indexOf('404') !== -1;
     if (isCacheMiss) {
-      // Cache expired between trigger executions — clear it on the shared config so all
-      // subsequent jobs in this run skip the stale cache ID instead of each hitting a 404.
+      // Cache expired — clear in-memory flag so remaining jobs this run skip the stale ID,
+      // and purge from PropertiesService so the next trigger doesn't reload and reuse it.
       config._scoringCacheName = '';
+      _clearScoringCacheState();
     }
     var noCache = config._scoringCacheName
       ? Object.assign({}, config, { _scoringCacheName: '' })
@@ -556,10 +599,106 @@ function _executeScoreRequests(requests) {
 
 function _fetchApifyItems(config, progressCallback) {
   if (config.activeRunState && config.activeRunState.sources && config.activeRunState.sources.length) {
-    return _fetchItemsForSources(config.activeRunState.sources, config, progressCallback);
+    var sources = config.activeRunState.sources;
+
+    // A previous execution was killed mid-poll: sources have runId but no datasetId.
+    // Resume waiting for the existing run(s) instead of starting new ones.
+    for (var i = 0; i < sources.length; i++) {
+      var s = sources[i];
+      if (!s.runId || s.datasetId) continue;
+      var resumeToken = s.token ||
+        (s.format === 'detail' ? (config.apifyDetailAccounts[0] || '') : (config.apifyAccounts[0] || ''));
+      _emitProgress(progressCallback, { status: 'Resuming Apify wait', processed: '' });
+      var runInfo = _waitForRunToFinish(s.runId, s.taskId || s.runId, resumeToken, config);
+      s.datasetId = runInfo.defaultDatasetId;
+      // Persist the completed datasetId so future resumes skip straight to dataset fetch.
+      _saveActiveRunState(config.activeRunState);
+    }
+
+    return _fetchItemsForSources(sources, config, progressCallback);
+  }
+
+  // Manual detail import: start the apimaestro/linkedin-job-detail actor with the pasted URLs.
+  if (config.activeRunState && config.activeRunState.importKind === 'detail') {
+    var detailSources = _startJobDetailSource(config, progressCallback);
+    config.activeRunState.sources = detailSources;
+    return _fetchItemsForSources(detailSources, config, progressCallback);
   }
 
   return _runTasksAndFetchItems(config, progressCallback);
+}
+
+function _startJobDetailSource(config, progressCallback) {
+  var jobIds = (config.activeRunState && config.activeRunState.detailJobIds) || [];
+  if (!jobIds.length) {
+    throw new Error('Manual import has no job IDs to fetch.');
+  }
+  var runInputJson = _buildJobDetailRunInput(jobIds);
+  var source = _tryApifyDetailAccountsInOrder(config, runInputJson, progressCallback);
+  return [source];
+}
+
+function _buildJobDetailRunInput(jobIds) {
+  return JSON.stringify({ job_id: jobIds.map(String) });
+}
+
+function _tryApifyDetailAccountsInOrder(config, runInputJson, progressCallback) {
+  var props = PropertiesService.getScriptProperties();
+  var accounts = config.apifyDetailAccounts;
+  var actorId = config.apifyDetailActorId;
+
+  var preferredIdx = parseInt(props.getProperty('APIFY_DETAIL_LAST_WORKING_INDEX') || '0') % accounts.length;
+  var token = accounts[preferredIdx];
+
+  Logger.log('[ApifyDetail] Account ' + (preferredIdx + 1) + '/' + accounts.length + ' (preferred)');
+  _emitProgress(progressCallback, { status: 'Starting Apify detail (account ' + (preferredIdx + 1) + ')', processed: '' });
+
+  try {
+    var runId = _startActorRun(actorId, runInputJson, token);
+
+    // Persist the runId BEFORE waiting so that a mid-poll execution timeout lets the
+    // backup trigger resume this same Apify run rather than launching a new one.
+    if (config.activeRunState) {
+      config.activeRunState.sources = [{ token: token, taskId: actorId, runId: runId, format: 'detail' }];
+      _saveActiveRunState(config.activeRunState);
+    }
+
+    _emitProgress(progressCallback, { status: 'Waiting for Apify', processed: '' });
+    var runInfo = _waitForRunToFinish(runId, actorId, token, config);
+    if (!runInfo.defaultDatasetId) throw new Error('No datasetId returned from detail account ' + (preferredIdx + 1) + '.');
+    props.setProperty('APIFY_DETAIL_LAST_WORKING_INDEX', String(preferredIdx));
+    props.deleteProperty('APIFY_DETAIL_ROTATION_ATTEMPTS');
+    Logger.log('[ApifyDetail] Account ' + (preferredIdx + 1) + ' succeeded, run ' + runId);
+    return { token: token, taskId: actorId, runId: runId, datasetId: runInfo.defaultDatasetId, format: 'detail' };
+  } catch (err) {
+    // Execution deadline reached mid-poll — runId is already in PropertiesService.
+    // Re-throw without rotation: the Apify run is still alive.
+    if (String(err.message).indexOf(APIFY_WAIT_PENDING_PREFIX) === 0) throw err;
+
+    Logger.log('[ApifyDetail] Account ' + (preferredIdx + 1) + ' failed: ' + err);
+
+    if (accounts.length <= 1) {
+      throw new Error('Only one Apify detail account configured and it failed: ' + err.message);
+    }
+
+    var rotationAttempts = parseInt(props.getProperty('APIFY_DETAIL_ROTATION_ATTEMPTS') || '0');
+    if (rotationAttempts >= accounts.length - 1) {
+      props.deleteProperty('APIFY_DETAIL_ROTATION_ATTEMPTS');
+      throw new Error('All ' + accounts.length + ' Apify detail accounts failed after full rotation. Last error: ' + err.message);
+    }
+
+    var nextIdx = (preferredIdx + 1) % accounts.length;
+    props.setProperty('APIFY_DETAIL_LAST_WORKING_INDEX', String(nextIdx));
+    props.setProperty('APIFY_DETAIL_ROTATION_ATTEMPTS', String(rotationAttempts + 1));
+    Logger.log('[ApifyDetail] Rotating to account ' + (nextIdx + 1) + '/' + accounts.length +
+      ' (attempt ' + (rotationAttempts + 1) + '/' + (accounts.length - 1) + '). Scheduling fresh retry...');
+    _scheduleApifyRotationRetry();
+
+    throw new Error(
+      '[ApifyDetail] Account ' + (preferredIdx + 1) + ' failed. Rotated to account ' + (nextIdx + 1) +
+      ' — retry scheduled in ~60 s.'
+    );
+  }
 }
 
 function _runTasksAndFetchItems(config, progressCallback) {
@@ -591,6 +730,15 @@ function _tryApifyAccountsInOrder(config, runInputJson, progressCallback) {
 
   try {
     var runId = _startActorRun(actorId, runInputJson, token);
+
+    // Persist the runId BEFORE waiting. If the Apps Script execution is killed during
+    // the poll, the backup trigger can resume by polling this same run instead of
+    // starting a brand-new one.
+    if (config.activeRunState) {
+      config.activeRunState.sources = [{ token: token, taskId: actorId, runId: runId }];
+      _saveActiveRunState(config.activeRunState);
+    }
+
     _emitProgress(progressCallback, { status: 'Waiting for Apify', processed: '' });
     var runInfo = _waitForRunToFinish(runId, actorId, token, config);
     if (!runInfo.defaultDatasetId) throw new Error('No datasetId returned from account ' + (preferredIdx + 1) + '.');
@@ -600,6 +748,10 @@ function _tryApifyAccountsInOrder(config, runInputJson, progressCallback) {
     Logger.log('[Apify] Account ' + (preferredIdx + 1) + ' succeeded, run ' + runId);
     return { token: token, taskId: actorId, runId: runId, datasetId: runInfo.defaultDatasetId };
   } catch (err) {
+    // Execution deadline reached mid-poll — runId is already in PropertiesService.
+    // Re-throw without rotation: the Apify run is still alive.
+    if (String(err.message).indexOf(APIFY_WAIT_PENDING_PREFIX) === 0) throw err;
+
     Logger.log('[Apify] Account ' + (preferredIdx + 1) + ' failed: ' + err);
 
     if (accounts.length <= 1) {
@@ -668,7 +820,8 @@ function _fetchItemsForSources(sources, config, progressCallback) {
       status: 'Fetching jobs',
       processed: ''
     });
-    var token = source.token || config.apifyAccounts[0] || '';
+    var token = source.token ||
+      (source.format === 'detail' ? config.apifyDetailAccounts[0] : config.apifyAccounts[0]) || '';
     var responseItems = _fetchDatasetItemsById(
       source.datasetId,
       'task ' + source.taskId + ' run ' + source.runId,
@@ -677,6 +830,7 @@ function _fetchItemsForSources(sources, config, progressCallback) {
     responseItems.forEach(function(item) {
       allItems.push({
         sourceLabel: source.taskId,
+        format: source.format || 'batch',
         item: item
       });
     });
@@ -818,13 +972,26 @@ function _startActorRun(actorId, runInputJson, token) {
 }
 
 function _waitForRunToFinish(runId, sourceLabel, token, config) {
-  var deadline = Date.now() + (config.apifyRunWaitSeconds * 1000);
+  var pollDeadline = Date.now() + (config.apifyRunWaitSeconds * 1000);
+  // Leave a 60 s buffer before the Apps Script 6-min hard kill.
+  // executionDeadlineMs is set to Date.now()+300 000 at loadRuntimeConfig() time,
+  // which is typically ~30 s into the execution, giving an effective safety margin.
+  var execDeadline = (config && config.executionDeadlineMs) ? Number(config.executionDeadlineMs) : Infinity;
+  var EXEC_BUFFER_MS = 60000;
 
-  while (Date.now() <= deadline) {
+  while (Date.now() <= pollDeadline) {
     if (_isCancelRequested()) {
       _clearCancelRequest();
       throw new Error('Apify wait cancelled by user.');
     }
+
+    // Approaching the Apps Script execution wall — yield gracefully.
+    // The caller has already persisted the runId in PropertiesService, so the
+    // resume trigger will poll this same run instead of starting a new one.
+    if (Date.now() + EXEC_BUFFER_MS >= execDeadline) {
+      throw new Error(APIFY_WAIT_PENDING_PREFIX + runId);
+    }
+
     var runInfo = _getRunInfo(runId, token);
     var status = String(runInfo.status || '');
 
@@ -994,6 +1161,94 @@ function _normalizeJob(item, sourceLabel, runStartedAt) {
     workType: workType,
     publishedAt: publishedAt
   };
+}
+
+// Normalizer for the apimaestro/linkedin-job-detail actor, whose JSON nests data under
+// job_info / company_info / apply_details / salary_info. Maps to the same job record shape
+// _normalizeJob produces, so everything downstream (scoring, writeJobs, dedup) is unchanged.
+function _normalizeJobDetail(item, sourceLabel, runStartedAt) {
+  var info = (item && item.job_info) || {};
+  var companyInfo = (item && item.company_info) || {};
+  var applyInfo = (item && item.apply_details) || {};
+  var salaryInfo = (item && item.salary_info) || null;
+
+  var company = _stringifyField(companyInfo.name);
+  var title = _stringifyField(info.title);
+  var location = _stringifyField(info.location);
+  var rawDescription = _truncate(_cleanJobDescription(_stringifyField(info.description)), 12000);
+
+  // Prepend a one-line salary banner (when structured comp is provided) so the scorer sees it.
+  var salaryBanner = _formatDetailSalaryBanner(salaryInfo);
+  var description = salaryBanner ? _truncate(salaryBanner + '\n\n' + rawDescription, 12000) : rawDescription;
+
+  var postedLabel = _stringifyField(info.listed_at || info.original_listed_at);
+  var postedDate = _derivePostedDate(info, postedLabel, runStartedAt);
+  var applicants = _normalizeApplicantsCount(applyInfo.total_applies);
+
+  var rawJobLink = _stringifyField(info.job_url);
+  // job_posting_id arrives as a JSON number — stringify before the regex-based extractor.
+  var jobId = _extractLinkedInJobId(_stringifyField(info.job_posting_id)) ||
+              _resolveJobId(info, rawJobLink);
+  var jobLink = _buildLinkedInJobUrlFromJobId(jobId) || rawJobLink;
+
+  var contractType = _stringifyField(info.employment_status);
+  var experienceLevel = _stringifyField(info.experience_level);
+  var workType = _stringifyField((info.workplace_types && info.workplace_types[0]) || '');
+  var publishedAt = _stringifyField(info.listed_at);
+  var importedAt = runStartedAt ? new Date(runStartedAt.getTime()) : new Date();
+
+  // Flag postings LinkedIn has already closed/expired so the owner notices.
+  var jobState = _stringifyField(info.job_state).toUpperCase();
+  var referralContact = jobState === 'CLOSED' ? '⚠ Closed/expired on LinkedIn' : '';
+
+  // Mark the raw payload's format so the nested-aware raw-ref readers know how to dig in later.
+  var markedItem = item || {};
+  markedItem.__sourceFormat = 'apimaestro-job-detail';
+
+  return {
+    jobId: jobId,
+    company: company,
+    title: title,
+    location: location,
+    posted: postedDate ? _formatDateTimeForDisplay(postedDate) : postedLabel,
+    applicants: applicants,
+    jobLink: jobLink,
+    sourceUrl: rawJobLink,
+    summary: '',
+    why: '',
+    titleLevel: '',
+    jdImpliedLevel: '',
+    priority: '',
+    score: '',
+    status: 'New',
+    referralContact: referralContact,
+    importedAt: importedAt,
+    scoredAt: '',
+    sourceTask: sourceLabel || APIFY_JOB_DETAIL_ACTOR_ID,
+    rawRef: _serializeRawRef(markedItem),
+    jobDescription: description,
+    contractType: contractType,
+    experienceLevel: experienceLevel,
+    workType: workType,
+    publishedAt: publishedAt
+  };
+}
+
+function _formatDetailSalaryBanner(salaryInfo) {
+  if (!salaryInfo) return '';
+  var min = _formatSalaryNumber(salaryInfo.min_salary);
+  var max = _formatSalaryNumber(salaryInfo.max_salary);
+  var currency = _stringifyField(salaryInfo.currency_code);
+  var period = _stringifyField(salaryInfo.pay_period);
+  if (!min && !max) return '';
+  var amount = (min && max) ? (min + '–' + max) : (min || max);
+  return ('Salary: ' + amount + (currency ? ' ' + currency : '') + (period ? ' / ' + period : '')).trim();
+}
+
+function _formatSalaryNumber(value) {
+  var n = Number(value);
+  if (!isFinite(n) || n <= 0) return '';
+  return String(Math.round(n));
 }
 
 function _resolveJobId(item, rawJobLink) {
@@ -1464,7 +1719,7 @@ function _getScoreResponseSchema() {
       },
       us_visa_sponsorship_potential: {
         type: 'string',
-        enum: ['Likely (90%)', 'Possible (70%)', 'Unclear (50%)', 'Unlikely (20%)', 'No (0%)'],
+        enum: ['Yes (100%)', 'Likely (90%)', 'Possible (70%)', 'Unclear (50%)', 'US required (40%)', 'Unlikely (20%)', 'No (0%)'],
         description: 'Estimated US visa sponsorship potential, with an informational probability anchor.'
       },
       us_visa_reason: {
@@ -1661,9 +1916,11 @@ function _normalizeJobLevel(value) {
 
 function _normalizeVisaSponsorshipPotential(value) {
   var allowed = {
+    'Yes (100%)': true,
     'Likely (90%)': true,
     'Possible (70%)': true,
     'Unclear (50%)': true,
+    'US required (40%)': true,
     'Unlikely (20%)': true,
     'No (0%)': true
   };

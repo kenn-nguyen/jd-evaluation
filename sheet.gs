@@ -3,6 +3,8 @@ var SETTINGS_SHEET_NAME = 'Settings';
 var HELP_SHEET_NAME = 'Help';
 var DEDUP_ARCHIVE_SHEET_NAME = 'Dedup_Archive';
 var RAW_DATA_SHEET_NAME = 'Raw_Data';
+var APIFY_ACCOUNTS_SHEET_NAME = 'Apify_Accounts';
+var APIFY_ACCOUNTS_COLUMNS = ['label', 'batch_key', 'detail_key', 'active'];
 var JOB_PRIORITY_HEADER_ROW = 6;
 var JOB_PRIORITY_DATA_START_ROW = 7;
 var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Flagged'];
@@ -82,7 +84,6 @@ var SETTINGS_DEFAULT_ROWS = [
   ['setting_key', 'setting_value', 'notes'],
 
   ['# Scraping & Apify', '', ''],
-  ['APIFY_ACCOUNTS', '', 'JSON array of API tokens: ["apify_AAA","apify_BBB"]. Rotated round-robin; failed tokens are skipped automatically.'],
   ['APIFY_RUN_INPUT', '', 'JSON search input sent to Apify. Use {f_tpr} for auto-computed lookback in seconds. See Help sheet for example.'],
   ['APIFY_LOOKBACK_HOURS', '', 'Fixed lookback in hours (e.g. 48). Blank = auto-compute from time since last successful run.'],
   ['APIFY_MAX_LOOKBACK_HOURS', '168', 'Cap for auto-computed lookback in hours. Prevents huge result sets after long idle periods (default 7 days).'],
@@ -94,8 +95,8 @@ var SETTINGS_DEFAULT_ROWS = [
   ['SCORING_MODEL', 'gemini-2.5-flash', 'Gemini model used for scoring. gemini-2.5-flash recommended.'],
   ['SCORING_PARALLEL_REQUESTS', '3', 'Number of AI scoring requests sent in parallel per batch. 3 is safe for most quota tiers.'],
   ['SCORING_RPM_LIMIT', '0', 'Rate limit in requests/minute. Set to your Gemini/Vertex quota (e.g. 10 for free tier). 0 = no pacing.'],
-  ['SCORING_MAX_JOBS_PER_EXECUTION', '0', 'Max jobs scored per run. 0 = auto (fits within the 5-min Apps Script limit). Override if needed.'],
-  ['TARGET_PROFILE', '', 'Blank = use the built-in profile from prompts.gs. Paste your own profile text to override.'],
+  ['SCORING_MAX_JOBS_PER_EXECUTION', '0', '0 = auto (sized to fit the 6-minute Apps Script limit; large runs continue automatically across executions). Set a number only to cap it manually.'],
+  ['TARGET_PROFILE', '', 'Blank = use the built-in profile. Paste your own resume/profile text to override.'],
   ['SCORING_INSTRUCTIONS', 'default', 'default = use the built-in scoring prompt. Replace with your own instruction block if needed.'],
   ['FORCE_RESCORE', 'FALSE', 'Set TRUE to force re-scoring of already-scored jobs in the current fetch.'],
 
@@ -108,7 +109,8 @@ var SETTINGS_DEFAULT_ROWS = [
   ['AUTO_RESERVE_PRIORITIES', 'P01,P02', 'Priorities always kept in your lane (Owner=Me) for networking. Never auto-assigned to the assignee.'],
   ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to assignee lane (Owner=Assignee) after each run.'],
   ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs stay in your lane.'],
-  ['AUTO_ASSIGN_VISA', 'Likely (90%),Possible (70%)', 'Visa signals eligible for assignee routing. Weaker signals keep jobs in your lane. Values: Likely (90%), Possible (70%), Unclear (50%), Unlikely (20%), No (0%)'],
+  ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay in your lane. See Help → Visa Signals for what each label means.'],
+  ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status Skip during routing, regardless of priority (the role does not sponsor). Set FALSE to disable.'],
   ['RESERVED_COMPANIES', '', 'Companies always kept in your lane, case-insensitive (e.g. Stripe,Airbnb).'],
   ['AUTO_ASSIGN_EXCLUDE_COMPANIES', '', 'Companies to skip entirely during routing, case-insensitive (e.g. Google,Meta).'],
 
@@ -123,27 +125,37 @@ var HELP_ROWS = [
   ['Help', ''],
 
   ['# Quick Start', ''],
-  ['Step 1 — Apify token', 'Settings → APIFY_ACCOUNTS: paste a JSON array of tokens: ["apify_AAA","apify_BBB"]. Get tokens at apify.com/cheap_scraper/linkedin-job-scraper → "Try for free" → apify.com/account/integrations.'],
+  ['Step 1 — Apify tokens', 'Run Jobs Pipeline → Maintenance → Initialize Sheets, then open the Apify_Accounts sheet. Add one row per account: Label | Batch Key | Detail Key | Active=TRUE. Get tokens at apify.com → Account → Integrations.'],
   ['Step 2 — Gemini API key', 'In Apps Script editor: Project Settings → Script Properties → add GEMINI_API_KEY with your Gemini Developer API key. Leave GEMINI_API_ROUTE as developer.'],
   ['Step 3 — Vertex billing (optional)', 'To use Vertex instead: link this Apps Script project to a standard Google Cloud project, enable Vertex AI API, set GEMINI_API_ROUTE=vertex, fill in VERTEX_PROJECT_ID.'],
   ['Step 4 — Search input', 'Settings → APIFY_RUN_INPUT: paste your LinkedIn search JSON. Use {f_tpr} as a placeholder for auto-computed lookback. Example in the Apify section below.'],
-  ['Step 5 — Target profile (optional)', 'Settings → TARGET_PROFILE: paste your resume/profile text to override the built-in profile. Leave blank to use prompts.gs default.'],
+  ['Step 5 — Target profile (optional)', 'Settings → TARGET_PROFILE: paste your resume/profile text to override the built-in profile. Leave blank to use the built-in default.'],
   ['Step 6 — Routing (optional)', 'Settings → Routing & Delegation: configure which priorities go to you vs. your assignee, reserved companies, and visa filters.'],
   ['Step 7 — Validate and run', 'Jobs Pipeline → Maintenance → Validate Config. Then Jobs Pipeline → Run Now.'],
 
   ['# Apify & Scraping', ''],
   ['Apify actor', 'This tool only works with cheap_scraper/linkedin-job-scraper. Do not change the actor — it determines the response schema used throughout the pipeline.'],
-  ['Account rotation', 'Tokens in APIFY_ACCOUNTS rotate round-robin. The system starts from the token after the last successful one. If all tokens fail, you receive an email alert.'],
+  ['Account rotation', 'Tokens in the Apify_Accounts sheet rotate in row order. Set Active=FALSE to skip a row. The system resumes from the last working token. If all tokens fail, you receive an email alert.'],
   ['APIFY_RUN_INPUT example', '{"startUrls":["https://www.linkedin.com/jobs/search/?f_TPR={f_tpr}&geoId=90000084&keywords=%22product+manager%22"]} — {f_tpr} auto-expands to e.g. r3600 (LinkedIn relative-time format).'],
-  ['Import old runs', 'Jobs Pipeline → Apify Tools: Import Run ID... to re-score a finished run. Import Dataset ID... if you only have the dataset ID. Import Last N Runs... to pull the N most recent successful runs across all accounts.'],
+  ['Import jobs manually', 'Jobs Pipeline → Import Jobs Manually: paste LinkedIn job URLs or raw job IDs (separated by spaces, commas, or new lines). Duplicates already in the sheet are skipped automatically.'],
 
   ['# AI Scoring', ''],
   ['Reevaluate rows', 'Jobs Pipeline → Reevaluate Selected Rows: rescores only selected jobs. Only New and Networking rows are eligible.'],
-  ['Large runs', 'Large scoring batches continue automatically in chunks. If a batch exceeds the 5-min Apps Script limit, the script saves progress and schedules a continuation — no action needed.'],
+  ['Large runs', 'Large scoring batches continue automatically in chunks. If a batch approaches the 6-minute Apps Script limit, the script saves progress and schedules a continuation — no action needed.'],
   ['Parallel requests', 'SCORING_PARALLEL_REQUESTS controls how many jobs are scored simultaneously. 3 is safe for most quota tiers; increase only if you have high RPM quota.'],
   ['If AI output is invalid', 'The script retries each job once on a bad AI response. If it still fails, that job is skipped and the rest continue.'],
   ['Resetting scoring prompt', 'Type default into SCORING_INSTRUCTIONS to restore the built-in prompt. No need to re-run Initialize Sheets.'],
   ['Vertex route', 'Vertex uses the Vertex AI REST endpoint with Apps Script OAuth, billed to your linked Google Cloud project. Usage does not count against Gemini Developer API quotas.'],
+
+  ['# Visa Signals (US sponsorship)', ''],
+  ['What it is', 'An informational read of how likely the employer is to sponsor a US work visa. It never changes a job\'s score or priority — it only affects routing. The % is a rough confidence anchor, not a guarantee.'],
+  ['Yes (100%)', 'The job post explicitly offers visa / sponsorship / relocation support.'],
+  ['Likely (90%)', 'No explicit offer, but a known strong sponsor — big tech or a large global fintech that routinely sponsors.'],
+  ['Possible (70%)', 'A soft positive signal: large/global employer, "open to all candidates", or international-friendly language.'],
+  ['Unclear (50%)', 'The post is silent on sponsorship — no signal either way. This is the default.'],
+  ['US required (40%)', 'Asks for US applicants / US location / US work authorization, but does not explicitly rule sponsorship out.'],
+  ['Unlikely (20%)', 'Silent on sponsorship and the context leans against it — small/early-stage startup, government/defense, or staffing/contract.'],
+  ['No (0%)', 'The post explicitly says no sponsorship, or requires citizenship / security clearance. These are auto-set to Skip (see AUTO_SKIP_VISA_NO).'],
 
   ['# Notifications', ''],
   ['Owner notification email', 'If NOTIFY_EMAIL is blank, no email alerts are sent — not for P01 jobs, not for failures.'],
@@ -159,12 +171,14 @@ function setupJobPriorityWorkbook() {
   var helpSheet = _getOrCreateSheet(spreadsheet, HELP_SHEET_NAME);
   var rawDataSheet = _getOrCreateSheet(spreadsheet, RAW_DATA_SHEET_NAME);
   var assignedSheet = _getOrCreateSheet(spreadsheet, ASSIGNED_SHEET_NAME);
+  var apifyAccountsSheet = _getOrCreateSheet(spreadsheet, APIFY_ACCOUNTS_SHEET_NAME);
 
   _setupJobPrioritySheet(jobSheet);
   _setupSettingsSheet(settingsSheet);
   _setupHelpSheet(helpSheet);
   _setupRawDataSheet(rawDataSheet);
   _setupAssignedSheet(assignedSheet);
+  _setupApifyAccountsSheet(apifyAccountsSheet);
   _protectSheetsForAssignee(spreadsheet);
 }
 
@@ -201,6 +215,16 @@ function ensureWorkbookReadyForRuntime() {
       rawDataSheet.getLastRow() < 1 ||
       !_headerMatches(rawDataSheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).getValues()[0], RAW_DATA_COLUMNS)) {
     _setupRawDataSheet(rawDataSheet);
+  }
+
+  var apifyAccountsSheet = spreadsheet.getSheetByName(APIFY_ACCOUNTS_SHEET_NAME);
+  if (!apifyAccountsSheet) {
+    apifyAccountsSheet = _getOrCreateSheet(spreadsheet, APIFY_ACCOUNTS_SHEET_NAME);
+    _setupApifyAccountsSheet(apifyAccountsSheet);
+  } else if (apifyAccountsSheet.getMaxColumns() < APIFY_ACCOUNTS_COLUMNS.length ||
+      apifyAccountsSheet.getLastRow() < APIFY_ACCOUNTS_HEADER_ROW ||
+      !_headerMatches(apifyAccountsSheet.getRange(APIFY_ACCOUNTS_HEADER_ROW, 1, 1, APIFY_ACCOUNTS_COLUMNS.length).getValues()[0], APIFY_ACCOUNTS_COLUMNS)) {
+    _setupApifyAccountsSheet(apifyAccountsSheet);
   }
 }
 
@@ -1077,6 +1101,97 @@ function _setupRawDataSheet(sheet) {
   sheet.hideColumns(2, RAW_DATA_COLUMNS.length - 1);
 }
 
+function _getApifyAccountsSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(APIFY_ACCOUNTS_SHEET_NAME);
+}
+
+// Header row 1, instruction row 2, data from row 3.
+var APIFY_ACCOUNTS_HEADER_ROW = 1;
+var APIFY_ACCOUNTS_DATA_START_ROW = 3;
+
+function _setupApifyAccountsSheet(sheet) {
+  _ensureSheetDimensions(sheet, APIFY_ACCOUNTS_COLUMNS.length, APIFY_ACCOUNTS_DATA_START_ROW);
+
+  sheet.getRange(APIFY_ACCOUNTS_HEADER_ROW, 1, 1, APIFY_ACCOUNTS_COLUMNS.length).setValues([APIFY_ACCOUNTS_COLUMNS]);
+  sheet.getRange(APIFY_ACCOUNTS_HEADER_ROW, 1, 1, APIFY_ACCOUNTS_COLUMNS.length)
+    .setFontWeight('bold')
+    .setBackground('#d0e0e3');
+
+  // Instruction row (row 2) — explains each column. One account per row from row 3 down.
+  sheet.getRange(2, 1, 1, APIFY_ACCOUNTS_COLUMNS.length).setValues([[
+    'Friendly name (e.g. John) — for your reference only',
+    'API token for the BATCH scraper actor (cheap_scraper/linkedin-job-scraper)',
+    'API token for the DETAIL actor (apimaestro/linkedin-job-detail) — used by manual import',
+    'TRUE to use this account; blank or FALSE to skip it. Row order = rotation order.'
+  ]]);
+  sheet.getRange(2, 1, 1, APIFY_ACCOUNTS_COLUMNS.length)
+    .setFontStyle('italic')
+    .setFontColor('#666666')
+    .setBackground('#f3f3f3')
+    .setWrap(true);
+
+  sheet.setFrozenRows(2);
+  sheet.setColumnWidth(1, 140);
+  sheet.setColumnWidth(2, 300);
+  sheet.setColumnWidth(3, 300);
+  sheet.setColumnWidth(4, 80);
+
+  // One-time migration: seed batch keys from the legacy APIFY_ACCOUNTS JSON setting if the
+  // accounts table has no data rows yet, so the existing scheduled run keeps the same keys/order.
+  if (sheet.getLastRow() < APIFY_ACCOUNTS_DATA_START_ROW) {
+    var legacy = _parseLegacyApifyAccounts();
+    if (legacy.length) {
+      var rows = legacy.map(function(token, i) {
+        return ['Account ' + (i + 1), token, '', true];
+      });
+      sheet.getRange(APIFY_ACCOUNTS_DATA_START_ROW, 1, rows.length, APIFY_ACCOUNTS_COLUMNS.length).setValues(rows);
+    }
+  }
+}
+
+function _parseLegacyApifyAccounts() {
+  var raw = String(getSettingsMap().APIFY_ACCOUNTS || '').trim();
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw).filter(function(a) { return typeof a === 'string' && a.trim(); });
+  } catch (e) {
+    return [];
+  }
+}
+
+// Reads the Apify_Accounts sheet into ordered key lists for both actors.
+// Active rows only (active TRUE or blank). Falls back to the legacy APIFY_ACCOUNTS JSON
+// for batch keys when the sheet is empty/missing, so the batch flow never breaks.
+function _getApifyAccounts() {
+  var sheet = _getApifyAccountsSheet();
+  var batch = [];
+  var detail = [];
+  var labels = [];
+
+  if (sheet && sheet.getLastRow() >= APIFY_ACCOUNTS_DATA_START_ROW) {
+    var rowCount = sheet.getLastRow() - APIFY_ACCOUNTS_DATA_START_ROW + 1;
+    var values = sheet.getRange(APIFY_ACCOUNTS_DATA_START_ROW, 1, rowCount, APIFY_ACCOUNTS_COLUMNS.length).getValues();
+    values.forEach(function(row) {
+      var activeRaw = _stringifyField(row[3]).trim().toUpperCase();
+      var isActive = activeRaw === '' || activeRaw === 'TRUE' || activeRaw === 'YES' || row[3] === true;
+      if (!isActive) return;
+      var batchKey = _stringifyField(row[1]).trim();
+      var detailKey = _stringifyField(row[2]).trim();
+      var label = _stringifyField(row[0]).trim();
+      if (batchKey) { batch.push(batchKey); }
+      if (detailKey) { detail.push(detailKey); }
+      labels.push(label);
+    });
+  }
+
+  // Back-compat: no sheet data → use legacy APIFY_ACCOUNTS JSON for batch keys.
+  if (!batch.length) {
+    batch = _parseLegacyApifyAccounts();
+  }
+
+  return { batch: batch, detail: detail, labels: labels };
+}
+
 function _syncJobPrioritySchemaForRuntime(sheet) {
   // Delete surplus columns FIRST (before remap reads them as valid data)
   var maxCols = sheet.getMaxColumns();
@@ -1635,6 +1750,13 @@ function _extractJobDescriptionFromRawRef(rawRef) {
 
   try {
     parsed = JSON.parse(String(rawRef));
+    // apimaestro/linkedin-job-detail nests the JD under job_info.description.
+    if (parsed && parsed.job_info && parsed.job_info.description) {
+      description = _truncate(_cleanJobDescription(parsed.job_info.description), 12000);
+      if (description) {
+        return description;
+      }
+    }
     description = _pickFirstValue(parsed || {}, keys);
     description = _truncate(_cleanJobDescription(description), 12000);
     if (description) {
@@ -1659,6 +1781,9 @@ function _extractSourceUrlFromRawRef(rawRef) {
   if (!rawRef) return '';
   try {
     var p = JSON.parse(String(rawRef));
+    if (p && p.job_info && p.job_info.job_url) {
+      return _stringifyField(p.job_info.job_url);
+    }
     return _stringifyField(p.jobUrl || p.applyUrl || p.url || p.link || p.postingUrl || '');
   } catch (e) { return ''; }
 }
@@ -1674,6 +1799,12 @@ function _extractLinkedInJobIdFromRawRef(rawRef) {
 
   try {
     parsed = JSON.parse(String(rawRef));
+    if (parsed && parsed.job_info && parsed.job_info.job_posting_id) {
+      directJobId = _extractLinkedInJobId(_stringifyField(parsed.job_info.job_posting_id));
+      if (directJobId) {
+        return directJobId;
+      }
+    }
     directJobId = _extractLinkedInJobId(_pickFirstValue(parsed || {}, keys));
     if (directJobId) {
       return directJobId;
@@ -2144,6 +2275,9 @@ function _setupAssignedSheet(sheet) {
   sheet.setConditionalFormatRules(filteredAssignedRules);
 
   sheet.hideColumns(ASSIGNED_COLUMN_INDEX.job_id);
+  // job_id stores large LinkedIn integers — force text format so Sheets never auto-converts them.
+  sheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.job_id,
+    Math.max(sheet.getMaxRows() - ASSIGNED_DATA_START_ROW + 1, 1), 1).setNumberFormat('@');
   _applyAISummaryColumnGroup(sheet, ASSIGNED_COLUMN_INDEX.summary);
 
   var colWidths = {
@@ -2190,6 +2324,7 @@ function _pushJobsToAssignedSheet(jobs) {
   var startRow = Math.max(assignedSheet.getLastRow() + 1, ASSIGNED_DATA_START_ROW);
   var rows = toAdd.map(function(job) { return _buildAssignedRow(job, 'New'); });
   assignedSheet.getRange(startRow, 1, rows.length, ASSIGNED_COLUMNS.length).setValues(rows);
+  assignedSheet.getRange(startRow, ASSIGNED_COLUMN_INDEX.job_id, rows.length, 1).setNumberFormat('@');
 
   var richTexts = toAdd.map(function(job) {
     return [_buildJobLinkRichText(job.jobId, job.mergedJobIds)];
@@ -2242,7 +2377,18 @@ function _sortAssignedSheet(sheet) {
   var sortedValues = indices.map(function(i) { return values[i]; });
   var sortedRichTexts = indices.map(function(i) { return richTexts[i]; });
   dataRange.setValues(sortedValues);
-  sheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.job_link, numRows, 1).setRichTextValues(sortedRichTexts);
+  // Re-apply '@' format so job_id integers are never auto-converted to dates by Sheets.
+  sheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.job_id, numRows, 1).setNumberFormat('@');
+
+  // Restore sorted rich texts. For any cell whose captured rich text is empty (can happen when
+  // the preceding flush hasn't propagated writes from a different sheet reference), rebuild the
+  // URL from the sorted job_id value so the cell is never left blank.
+  var finalRichTexts = sortedRichTexts.map(function(rt, j) {
+    if (rt[0] && rt[0].getText()) return rt;
+    var jobId = _stringifyField(sortedValues[j][ASSIGNED_COLUMN_INDEX.job_id - 1]).trim();
+    return [_buildJobLinkRichText(jobId, '')];
+  });
+  sheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.job_link, numRows, 1).setRichTextValues(finalRichTexts);
 }
 
 function _syncAssignedRowsForJobs(jobs) {
@@ -2309,7 +2455,7 @@ function _findJobPriorityRowByJobId(jobId) {
 }
 
 function _protectSheetsForAssignee(spreadsheet) {
-  var sheetsToProtect = [JOB_PRIORITY_SHEET_NAME, SETTINGS_SHEET_NAME, HELP_SHEET_NAME, RAW_DATA_SHEET_NAME];
+  var sheetsToProtect = [JOB_PRIORITY_SHEET_NAME, SETTINGS_SHEET_NAME, HELP_SHEET_NAME, RAW_DATA_SHEET_NAME, APIFY_ACCOUNTS_SHEET_NAME];
 
   sheetsToProtect.forEach(function(name) {
     var sheet = spreadsheet.getSheetByName(name);
