@@ -180,6 +180,9 @@ function setupJobPriorityWorkbook() {
   _setupAssignedSheet(assignedSheet);
   _setupApifyAccountsSheet(apifyAccountsSheet);
   _protectSheetsForAssignee(spreadsheet);
+  // Installable onEdit trigger so assignee status changes sync to the protected Job_Priority
+  // sheet (the simple onEdit cannot — it runs as the assignee and is blocked by protection).
+  _ensureEditTrigger();
 }
 
 function ensureWorkbookReadyForRuntime() {

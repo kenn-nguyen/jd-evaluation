@@ -92,7 +92,11 @@ function sortBothSheetsNow() {
   SpreadsheetApp.getUi().alert('Sort & Rank complete.');
 }
 
-function onEdit(e) {
+// Installable onEdit handler (NOT the simple onEdit trigger). Created by _ensureEditTrigger()
+// under the owner's account so it runs AS THE OWNER — this is what lets an assignee's status
+// change on the Assigned sheet write back to the owner-protected Job_Priority sheet, and lets
+// bounce-back emails send (authorized services are unavailable to simple triggers).
+function handleSheetEdit(e) {
   if (!e || !e.range) return;
 
   var sheet = e.range.getSheet();
@@ -744,6 +748,19 @@ function createRunTrigger() {
 
 function createHourlyTrigger() {
   createRunTrigger();
+}
+
+// Installable onEdit trigger bound to handleSheetEdit. Runs as whoever creates it (the owner),
+// so cross-sheet writes to the owner-protected Job_Priority sheet and bounce-back emails work
+// even when the edit was made by the assignee. Idempotent: clears any prior copy first.
+function _ensureEditTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'handleSheetEdit') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('handleSheetEdit')
+    .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
+    .onEdit()
+    .create();
 }
 
 function removeHourlyTriggers() {
@@ -1439,8 +1456,8 @@ function _notifyAssigneeOfNewJobs(config, count) {
   });
 }
 
-// Best-effort owner alert on a bounce-back. Called from onEdit (a simple trigger), so MailApp may be
-// unauthorized and silently fail — the in-sheet cell note added by the caller is the reliable signal.
+// Owner alert on a bounce-back. Called from handleSheetEdit (an installable trigger running as the
+// owner), so MailApp is authorized. The in-sheet cell note added by the caller is a secondary signal.
 function _notifyOwnerBounceBack(jobId, reason, note) {
   var config;
   try { config = loadRuntimeConfig(); } catch (e) { return; }
