@@ -83,13 +83,29 @@ function onInstall() {
 
 function sortBothSheetsNow() {
   ensureWorkbookReadyForRuntime();
+  // Apply assignment rules first: route New + unowned jobs to lanes (owner set by
+  // priority/visa/score), so the Assigned mirror reflects the rules rather than blindly
+  // pulling in whatever happens to be owned. Then rank + mirror + sort.
+  var counts = { assigned: 0, reserved: 0, skipped: 0 };
+  try {
+    counts = _routeNewJobs(loadRuntimeConfig());
+  } catch (routeError) { Logger.log('Routing during Sort & Rank failed: ' + routeError); }
+  // Flush so routing's owner/status writes are visible to the reconcile read in sortAndRankJobs.
+  SpreadsheetApp.flush();
   sortAndRankJobs();
   // Flush ensures writes from _syncAssignedRowsForJobs (which uses its own sheet reference)
   // are committed before _sortAssignedSheet reads via a different sheet reference.
   SpreadsheetApp.flush();
   var assignedSheet = _getAssignedSheet();
   if (assignedSheet) _sortAssignedSheet(assignedSheet);
-  SpreadsheetApp.getUi().alert('Sort & Rank complete.');
+  var routed = counts.assigned + counts.reserved + counts.skipped;
+  SpreadsheetApp.getUi().alert(
+    'Sort & Rank complete.' +
+    (routed
+      ? '\nRouted ' + routed + ' new job(s): ' + counts.assigned + ' → assignee, ' +
+        counts.reserved + ' → your lane, ' + counts.skipped + ' → skipped.'
+      : '\nNo new jobs needed routing.')
+  );
 }
 
 // Installable onEdit handler (NOT the simple onEdit trigger). Created by _ensureEditTrigger()
@@ -116,9 +132,30 @@ function handleSheetEdit(e) {
       }
     } catch (err) { Logger.log(err); }
   } else if (sheetName === ASSIGNED_SHEET_NAME) {
-    if (row < ASSIGNED_DATA_START_ROW || col !== ASSIGNED_COLUMN_INDEX.status) return;
-    try { _handleAssignedStatusEdit(sheet, row, e.value); } catch (err) { Logger.log(err); }
+    if (row < ASSIGNED_DATA_START_ROW) return;
+    try {
+      if (col === ASSIGNED_COLUMN_INDEX.status) {
+        _handleAssignedStatusEdit(sheet, row, e.value);
+      } else if (col === ASSIGNED_COLUMN_INDEX.notes) {
+        _handleAssignedNotesEdit(sheet, row);
+      }
+    } catch (err) { Logger.log(err); }
   }
+}
+
+// Notes edited on the Assigned sheet: if the row is Flagged, keep JP referral_contact in sync so
+// a note typed AFTER flagging (the natural order) isn't lost. The flag handler only captures the
+// note at the instant of the status change, so without this a flag-then-note sequence loses it.
+function _handleAssignedNotesEdit(sheet, row) {
+  var status = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.status).getValue());
+  if (status !== 'Flagged') return;
+  var jobId = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.job_id).getValue()).trim();
+  if (!jobId) return;
+  var jpRow = _findJobPriorityRowByJobId(jobId);
+  if (!jpRow) return;
+  var note = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.notes).getValue());
+  _getJobPrioritySheet().getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.referral_contact)
+    .setValue(note ? '⚑ ' + note : '');
 }
 
 function _jobRecordFromJobPriorityRow(sheet, row) {
@@ -127,14 +164,25 @@ function _jobRecordFromJobPriorityRow(sheet, row) {
   return _sheetRowToJobRecord(values, formulas, row, {});
 }
 
+// Canonical job_id for a Job_Priority row. The job_id cell can be date-corrupted by Sheets
+// (large integers become date serials), so fall back to the job_link HYPERLINK formula —
+// same resolution as _sheetRowToJobRecord. Raw .getValue() must NOT be used for cross-sheet
+// lookups, or the Assigned-sheet match silently fails.
+function _canonicalJobIdFromJpRow(sheet, row) {
+  var rawJobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+  var jobLinkFormula = sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_link).getFormula() || '';
+  var jobLinkUrl = _extractUrlFromHyperlinkFormula(jobLinkFormula) || '';
+  return _extractLinkedInJobId(rawJobId) || _extractLinkedInJobId(jobLinkUrl) || rawJobId;
+}
+
 // Owner column edited on Job_Priority: create or remove the assignee's mirror row.
 function _handleJobPriorityOwnerEdit(sheet, row, newValue, oldValue) {
   var nv = _stringifyField(newValue);
-  if (nv === 'Assignee') {
+  if (_isAssignee(nv)) {
     var job = _jobRecordFromJobPriorityRow(sheet, row);
     if (job) _pushJobsToAssignedSheet([job]); // resets to New, applies action default, re-sorts queue
-  } else if (_stringifyField(oldValue) === 'Assignee') {
-    var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+  } else if (_isAssignee(oldValue)) {
+    var jobId = _canonicalJobIdFromJpRow(sheet, row);
     var assignedSheet = _getAssignedSheet();
     if (assignedSheet && jobId) _removeFromAssignedSheet(assignedSheet, jobId);
   }
@@ -144,7 +192,7 @@ function _handleJobPriorityOwnerEdit(sheet, row, newValue, oldValue) {
 // Special case: Skip = owner decided this job is dead — remove from Assigned unconditionally.
 function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
   var nv = _stringifyField(newValue);
-  var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+  var jobId = _canonicalJobIdFromJpRow(sheet, row);
   var assignedSheet = _getAssignedSheet();
   if (!assignedSheet || !jobId) return;
 
@@ -154,7 +202,7 @@ function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
   }
 
   var owner = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.owner).getValue());
-  if (owner !== 'Assignee') return;
+  if (!_isAssignee(owner)) return;
   var arow = _getAssignedJobIdIndex(assignedSheet)[jobId];
   if (arow && ASSIGNED_STATUS_OPTIONS.indexOf(nv) !== -1) {
     assignedSheet.getRange(arow, ASSIGNED_COLUMN_INDEX.status).setValue(nv);
@@ -163,7 +211,7 @@ function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
 
 // Action column edited on Job_Priority: mirror down to her row.
 function _handleJobPriorityActionEdit(sheet, row) {
-  var jobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
+  var jobId = _canonicalJobIdFromJpRow(sheet, row);
   var action = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.action).getValue());
   var assignedSheet = _getAssignedSheet();
   if (!assignedSheet || !jobId) return;
@@ -1499,6 +1547,12 @@ function _routeNewJobs(config) {
   var lastRow = jobSheet.getLastRow();
   if (lastRow < JOB_PRIORITY_DATA_START_ROW) return counts;
 
+  // Refresh owner/status/action validation BEFORE writing — this function writes the owner
+  // column directly (unlike writeJobs/replaceAllJobs which refresh it themselves). Without this,
+  // sheets created before 'Assignee (auto)' existed still enforce the old [Me, Assignee] list and
+  // reject the write. Idempotent; also self-heals the dropdown so the new value is selectable.
+  _applyStatusValidation(jobSheet);
+
   var records = getExistingJobRecords();
   var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
   var ownerColVals = jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.owner, numRows, 1).getValues();
@@ -1509,24 +1563,32 @@ function _routeNewJobs(config) {
   records.forEach(function(r) {
     var idx = r.rowNumber - JOB_PRIORITY_DATA_START_ROW;
     if (idx < 0 || idx >= numRows) return;
-    if (_stringifyField(ownerColVals[idx][0])) return;              // sticky: already owned
+    var ownerVal = _stringifyField(ownerColVals[idx][0]);
+    // Locked: a manual claim ('Me') or a manual delegation (plain 'Assignee'). Re-manageable:
+    // empty (unmanaged) or 'Assignee (auto)' (a prior rules assignment). Plus only status 'New'.
+    if (ownerVal === 'Me' || ownerVal === 'Assignee') return;
     if (_stringifyField(statusColVals[idx][0] || 'New') !== 'New') return;
+    var wasAuto = (ownerVal === OWNER_AUTO_ASSIGNEE);
 
     var priority = _stringifyField(r.priority);
     var company = (_stringifyField(r.company) || '').toLowerCase().trim();
 
-    // Visa hard block → skip regardless of priority/company. The role explicitly does not
-    // sponsor, so the candidate cannot take it; networking won't change a no-sponsorship policy.
+    // Rules only ever set owner='Assignee (auto)'. Every other outcome CLEARS owner to empty —
+    // so a previously auto-assigned row that no longer qualifies gets un-assigned, and empty
+    // rows stay re-evaluable. 'Me' / plain 'Assignee' are manual and never reached (locked above).
+
+    // Visa hard block → skip status. The role explicitly does not sponsor, so the candidate
+    // cannot take it; networking won't change a no-sponsorship policy.
     if (autoSkipVisaNo && _stringifyField(r.usVisaSponsorshipPotential) === 'No (0%)') {
-      ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
+      ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
     }
-    // Hard exclude → skip
+    // Hard exclude → skip status
     if (excludeCompanies.indexOf(company) !== -1) {
-      ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
+      ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
     }
-    // Reserved company or top priority → my lane (networking)
+    // Reserved company or top priority → left empty for your review (never delegated)
     if (reservedCompanies.indexOf(company) !== -1 || reservePriorities.indexOf(priority) !== -1) {
-      ownerColVals[idx][0] = 'Me'; counts.reserved++; return;
+      ownerColVals[idx][0] = ''; counts.reserved++; return;
     }
     // Assignee band → her lane if it clears visa + score
     if (assigneePriorities.indexOf(priority) !== -1) {
@@ -1534,14 +1596,16 @@ function _routeNewJobs(config) {
       var scoreOk = true;
       if (minScore > 0) { var s = Number(r.score); scoreOk = !isNaN(s) && s >= minScore; }
       if (visaOk && scoreOk) {
-        ownerColVals[idx][0] = 'Assignee'; actionColVals[idx][0] = 'Fill & Submit';
-        r.owner = 'Assignee'; r.action = 'Fill & Submit';
-        assigneeJobs.push(r); counts.assigned++; return;
+        ownerColVals[idx][0] = OWNER_AUTO_ASSIGNEE; actionColVals[idx][0] = 'Fill & Submit';
+        r.owner = OWNER_AUTO_ASSIGNEE; r.action = 'Fill & Submit';
+        // Only count/push genuinely new assignments — a re-confirmed auto job is already in Assigned.
+        if (!wasAuto) { assigneeJobs.push(r); counts.assigned++; }
+        return;
       }
-      ownerColVals[idx][0] = 'Me'; counts.reserved++; return;       // in-band but filtered out → owner decides
+      ownerColVals[idx][0] = ''; counts.reserved++; return;   // in-band but filtered out → un-assign, re-evaluable later
     }
-    // Everything else (P06+) → skip
-    ownerColVals[idx][0] = 'Me'; statusColVals[idx][0] = 'Skip'; counts.skipped++;
+    // Everything else (P06+) → skip status, owner cleared
+    ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'Skip'; counts.skipped++;
   });
 
   jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.owner, numRows, 1).setValues(ownerColVals);
@@ -1623,13 +1687,19 @@ function reassignJobsPrompt() {
   var config = loadRuntimeConfig();
 
   var counts = _routeNewJobs(config);
+  // Reconcile the Assigned sheet so routing's un-assignments propagate immediately: a job whose
+  // owner was just cleared (no longer qualifies) gets its stale Assigned row removed here rather
+  // than lingering until the next Sort & Rank. Idempotent.
+  SpreadsheetApp.flush();
+  _reconcileAssignedSheet(getExistingJobRecords());
+
   var total = counts.assigned + counts.reserved + counts.skipped;
   if (!total) { ui.alert('No unrouted New jobs to route.'); return; }
 
   ui.alert(
     'Routed ' + total + ' new job(s):\n' +
     '• ' + counts.assigned + ' → assignee lane\n' +
-    '• ' + counts.reserved + ' → your lane (networking)\n' +
+    '• ' + counts.reserved + ' → left unowned for your review\n' +
     '• ' + counts.skipped + ' → skipped (low priority/excluded)'
   );
 }

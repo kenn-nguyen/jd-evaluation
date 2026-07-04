@@ -16,8 +16,18 @@ var JOB_PRIORITY_STATUS_SORT_ORDER = {
   Submitted: 4,
   Skip: 5
 };
-var JOB_PRIORITY_OWNER_OPTIONS = ['Me', 'Assignee'];
+// 'Assignee' = a manual delegation (locked from the rules). 'Assignee (auto)' = a rules-set
+// assignment that the rules may re-evaluate/pull on later runs. Only the rules ever write the
+// '(auto)' value, so no manual action can land in the re-manageable bucket. _isAssignee() treats
+// both as "assigned to the assignee" for mirroring/sync/prune.
+var OWNER_AUTO_ASSIGNEE = 'Assignee (auto)';
+var JOB_PRIORITY_OWNER_OPTIONS = ['Me', 'Assignee', OWNER_AUTO_ASSIGNEE];
 var ACTION_OPTIONS = ['Fill & Submit', 'Fill Only'];
+
+function _isAssignee(owner) {
+  var v = _stringifyField(owner).trim();
+  return v === 'Assignee' || v === OWNER_AUTO_ASSIGNEE;
+}
 var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'rank',
   'priority',
@@ -106,9 +116,9 @@ var SETTINGS_DEFAULT_ROWS = [
   ['QUIET_END_HOUR', '5', 'Hour to resume running (0-23, Pacific Time). Default 5 = 5 am PT. Set both to 0 to disable.'],
 
   ['# Routing & Delegation', '', ''],
-  ['AUTO_RESERVE_PRIORITIES', 'P01,P02', 'Priorities always kept in your lane (Owner=Me) for networking. Never auto-assigned to the assignee.'],
-  ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to assignee lane (Owner=Assignee) after each run.'],
-  ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs stay in your lane.'],
+  ['AUTO_RESERVE_PRIORITIES', 'P01,P02', 'Priorities never auto-delegated. Left with an empty Owner for your review (not stamped Me). See Help → Owner & lanes.'],
+  ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to the assignee (Owner set to "Assignee (auto)") after each run, if they clear the visa + score filters.'],
+  ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs are left unowned (empty) for your review.'],
   ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay in your lane. See Help → Visa Signals for what each label means.'],
   ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status Skip during routing, regardless of priority (the role does not sponsor). Set FALSE to disable.'],
   ['RESERVED_COMPANIES', '', 'Companies always kept in your lane, case-insensitive (e.g. Stripe,Airbnb).'],
@@ -156,6 +166,14 @@ var HELP_ROWS = [
   ['US required (40%)', 'Asks for US applicants / US location / US work authorization, but does not explicitly rule sponsorship out.'],
   ['Unlikely (20%)', 'Silent on sponsorship and the context leans against it — small/early-stage startup, government/defense, or staffing/contract.'],
   ['No (0%)', 'The post explicitly says no sponsorship, or requires citizenship / security clearance. These are auto-set to Skip (see AUTO_SKIP_VISA_NO).'],
+
+  ['# Owner & lanes', ''],
+  ['What Owner means', 'The Owner column decides whose lane a job is in. Set it from the dropdown, or let the rules set it. Empty = unmanaged.'],
+  ['(empty)', 'Unmanaged. The rules may act on it each run (route to the assignee, leave it, or Skip it). Your review pool = empty-owner, New, non-Skip jobs.'],
+  ['Me', 'Your manual claim. The rules never touch it. Clear it back to empty to hand the job back to the rules.'],
+  ['Assignee', 'A manual delegation (you picked it). Locked — the rules never re-evaluate or pull it. Mirrored to the Assigned sheet.'],
+  ['Assignee (auto)', 'Set by the rules. The rules may re-evaluate it on later runs and pull it back (clear/Skip) if it no longer qualifies — e.g. after a reevaluation drops its priority or flips visa to No. Only the rules write this value. Also mirrored to Assigned.'],
+  ['Bounce-backs', 'When the assignee Flags a job or finishes a Fill-Only job, it returns to you as Owner=Me with the status + a note.'],
 
   ['# Notifications', ''],
   ['Owner notification email', 'If NOTIFY_EMAIL is blank, no email alerts are sent — not for P01 jobs, not for failures.'],
@@ -379,7 +397,7 @@ function writeJobs(rows) {
   _applyStatusValidation(sheet);
 
   var assignedJobs = rows.filter(function(job) {
-    return _stringifyField(job.owner) === 'Assignee';
+    return _isAssignee(job.owner);
   });
   if (assignedJobs.length) _syncAssignedRowsForJobs(assignedJobs);
 }
@@ -670,7 +688,7 @@ function replaceAllJobs(rows, opts) {
     _applyJobLinkRichTexts(sheet, JOB_PRIORITY_DATA_START_ROW, rows);
 
     var assignedJobs = rows.filter(function(job) {
-      return _stringifyField(job.owner) === 'Assignee';
+      return _isAssignee(job.owner);
     });
     if (assignedJobs.length) _syncAssignedRowsForJobs(assignedJobs);
   }
@@ -744,7 +762,7 @@ function pruneExpiredJobRows(days) {
     // Always keep: active outreach, last-mile items, and assignee work — never silently prune these.
     var protectedStatus = record.status === 'Submitted' || record.status === 'Networking' ||
                           record.status === 'Flagged';
-    if (protectedStatus || _stringifyField(record.owner) === 'Assignee') {
+    if (protectedStatus || _isAssignee(record.owner)) {
       keepRecords.push(record);
       return;
     }
@@ -961,6 +979,65 @@ function sortAndRankJobs() {
   var sortedRecords = getExistingJobRecords().sort(_compareJobsForDisplay);
   sortedRecords.forEach(function(record, i) { record.rank = i + 1; });
   replaceAllJobs(sortedRecords);
+  // Self-heal the Assigned sheet on every rank: drop rows the assignee no longer owns
+  // (Skip'd, flagged/bounced back to owner, un-assigned, or whose JP row is gone).
+  _reconcileAssignedSheet(sortedRecords);
+}
+
+// Makes the Assigned sheet fully consistent with Job_Priority ownership. Two passes:
+//   Remove — drop Assigned rows the assignee no longer owns: JP row missing, JP owner no longer
+//            'Assignee' (flagged/bounced/un-assigned), or JP status 'Skip'. Submitted assignee
+//            rows are kept as history.
+//   Add    — ensure every active assignee-owned job (owner='Assignee', status not Submitted/Skip)
+//            is present, covering bulk Owner→Assignee edits the single-cell onEdit handler misses.
+// Reuses the already-loaded JP records; both passes are idempotent.
+function _reconcileAssignedSheet(records) {
+  var assignedSheet = _getAssignedSheet();
+  if (!assignedSheet) return;
+
+  // Map every JP id (primary + merged) → its owner/status.
+  var jpById = {};
+  (records || []).forEach(function(r) {
+    var info = { owner: _stringifyField(r.owner), status: _stringifyField(r.status) || 'New' };
+    var ids = [r.jobId];
+    if (r.mergedJobIds) {
+      _stringifyField(r.mergedJobIds).split(',').forEach(function(p) { ids.push(p); });
+    }
+    ids.forEach(function(id) {
+      var key = _stringifyField(id).trim();
+      if (key) jpById[key] = info;
+    });
+  });
+
+  // --- Remove pass (only if the Assigned sheet has data rows) ---
+  var lastRow = assignedSheet.getLastRow();
+  if (lastRow >= ASSIGNED_DATA_START_ROW) {
+    var rowCount = lastRow - ASSIGNED_DATA_START_ROW + 1;
+    var ids = assignedSheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.job_id, rowCount, 1).getValues();
+    var staleRows = [];
+    for (var i = 0; i < ids.length; i++) {
+      var id = _stringifyField(ids[i][0]).trim();
+      if (!id) continue;
+      var jp = jpById[id];
+      if (!jp || !_isAssignee(jp.owner) || jp.status === 'Skip') {
+        staleRows.push(ASSIGNED_DATA_START_ROW + i);
+      }
+    }
+    // Delete bottom-up so earlier deletions don't shift the remaining indices.
+    for (var j = staleRows.length - 1; j >= 0; j--) {
+      assignedSheet.deleteRow(staleRows[j]);
+    }
+  }
+
+  // --- Add pass: push any active assignee-owned job not already present.
+  // _pushJobsToAssignedSheet is idempotent (skips existing rows) and re-sorts after appending. ---
+  var TERMINAL = { Submitted: true, Skip: true };
+  var toAssign = (records || []).filter(function(r) {
+    return _isAssignee(r.owner) && !TERMINAL[_stringifyField(r.status) || 'New'];
+  });
+  if (toAssign.length) {
+    _pushJobsToAssignedSheet(toAssign);
+  }
 }
 
 function updateRunSummary(summary) {
@@ -2188,7 +2265,7 @@ function _setupAssignedSheet(sheet) {
   instrRange.setValue(
     'Your application queue — jobs routed here by the pipeline. ' +
     'Status flow: New → Filled (form done) → Submitted (applied). ' +
-    'To flag: write your note in the Notes column FIRST, then set Status to Flagged — use this for anything problematic (failed, can\'t fill, expired, etc.). The note is captured the moment status changes.'
+    'To flag: set Status to Flagged and write why in the Notes column (either order works — the note syncs to the owner). Use this for anything problematic (failed, can\'t fill, expired, etc.).'
   );
   instrRange.setFontSize(10).setWrap(true)
     .setBackground('#f0fdf4').setFontColor('#374151')
@@ -2335,12 +2412,15 @@ function _pushJobsToAssignedSheet(jobs) {
   assignedSheet.getRange(startRow, ASSIGNED_COLUMN_INDEX.job_link, richTexts.length, 1)
     .setRichTextValues(richTexts);
 
-  // Mark ownership on the master sheet (lane = Owner, not status).
+  // Mark ownership on the master sheet (lane = Owner, not status). Preserve an existing assignee
+  // flavor (esp. rules' 'Assignee (auto)'); only stamp plain 'Assignee' when it wasn't assigned
+  // yet (e.g. the "Assign Selected Rows" menu, where owner was empty/Me — a manual delegation).
   var jobSheet = _getJobPrioritySheet();
   toAdd.forEach(function(job) {
     var rowNum = _findJobPriorityRowByJobId(_stringifyField(job.jobId));
     if (rowNum) {
-      jobSheet.getRange(rowNum, JOB_PRIORITY_COLUMN_INDEX.owner).setValue('Assignee');
+      jobSheet.getRange(rowNum, JOB_PRIORITY_COLUMN_INDEX.owner)
+        .setValue(_isAssignee(job.owner) ? job.owner : 'Assignee');
       var act = _stringifyField(job.action) || 'Fill & Submit';
       jobSheet.getRange(rowNum, JOB_PRIORITY_COLUMN_INDEX.action).setValue(act);
     }
