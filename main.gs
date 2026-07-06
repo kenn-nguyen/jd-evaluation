@@ -137,7 +137,7 @@ function handleSheetEdit(e) {
       if (col === ASSIGNED_COLUMN_INDEX.status) {
         _handleAssignedStatusEdit(sheet, row, e.value);
       } else if (col === ASSIGNED_COLUMN_INDEX.notes) {
-        _handleAssignedNotesEdit(sheet, row);
+        _handleAssignedNotesEdit(sheet, row, e.oldValue);
       }
     } catch (err) { Logger.log(err); }
   }
@@ -146,7 +146,7 @@ function handleSheetEdit(e) {
 // Notes edited on the Assigned sheet: if the row is Flagged, keep JP referral_contact in sync so
 // a note typed AFTER flagging (the natural order) isn't lost. The flag handler only captures the
 // note at the instant of the status change, so without this a flag-then-note sequence loses it.
-function _handleAssignedNotesEdit(sheet, row) {
+function _handleAssignedNotesEdit(sheet, row, oldValue) {
   var status = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.status).getValue());
   if (status !== 'Flagged') return;
   var jobId = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.job_id).getValue()).trim();
@@ -156,6 +156,12 @@ function _handleAssignedNotesEdit(sheet, row) {
   var note = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.notes).getValue());
   _getJobPrioritySheet().getRange(jpRow, JOB_PRIORITY_COLUMN_INDEX.referral_contact)
     .setValue(note ? '⚑ ' + note : '');
+  // Notify the owner with the note when it's first added after flagging — the flag-time email
+  // went out without it (flag-then-note is the natural order). Only on the empty->note transition
+  // so later tweaks don't re-send.
+  if (note && !_stringifyField(oldValue)) {
+    _notifyOwnerBounceBack(jobId, 'flagged for your review', note);
+  }
 }
 
 function _jobRecordFromJobPriorityRow(sheet, row) {
