@@ -2056,6 +2056,17 @@ function _parseRawRefObject(rawRef) {
 }
 
 function _compareJobRecencyDesc(left, right) {
+  // Freshest LIVE POSTING first: this ranks which duplicate is the "current" one for canonical
+  // link / job_id / metadata selection. Posting date is the right signal — import time is only
+  // when WE scraped it, so a re-scraped OLD posting must not outrank a genuinely newer posting.
+  // record.posted is a formatted date for most jobs (parses); a relative label returns 0 and
+  // falls through to the import/scored fallbacks below.
+  var leftPosted = _toComparableTime(left.posted);
+  var rightPosted = _toComparableTime(right.posted);
+  if (leftPosted !== rightPosted) {
+    return rightPosted - leftPosted;
+  }
+
   var leftTime = _toComparableTime(left.importedAt || left.scoredAt);
   var rightTime = _toComparableTime(right.importedAt || right.scoredAt);
 
