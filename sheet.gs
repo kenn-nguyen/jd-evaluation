@@ -768,17 +768,24 @@ function pruneExpiredJobRows(days) {
     }
 
     var importedTime = _toComparableTime(record.importedAt);
-    // No importedAt → keep (never silently purge records without a timestamp).
-    if (!importedTime) {
+    // posted is a formatted date for most jobs (parses) or a relative label like "2 weeks ago"
+    // (returns 0 → ignored, falls back to importedAt). An old posting is likely filled/closed
+    // regardless of when we scraped it, so prune on posting age too — same threshold.
+    var postedTime = _toComparableTime(record.posted);
+    // No usable timestamp at all → keep (never silently purge records without any date).
+    if (!importedTime && !postedTime) {
       keepRecords.push(record);
       return;
     }
-    if ((now.getTime() - importedTime) <= expiryMs) {
-      keepRecords.push(record);
+    var nowMs = now.getTime();
+    var importOld = importedTime && (nowMs - importedTime) > expiryMs;
+    var postedOld = postedTime && (nowMs - postedTime) > expiryMs;
+    // Prune when stale by EITHER how long it has sat in the pipeline or its posting age.
+    if (importOld || postedOld) {
+      prunedCount++;
       return;
     }
-    // Has importedAt AND older than EXPIRY_DAYS → prune
-    prunedCount++;
+    keepRecords.push(record);
   });
 
   if (prunedCount > 0) {
