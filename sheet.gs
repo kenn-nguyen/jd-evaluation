@@ -1691,15 +1691,19 @@ function _compareJobsForDisplay(left, right) {
     return priorityDifference;
   }
 
+  // Within a priority: freshest POSTING on top. Fall back to import date only when posted is a
+  // relative label / missing (returns 0), so those rows don't all sink to the bottom.
+  var leftRecency = _toComparableTime(left.posted) || _toComparableTime(left.importedAt);
+  var rightRecency = _toComparableTime(right.posted) || _toComparableTime(right.importedAt);
+  if (leftRecency !== rightRecency) {
+    return rightRecency - leftRecency;
+  }
+
+  // Same priority + same posting date → higher score first.
   var leftScore = Number(left.score || 0);
   var rightScore = Number(right.score || 0);
   if (leftScore !== rightScore) {
     return rightScore - leftScore;
-  }
-
-  var importedDifference = _toComparableTime(right.importedAt) - _toComparableTime(left.importedAt);
-  if (importedDifference !== 0) {
-    return importedDifference;
   }
 
   return 0;
@@ -2449,7 +2453,8 @@ function _sortAssignedSheet(sheet) {
 
   // Sort by index so we can reorder richTexts in parallel.
   // Rule: Submitted rows sink to the bottom. All other statuses (New/Filled/Flagged)
-  // are active work and sorted together by priority → score only.
+  // are active work and sorted together by priority → newest posted date → score
+  // (matches the Job_Priority sort so the rank column and row order stay consistent).
   var indices = values.map(function(_, i) { return i; });
   indices.sort(function(a, b) {
     var rowA = values[a], rowB = values[b];
@@ -2459,6 +2464,10 @@ function _sortAssignedSheet(sheet) {
     var pA = _prioritySortRank(_stringifyField(rowA[ASSIGNED_COLUMN_INDEX.priority - 1]));
     var pB = _prioritySortRank(_stringifyField(rowB[ASSIGNED_COLUMN_INDEX.priority - 1]));
     if (pA !== pB) return pA - pB;
+    // Freshest posting first within a priority (unparseable/label posted → 0, sinks).
+    var postedA = _toComparableTime(rowA[ASSIGNED_COLUMN_INDEX.posted - 1]);
+    var postedB = _toComparableTime(rowB[ASSIGNED_COLUMN_INDEX.posted - 1]);
+    if (postedA !== postedB) return postedB - postedA;
     var scoreA = Number(rowA[ASSIGNED_COLUMN_INDEX.score - 1]) || 0;
     var scoreB = Number(rowB[ASSIGNED_COLUMN_INDEX.score - 1]) || 0;
     return scoreB - scoreA;
