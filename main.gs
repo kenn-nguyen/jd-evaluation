@@ -609,7 +609,25 @@ function _runPipelineInternal(activeRunState, options) {
         tracker.update({ status: 'Auto-assigning jobs' });
         _routeNewJobs(config);
       } catch (assignError) { Logger.log('Auto-assign error: ' + assignError); }
-      result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
+
+      // Derive new-this-run jobs (and new P01s) from the SHEET by importedAt, rather than the
+      // in-run counters. A hard-timeout resume loses those counters — a job scored in the killed
+      // slice is already written and looks "existing" on resume, so it silently stops being
+      // counted or alerted. importedAt is stamped on the row and survives resumes: a job imported
+      // this run carries importedAt == the run start; existing rows keep older importedAt.
+      // (60s tolerance absorbs sheet datetime rounding.)
+      var runStartMs = _toComparableTime(scoringRunStartedAt);
+      if (runStartMs) {
+        var freshRecords = getExistingJobRecords().filter(function(r) {
+          return _toComparableTime(r.importedAt) >= (runStartMs - 60000);
+        });
+        var freshTopPriority = freshRecords.filter(function(r) { return _isTopPriority(r.priority); });
+        result.newAJobs = freshTopPriority;
+        result.newJobsCount = freshRecords.length;
+        result.aJobsCount = freshTopPriority.length;
+      } else {
+        result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
+      }
     }
 
     // Try dedup and sort inline if there is enough execution time left.
