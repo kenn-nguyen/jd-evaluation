@@ -2058,42 +2058,22 @@ function pruneRawData(days) {
 
   var maxCols = sheet.getMaxColumns();
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
-  var rawRefColIndex = headers.indexOf('raw_ref');
-  if (rawRefColIndex === -1) rawRefColIndex = 1;
   var jobIdColIndex = headers.indexOf('job_id');
   if (jobIdColIndex === -1) jobIdColIndex = 0;
 
   var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
-  var cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - days);
 
   var rowsToDelete = [];
 
   values.forEach(function(row, offset) {
-    // Protect raw_refs for jobs still tracked in Job_Priority (e.g. Submitted, Networking).
-    // Their job description may be needed if scoring criteria change and re-scoring is triggered.
+    // Keep raw_refs for jobs still tracked in Job_Priority (primary OR merged id) — their JD may
+    // be needed if scoring criteria change and re-scoring is triggered. Every other row is an
+    // ORPHAN (its JP row was deleted/pruned, or a scrape that never landed in JP), so its raw_ref
+    // is dead weight — prune it regardless of age. (The `days` window no longer applies to raw
+    // data; orphan status alone decides.)
     var rawJobId = _stringifyField(row[jobIdColIndex]).trim();
     if (rawJobId && activeJobIds[rawJobId]) return;
-
-    var rawRef = row[rawRefColIndex];
-    if (!rawRef) return;
-
-    var parsed;
-    try { parsed = JSON.parse(rawRef); } catch (e) { return; }
-
-    // Use publishedAt as the anchor for resolving postedTime relative offsets.
-    // _derivePostedDate tries postedTime first (e.g. "54 minutes ago" → anchor - 54min),
-    // then falls back to publishedAt/postedAt/createdAt/listedAt directly.
-    var anchorStr = parsed.publishedAt || parsed.postedAt || parsed.createdAt || parsed.listedAt || '';
-    if (!anchorStr) return;
-
-    var anchorDate = new Date(anchorStr);
-    if (isNaN(anchorDate.getTime())) return;
-
-    var postedDate = _derivePostedDate(parsed, parsed.postedTime || '', anchorDate);
-    if (!postedDate || isNaN(postedDate.getTime())) postedDate = anchorDate;
-
-    if (postedDate < cutoff) rowsToDelete.push(offset + 2); // 1-based, data starts row 2
+    rowsToDelete.push(offset + 2); // 1-based, data starts row 2
   });
 
   // Delete in reverse order so row numbers stay valid
