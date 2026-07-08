@@ -603,31 +603,13 @@ function _runPipelineInternal(activeRunState, options) {
       return result;
     }
 
-    // Scoring complete. Run auto-assign first (fast).
+    // Scoring complete. Run auto-assign first (fast). It must run before dedup/sort; the
+    // new-jobs/P01 recompute for the board + email happens AFTER the sheet is finalized (below).
     if (options.postProcess) {
       try {
         tracker.update({ status: 'Auto-assigning jobs' });
         _routeNewJobs(config);
       } catch (assignError) { Logger.log('Auto-assign error: ' + assignError); }
-
-      // Derive new-this-run jobs (and new P01s) from the SHEET by importedAt, rather than the
-      // in-run counters. A hard-timeout resume loses those counters — a job scored in the killed
-      // slice is already written and looks "existing" on resume, so it silently stops being
-      // counted or alerted. importedAt is stamped on the row and survives resumes: a job imported
-      // this run carries importedAt == the run start; existing rows keep older importedAt.
-      // (60s tolerance absorbs sheet datetime rounding.)
-      var runStartMs = _toComparableTime(scoringRunStartedAt);
-      if (runStartMs) {
-        var freshRecords = getExistingJobRecords().filter(function(r) {
-          return _toComparableTime(r.importedAt) >= (runStartMs - 60000);
-        });
-        var freshTopPriority = freshRecords.filter(function(r) { return _isTopPriority(r.priority); });
-        result.newAJobs = freshTopPriority;
-        result.newJobsCount = freshRecords.length;
-        result.aJobsCount = freshTopPriority.length;
-      } else {
-        result.newAJobs = _getJobsByJobIds(result.newTopPriorityJobIds || []);
-      }
     }
 
     // Try dedup and sort inline if there is enough execution time left.
@@ -648,6 +630,9 @@ function _runPipelineInternal(activeRunState, options) {
     if (hasTimeForDedup && hasTimeForSort) {
       // Everything fits — finish inline, no extra trigger needed.
       sortAndRankJobs();
+      // Recompute new/P01 from the now-finalized sheet so the board + email match it exactly
+      // (dedup/sort can merge/re-rank a P01 after scoring).
+      _recomputeRunResultsFromSheet(result, scoringRunStartedAt);
       _markTrackedExecutionFinished(result.activeRunState, 'completed');
       _clearActiveRunState();
       _removeResumeTriggers();
@@ -672,7 +657,9 @@ function _runPipelineInternal(activeRunState, options) {
       return result;
     }
 
-    // Not enough time — notify now, then defer remaining step(s) to a trigger.
+    // Not enough time — defer dedup/sort to a trigger. Do NOT notify here: the sheet isn't
+    // finalized yet, so the email would show pre-dedup/pre-sort values. The alert is sent from
+    // _runSortPhase (the terminal step) once the sheet settles.
     tracker.update({
       status: 'Scored — finishing in next execution',
       processed: result.processedCount + ' / ' + result.totalJobsCount,
@@ -686,13 +673,11 @@ function _runPipelineInternal(activeRunState, options) {
       errorMessage: result.errors.length ? _truncate(result.errors.join(' | '), 500) : ''
     });
 
-    if (options.notify) {
-      _sendCompletionNotifications(config, result, tracker.get());
-    }
-
     _markTrackedExecutionFinished(result.activeRunState, 'yielded');
     // If dedup ran inline but sort didn't, skip straight to the sort phase.
     result.activeRunState.postPhase = hasTimeForDedup ? 'sort' : 'dedup';
+    // Hand the completion notification to the terminal sort phase (after the sheet is finalized).
+    result.activeRunState.notifyOnComplete = !!options.notify;
     _saveActiveRunState(result.activeRunState);
     _scheduleResumeTrigger();
 
@@ -781,13 +766,62 @@ function _runSortPhase(state) {
     _scheduleResumeTrigger(BACKUP_RESUME_TRIGGER_DELAY_MS);
     updateRunSummary({ status: 'Sorting and ranking…' });
     sortAndRankJobs();
+
+    // This is the terminal step of the deferred path. Send the completion notification HERE,
+    // after the sheet is finalized, so the P01 email + counts match the sheet (the run deferred
+    // notifying earlier so it wouldn't email pre-dedup/pre-sort values). Derive from the sheet
+    // by importedAt so it's resilient to resumes.
+    if (state && state.notifyOnComplete) {
+      try {
+        var config = loadRuntimeConfig();
+        var result = {
+          rows: [],
+          scoredJobsCount: state.scoredJobsCount || 0,
+          failedJobsCount: state.failedJobsCount || 0,
+          importFailedJobsCount: state.importFailedJobsCount || 0,
+          totalJobsCount: state.totalJobsCount || 0,
+          errors: state.errors || []
+        };
+        _recomputeRunResultsFromSheet(result, state.runStartedAt ? new Date(state.runStartedAt) : null);
+        updateRunSummary({
+          status: 'Completed',
+          newJobsCount: result.newJobsCount,
+          aJobsCount: result.aJobsCount
+        });
+        _sendCompletionNotifications(config, result, {});
+      } catch (notifyError) {
+        Logger.log('Deferred completion notify failed: ' + notifyError);
+        updateRunSummary({ status: 'Completed' });
+      }
+    } else {
+      updateRunSummary({ status: 'Completed' });
+    }
+
     _markTrackedExecutionFinished(state, 'completed');
     _clearActiveRunState();
     _removeResumeTriggers(); // clears the backup set above
-    updateRunSummary({ status: 'Completed' });
   } finally {
     if (lock.hasLock()) lock.releaseLock();
   }
+}
+
+// Derive this run's new jobs (and new P01s) from the finalized sheet by importedAt, and set them
+// on `result` for the board + P01 email. importedAt is stamped per row and survives hard-timeout
+// resumes; a job imported this run carries importedAt == the run start (existing rows keep older),
+// with a 60s tolerance for sheet datetime rounding.
+function _recomputeRunResultsFromSheet(result, runStartedAt) {
+  var runStartMs = _toComparableTime(runStartedAt);
+  if (!runStartMs) {
+    result.newAJobs = result.newAJobs || _getJobsByJobIds(result.newTopPriorityJobIds || []);
+    return;
+  }
+  var freshRecords = getExistingJobRecords().filter(function(r) {
+    return _toComparableTime(r.importedAt) >= (runStartMs - 60000);
+  });
+  var freshTopPriority = freshRecords.filter(function(r) { return _isTopPriority(r.priority); });
+  result.newAJobs = freshTopPriority;
+  result.newJobsCount = freshRecords.length;
+  result.aJobsCount = freshTopPriority.length;
 }
 
 function _runJobReevaluationInternal(initialActiveRunState) {
