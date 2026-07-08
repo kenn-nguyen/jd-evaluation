@@ -2061,27 +2061,36 @@ function pruneRawData(days) {
   var jobIdColIndex = headers.indexOf('job_id');
   if (jobIdColIndex === -1) jobIdColIndex = 0;
 
-  var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
+  var dataRowCount = lastRow - 1;
+  var values = sheet.getRange(2, 1, dataRowCount, maxCols).getValues();
 
-  var rowsToDelete = [];
-
-  values.forEach(function(row, offset) {
-    // Keep raw_refs for jobs still tracked in Job_Priority (primary OR merged id) — their JD may
-    // be needed if scoring criteria change and re-scoring is triggered. Every other row is an
-    // ORPHAN (its JP row was deleted/pruned, or a scrape that never landed in JP), so its raw_ref
-    // is dead weight — prune it regardless of age. (The `days` window no longer applies to raw
-    // data; orphan status alone decides.)
-    var rawJobId = _stringifyField(row[jobIdColIndex]).trim();
-    if (rawJobId && activeJobIds[rawJobId]) return;
-    rowsToDelete.push(offset + 2); // 1-based, data starts row 2
+  // Keep raw_refs for jobs still tracked in Job_Priority (primary OR merged id) — their JD may be
+  // needed for re-scoring. Every other row is an ORPHAN (its JP row was deleted/pruned, or a
+  // scrape that never landed in JP), so its raw_ref is dead weight — dropped regardless of age.
+  var keep = values.filter(function(row) {
+    var id = _stringifyField(row[jobIdColIndex]).trim();
+    return id && activeJobIds[id];
   });
 
-  // Delete in reverse order so row numbers stay valid
-  for (var i = rowsToDelete.length - 1; i >= 0; i--) {
-    sheet.deleteRow(rowsToDelete[i]);
+  var deletedCount = dataRowCount - keep.length;
+  if (deletedCount <= 0) return 0;
+
+  // Bulk rewrite — never per-row deleteRow (that times out on thousands of rows). Overwrite the
+  // survivors at the top in ONE setValues, then remove the trailing block in ONE deleteRows call:
+  // O(1) sheet ops regardless of how many orphans there are. (Raw_Data is an unordered lookup, so
+  // compacting survivors to the top is fine.)
+  if (keep.length) {
+    sheet.getRange(2, 1, keep.length, maxCols).setValues(keep);
+    // Keep job_id as text so large numeric ids are never coerced to dates.
+    sheet.getRange(2, jobIdColIndex + 1, keep.length, 1).setNumberFormat('@');
+  }
+  var firstTrailingRow = 2 + keep.length;
+  var trailingCount = lastRow - firstTrailingRow + 1;
+  if (trailingCount > 0) {
+    sheet.deleteRows(firstTrailingRow, trailingCount);
   }
 
-  return rowsToDelete.length;
+  return deletedCount;
 }
 
 function pruneAssignedRows(days) {
