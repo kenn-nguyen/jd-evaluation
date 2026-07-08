@@ -111,7 +111,7 @@ var SETTINGS_DEFAULT_ROWS = [
   ['FORCE_RESCORE', 'FALSE', 'Set TRUE to force re-scoring of already-scored jobs in the current fetch.'],
 
   ['# Schedule', '', ''],
-  ['RUN_INTERVAL_HOURS', '4', 'How often the pipeline runs automatically (hours). Supported: 1, 2, 4, 6, 8, 12.'],
+  ['RUN_INTERVAL_HOURS', '4', 'How often the pipeline runs automatically — any integer 1-12 hours (fires on the nearest hour). A run landing in quiet hours is skipped; the next run covers the gap. Re-run Create Run Trigger after changing.'],
   ['QUIET_START_HOUR', '19', 'Hour to stop running (0-23, Pacific Time). Default 19 = 7 pm PT.'],
   ['QUIET_END_HOUR', '5', 'Hour to resume running (0-23, Pacific Time). Default 5 = 5 am PT. Set both to 0 to disable.'],
 
@@ -1253,7 +1253,11 @@ function _getApifyAccounts() {
   var sheet = _getApifyAccountsSheet();
   var batch = [];
   var detail = [];
-  var labels = [];
+  // Labels are kept PARALLEL to each key array (a label is pushed only when its key is pushed),
+  // so batchLabels[i] names batch[i] and detailLabels[i] names detail[i] even when some rows have
+  // only one of the two keys.
+  var batchLabels = [];
+  var detailLabels = [];
 
   if (sheet && sheet.getLastRow() >= APIFY_ACCOUNTS_DATA_START_ROW) {
     var rowCount = sheet.getLastRow() - APIFY_ACCOUNTS_DATA_START_ROW + 1;
@@ -1265,18 +1269,18 @@ function _getApifyAccounts() {
       var batchKey = _stringifyField(row[1]).trim();
       var detailKey = _stringifyField(row[2]).trim();
       var label = _stringifyField(row[0]).trim();
-      if (batchKey) { batch.push(batchKey); }
-      if (detailKey) { detail.push(detailKey); }
-      labels.push(label);
+      if (batchKey) { batch.push(batchKey); batchLabels.push(label || ('Account ' + batch.length)); }
+      if (detailKey) { detail.push(detailKey); detailLabels.push(label || ('Account ' + detail.length)); }
     });
   }
 
   // Back-compat: no sheet data → use legacy APIFY_ACCOUNTS JSON for batch keys.
   if (!batch.length) {
     batch = _parseLegacyApifyAccounts();
+    batchLabels = batch.map(function(_, i) { return 'Account ' + (i + 1); });
   }
 
-  return { batch: batch, detail: detail, labels: labels };
+  return { batch: batch, detail: detail, batchLabels: batchLabels, detailLabels: detailLabels };
 }
 
 function _syncJobPrioritySchemaForRuntime(sheet) {

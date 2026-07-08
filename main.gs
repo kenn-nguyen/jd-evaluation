@@ -274,7 +274,7 @@ function runJobImportAndScoring() {
     return _runJobReevaluationInternal();
   }
 
-  // Only enforce quiet hours when starting a fresh run, not when continuing one
+  // Only enforce quiet hours + the interval gate when starting a fresh run, not when continuing one.
   if (!activeRunState) {
     var settings = getSettingsMap();
     var quietStart = _parseHourSetting(settings.QUIET_START_HOUR, 19);
@@ -284,6 +284,22 @@ function runJobImportAndScoring() {
       updateRunSummary({ status: 'Skipped (quiet hours ' + quietStart + ':00–' + quietEnd + ':00)' });
       return;
     }
+
+    // Interval gate: the trigger fires hourly, but only run once RUN_INTERVAL_HOURS have elapsed
+    // since the last scheduled run (0.5h tolerance so an N-hour interval fires on the Nth hourly
+    // tick, not the N+1th). Skips are silent — a between-interval tick is normal — and do NOT stamp
+    // the clock, so it runs promptly the moment the interval is reached or quiet hours end.
+    var intervalHours = _normalizePositiveInteger(settings.RUN_INTERVAL_HOURS || 4, 4, 12);
+    var props = PropertiesService.getScriptProperties();
+    var lastScheduledIso = props.getProperty('LAST_SCHEDULED_RUN_AT');
+    if (lastScheduledIso) {
+      var elapsedMs = Date.now() - new Date(lastScheduledIso).getTime();
+      if (elapsedMs < (intervalHours - 0.5) * 3600 * 1000) {
+        Logger.log('Skipping run: ~' + (Math.round(elapsedMs / 360000) / 10) + 'h since last run; interval is ' + intervalHours + 'h.');
+        return;
+      }
+    }
+    props.setProperty('LAST_SCHEDULED_RUN_AT', new Date().toISOString());
   }
 
   return _runJobImportAndScoringInternal();
@@ -292,6 +308,8 @@ function runJobImportAndScoring() {
 // Called by "Run Now" menu — bypasses quiet hours so the user always gets an immediate run.
 function runJobImportAndScoringNow() {
   updateRunSummary({ status: 'Starting...' });
+  // A manual run resets the interval clock so the next scheduled run waits a full interval.
+  PropertiesService.getScriptProperties().setProperty('LAST_SCHEDULED_RUN_AT', new Date().toISOString());
   var activeRunState = _loadActiveRunState();
   if (activeRunState && activeRunState.mode === 'reevaluate') {
     return _runJobReevaluationInternal();
@@ -844,11 +862,13 @@ function _runJobReevaluationInternal(initialActiveRunState) {
 
 function createRunTrigger() {
   removeHourlyTriggers();
-  var settings = getSettingsMap();
-  var intervalHours = _normalizePositiveInteger(settings.RUN_INTERVAL_HOURS || 4, 4, 12);
+  // Fire hourly as a heartbeat. The actual RUN_INTERVAL_HOURS (any integer 1-12) is enforced by
+  // the elapsed-time gate in runJobImportAndScoring — everyHours() only accepts 1/2/4/6/8/12, so
+  // an arbitrary interval can't be passed to it directly. Hourly ticks + the code gate give any
+  // interval, to the nearest hour.
   ScriptApp.newTrigger('runJobImportAndScoring')
     .timeBased()
-    .everyHours(intervalHours)
+    .everyHours(1)
     .create();
 }
 
