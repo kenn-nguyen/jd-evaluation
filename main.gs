@@ -202,7 +202,7 @@ function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
   var assignedSheet = _getAssignedSheet();
   if (!assignedSheet || !jobId) return;
 
-  if (nv === 'Skip') {
+  if (_isSkip(nv)) {
     _removeFromAssignedSheet(assignedSheet, jobId);
     return;
   }
@@ -1645,7 +1645,10 @@ function _routeNewJobs(config) {
     // Locked: a manual claim ('Me') or a manual delegation (plain 'Assignee'). Re-manageable:
     // empty (unmanaged) or 'Assignee (auto)' (a prior rules assignment). Plus only status 'New'.
     if (ownerVal === 'Me' || ownerVal === 'Assignee') return;
-    if (_stringifyField(statusColVals[idx][0] || 'New') !== 'New') return;
+    // Re-manageable statuses: 'New' (never routed) and 'Skip (auto)' (a prior rules skip the rules
+    // may lift if the job now qualifies). Manual 'Skip' and every other status stay locked.
+    var statusVal = _stringifyField(statusColVals[idx][0] || 'New');
+    if (statusVal !== 'New' && statusVal !== STATUS_SKIP_AUTO) return;
     var wasAuto = (ownerVal === OWNER_AUTO_ASSIGNEE);
 
     var priority = _stringifyField(r.priority);
@@ -1658,15 +1661,16 @@ function _routeNewJobs(config) {
     // Visa hard block → skip status. The role explicitly does not sponsor, so the candidate
     // cannot take it; networking won't change a no-sponsorship policy.
     if (autoSkipVisaNo && _stringifyField(r.usVisaSponsorshipPotential) === 'No (0%)') {
-      ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
+      ownerColVals[idx][0] = ''; statusColVals[idx][0] = STATUS_SKIP_AUTO; counts.skipped++; return;
     }
     // Hard exclude → skip status
     if (excludeCompanies.indexOf(company) !== -1) {
-      ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'Skip'; counts.skipped++; return;
+      ownerColVals[idx][0] = ''; statusColVals[idx][0] = STATUS_SKIP_AUTO; counts.skipped++; return;
     }
-    // Reserved company or top priority → left empty for your review (never delegated)
+    // Reserved company or top priority → left empty for your review (never delegated). Reset to
+    // 'New' so a prior 'Skip (auto)' that now qualifies resurfaces for review.
     if (reservedCompanies.indexOf(company) !== -1 || reservePriorities.indexOf(priority) !== -1) {
-      ownerColVals[idx][0] = ''; counts.reserved++; return;
+      ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'New'; counts.reserved++; return;
     }
     // Assignee band → her lane if it clears visa + score
     if (assigneePriorities.indexOf(priority) !== -1) {
@@ -1674,16 +1678,16 @@ function _routeNewJobs(config) {
       var scoreOk = true;
       if (minScore > 0) { var s = Number(r.score); scoreOk = !isNaN(s) && s >= minScore; }
       if (visaOk && scoreOk) {
-        ownerColVals[idx][0] = OWNER_AUTO_ASSIGNEE; actionColVals[idx][0] = 'Fill & Submit';
-        r.owner = OWNER_AUTO_ASSIGNEE; r.action = 'Fill & Submit';
+        ownerColVals[idx][0] = OWNER_AUTO_ASSIGNEE; statusColVals[idx][0] = 'New'; actionColVals[idx][0] = 'Fill & Submit';
+        r.owner = OWNER_AUTO_ASSIGNEE; r.status = 'New'; r.action = 'Fill & Submit';
         // Only count/push genuinely new assignments — a re-confirmed auto job is already in Assigned.
         if (!wasAuto) { assigneeJobs.push(r); counts.assigned++; }
         return;
       }
-      ownerColVals[idx][0] = ''; counts.reserved++; return;   // in-band but filtered out → un-assign, re-evaluable later
+      ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'New'; counts.reserved++; return;   // in-band but filtered out → un-assign, re-evaluable later
     }
     // Everything else (P06+) → skip status, owner cleared
-    ownerColVals[idx][0] = ''; statusColVals[idx][0] = 'Skip'; counts.skipped++;
+    ownerColVals[idx][0] = ''; statusColVals[idx][0] = STATUS_SKIP_AUTO; counts.skipped++;
   });
 
   jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.owner, numRows, 1).setValues(ownerColVals);
@@ -1718,7 +1722,7 @@ function skipNoVisaJobsPrompt() {
     var idx = r.rowNumber - JOB_PRIORITY_DATA_START_ROW;
     if (idx < 0 || idx >= numRows) return;
     if (_stringifyField(r.usVisaSponsorshipPotential) !== 'No (0%)') return;
-    if (_stringifyField(statusColVals[idx][0]) === 'Skip') return; // already skipped
+    if (_isSkip(statusColVals[idx][0])) return; // already skipped (manual or auto)
     toSkip.push(idx);
   });
 
@@ -1727,17 +1731,18 @@ function skipNoVisaJobsPrompt() {
   var resp = ui.alert(
     'Skip All No-Visa Jobs',
     'Found ' + toSkip.length + ' job(s) scored "No (0%)" that are not yet Skip.\n\n' +
-    'This will set their status to Skip, including rows already owned or assigned. Proceed?',
+    'This will set their status to Skip (auto), including rows already owned or assigned. Proceed?',
     ui.ButtonSet.OK_CANCEL
   );
   if (resp !== ui.Button.OK) return;
 
-  toSkip.forEach(function(idx) { statusColVals[idx][0] = 'Skip'; });
+  _applyStatusValidation(jobSheet); // refresh so 'Skip (auto)' is an accepted value before writing
+  toSkip.forEach(function(idx) { statusColVals[idx][0] = STATUS_SKIP_AUTO; });
   jobSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, numRows, 1).setValues(statusColVals);
 
   SpreadsheetApp.flush();
   sortAndRankJobs();
-  ui.alert('Set ' + toSkip.length + ' job(s) to Skip and re-sorted.');
+  ui.alert('Set ' + toSkip.length + ' job(s) to Skip (auto) and re-sorted.');
 }
 
 function assignSelectedRowsPrompt() {

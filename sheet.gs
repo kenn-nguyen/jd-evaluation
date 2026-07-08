@@ -7,14 +7,20 @@ var APIFY_ACCOUNTS_SHEET_NAME = 'Apify_Accounts';
 var APIFY_ACCOUNTS_COLUMNS = ['label', 'batch_key', 'detail_key', 'active'];
 var JOB_PRIORITY_HEADER_ROW = 6;
 var JOB_PRIORITY_DATA_START_ROW = 7;
-var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Flagged'];
+// 'Skip' = you skipped it manually (locked from the rules). 'Skip (auto)' = the rules skipped it
+// (visa "No (0%)", excluded company, or low-priority P06+) and the rules may re-evaluate/lift it on
+// a later run. Only the rules ever write '(auto)', so no manual action lands in the re-manageable
+// bucket. _isSkip() treats both as "skipped" for mirroring/sort/removal.
+var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Skip (auto)', 'Flagged'];
+var STATUS_SKIP_AUTO = 'Skip (auto)';
 var JOB_PRIORITY_STATUS_SORT_ORDER = {
   Networking: 0,
   Filled: 1,
   Flagged: 2,
   New: 3,
   Submitted: 4,
-  Skip: 5
+  Skip: 5,
+  'Skip (auto)': 5
 };
 // 'Assignee' = a manual delegation (locked from the rules). 'Assignee (auto)' = a rules-set
 // assignment that the rules may re-evaluate/pull on later runs. Only the rules ever write the
@@ -27,6 +33,13 @@ var ACTION_OPTIONS = ['Fill & Submit', 'Fill Only'];
 function _isAssignee(owner) {
   var v = _stringifyField(owner).trim();
   return v === 'Assignee' || v === OWNER_AUTO_ASSIGNEE;
+}
+// True for both a manual 'Skip' and a rules-set 'Skip (auto)' — for anything that treats the job
+// as dead (remove from Assigned, sort to bottom, dedup). The re-evaluable distinction lives only in
+// _routeNewJobs (which may lift 'Skip (auto)' but never touches manual 'Skip').
+function _isSkip(status) {
+  var v = _stringifyField(status).trim();
+  return v === 'Skip' || v === STATUS_SKIP_AUTO;
 }
 var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'rank',
@@ -59,7 +72,8 @@ var JOB_PRIORITY_HIDDEN_COLUMNS = [
   'level_normalized',
   'requires_people_mgmt',
   'required_yoe_pm',
-  'required_yoe_total'
+  'required_yoe_total',
+  'sort_key'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
 var RAW_DATA_COLUMNS = ['job_id', 'raw_ref'];
@@ -120,7 +134,7 @@ var SETTINGS_DEFAULT_ROWS = [
   ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to the assignee (Owner set to "Assignee (auto)") after each run, if they clear the visa + score filters.'],
   ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs are left unowned (empty) for your review.'],
   ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay in your lane. See Help → Visa Signals for what each label means.'],
-  ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status Skip during routing, regardless of priority (the role does not sponsor). Set FALSE to disable.'],
+  ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status "Skip (auto)" during routing, regardless of priority (the role does not sponsor). "Skip (auto)" = skipped by the rules (re-evaluable); plain "Skip" = you skipped it manually (locked). Set FALSE to disable.'],
   ['RESERVED_COMPANIES', '', 'Companies always kept in your lane, case-insensitive (e.g. Stripe,Airbnb).'],
   ['AUTO_ASSIGN_EXCLUDE_COMPANIES', '', 'Companies to skip entirely during routing, case-insensitive (e.g. Google,Meta).'],
 
@@ -165,7 +179,7 @@ var HELP_ROWS = [
   ['Unclear (50%)', 'The post is silent on sponsorship — no signal either way. This is the default.'],
   ['US required (40%)', 'Asks for US applicants / US location / US work authorization, but does not explicitly rule sponsorship out.'],
   ['Unlikely (20%)', 'Silent on sponsorship and the context leans against it — small/early-stage startup, government/defense, or staffing/contract.'],
-  ['No (0%)', 'The post explicitly says no sponsorship, or requires citizenship / security clearance. These are auto-set to Skip (see AUTO_SKIP_VISA_NO).'],
+  ['No (0%)', 'The post explicitly says no sponsorship, or requires citizenship / security clearance. These are auto-set to "Skip (auto)" (see AUTO_SKIP_VISA_NO).'],
 
   ['# Owner & lanes', ''],
   ['What Owner means', 'The Owner column decides whose lane a job is in. Set it from the dropdown, or let the rules set it. Empty = unmanaged.'],
@@ -977,18 +991,94 @@ function _mergeSimilarJdGroup(records) {
 
 function sortAndRankJobs() {
   var sheet = _getJobPrioritySheet();
+  // The native sort writes to the hidden sort_key column — make sure the schema (incl. that
+  // column) exists first, in case we were reached via a path that skipped ensureWorkbookReadyForRuntime.
+  if (sheet.getMaxColumns() < JOB_PRIORITY_COLUMNS.length) {
+    _syncJobPrioritySchemaForRuntime(sheet);
+    sheet = _getJobPrioritySheet();
+  }
   var lastRow = sheet.getLastRow();
 
   if (lastRow < JOB_PRIORITY_DATA_START_ROW) {
     return;
   }
 
-  var sortedRecords = getExistingJobRecords().sort(_compareJobsForDisplay);
-  sortedRecords.forEach(function(record, i) { record.rank = i + 1; });
-  replaceAllJobs(sortedRecords);
-  // Self-heal the Assigned sheet on every rank: drop rows the assignee no longer owns
-  // (Skip'd, flagged/bounced back to owner, un-assigned, or whose JP row is gone).
-  _reconcileAssignedSheet(sortedRecords);
+  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var IDX = JOB_PRIORITY_COLUMN_INDEX;
+
+  // FAST PATH: sorting only REORDERS rows — the data doesn't change. So instead of reading all
+  // records + rewriting the whole sheet (replaceAllJobs: raw-data upsert, format/rich-text rebuild,
+  // validation reapply), compute a composite sort key per row and let Sheets' native Range.sort()
+  // reorder the rows in place (values, rich-text hyperlinks, and formats all move together).
+  // One values read + one formulas read; no rebuild.
+  var vals = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, numRows, JOB_PRIORITY_COLUMNS.length).getValues();
+  var linkFormulas = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).getFormulas();
+
+  var sortKeys = vals.map(function(row) {
+    return [_buildJobSortKey(
+      row[IDX.status - 1], row[IDX.priority - 1], row[IDX.posted - 1],
+      row[IDX.imported_at - 1], row[IDX.score - 1]
+    )];
+  });
+  var keyRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1);
+  keyRange.setNumberFormat('@'); // text, so fixed-width numeric keys sort lexicographically
+  keyRange.setValues(sortKeys);
+
+  // Native reorder of the whole data block by the sort key (ascending == our display order).
+  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, numRows, JOB_PRIORITY_COLUMNS.length)
+    .sort([{ column: IDX.sort_key, ascending: true }]);
+
+  // rank = final row position.
+  var ranks = [];
+  for (var r = 1; r <= numRows; r++) ranks.push([r]);
+  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.rank, numRows, 1).setValues(ranks);
+
+  // Self-heal the Assigned sheet on every rank (drop rows the assignee no longer owns; add active
+  // ones). Build records from the values we already read — order-agnostic, so the pre-sort snapshot
+  // is fine — avoiding a full getExistingJobRecords() (+ raw_data join). Include the display fields
+  // the add-pass needs to push a row (_buildAssignedRow); the job_link is rebuilt from jobId there.
+  var reconcileRecords = vals.map(function(row, i) {
+    var rawId = _stringifyField(row[IDX.job_id - 1]);
+    var url = _extractUrlFromHyperlinkFormula(linkFormulas[i][0] || '');
+    return {
+      jobId: _extractLinkedInJobId(rawId) || _extractLinkedInJobId(url) || rawId,
+      owner: row[IDX.owner - 1],
+      status: row[IDX.status - 1],
+      action: row[IDX.action - 1],
+      mergedJobIds: row[IDX.merged_job_ids - 1],
+      rank: row[IDX.rank - 1],
+      priority: row[IDX.priority - 1],
+      score: row[IDX.score - 1],
+      usVisaSponsorshipPotential: row[IDX.us_visa - 1],
+      usVisaReason: row[IDX.us_visa_reason - 1],
+      company: row[IDX.company - 1],
+      title: row[IDX.title - 1],
+      location: row[IDX.location - 1],
+      posted: row[IDX.posted - 1],
+      summary: row[IDX.summary - 1],
+      why: row[IDX.why - 1]
+    };
+  });
+  _reconcileAssignedSheet(reconcileRecords);
+}
+
+// Composite, fixed-width, zero-padded sort key so an ascending text sort reproduces
+// _compareJobsForDisplay: status rank -> priority rank -> newest posted -> highest score.
+function _buildJobSortKey(status, priority, posted, importedAt, score) {
+  var recency = _toComparableTime(posted) || _toComparableTime(importedAt); // ms; 0 if unknown
+  var MAX_MS = 9999999999999; // > any realistic epoch-ms for decades; keeps the inverted value 13 digits
+  var invPosted = MAX_MS - Math.max(0, Math.min(recency, MAX_MS)); // newest -> smallest -> sorts first
+  var sc = Math.max(0, Math.min(Math.round(Number(score) || 0), 9999));
+  return _padSortNum(_statusSortRank(status), 2) +
+         _padSortNum(_prioritySortRank(priority), 2) +
+         _padSortNum(invPosted, 13) +
+         _padSortNum(9999 - sc, 4); // higher score -> smaller -> sorts first
+}
+
+function _padSortNum(n, width) {
+  var str = String(Math.max(0, Math.floor(Number(n) || 0)));
+  while (str.length < width) str = '0' + str;
+  return str;
 }
 
 // Makes the Assigned sheet fully consistent with Job_Priority ownership. Two passes:
@@ -1026,7 +1116,7 @@ function _reconcileAssignedSheet(records) {
       var id = _stringifyField(ids[i][0]).trim();
       if (!id) continue;
       var jp = jpById[id];
-      if (!jp || !_isAssignee(jp.owner) || jp.status === 'Skip') {
+      if (!jp || !_isAssignee(jp.owner) || _isSkip(jp.status)) {
         staleRows.push(ASSIGNED_DATA_START_ROW + i);
       }
     }
@@ -1038,7 +1128,7 @@ function _reconcileAssignedSheet(records) {
 
   // --- Add pass: push any active assignee-owned job not already present.
   // _pushJobsToAssignedSheet is idempotent (skips existing rows) and re-sorts after appending. ---
-  var TERMINAL = { Submitted: true, Skip: true };
+  var TERMINAL = { Submitted: true, Skip: true, 'Skip (auto)': true };
   var toAssign = (records || []).filter(function(r) {
     return _isAssignee(r.owner) && !TERMINAL[_stringifyField(r.status) || 'New'];
   });
@@ -1533,7 +1623,7 @@ function _applyStatusFormattingRules(sheet) {
   var statusCol = '$' + _columnToLetter(JOB_PRIORITY_COLUMN_INDEX.status);
   var statusRow = JOB_PRIORITY_DATA_START_ROW;
 
-  var rowDimFormula = '=OR(' + statusCol + statusRow + '="Submitted",' + statusCol + statusRow + '="Skip")';
+  var rowDimFormula = '=OR(' + statusCol + statusRow + '="Submitted",' + statusCol + statusRow + '="Skip",' + statusCol + statusRow + '="Skip (auto)")';
   var oldFormula = '=AND(' + statusCol + statusRow + '<>"",' + statusCol + statusRow + '<>"New")';
 
   var chipDefs = [
@@ -1542,7 +1632,8 @@ function _applyStatusFormattingRules(sheet) {
     { formula: '=' + statusCol + statusRow + '="Filled"',     bg: '#bfdbfe', fg: '#1e3a8a' },
     { formula: '=' + statusCol + statusRow + '="Flagged"',    bg: '#fde68a', fg: '#92400e' },
     { formula: '=' + statusCol + statusRow + '="Submitted"',  bg: '#bbf7d0', fg: '#14532d' },
-    { formula: '=' + statusCol + statusRow + '="Skip"',       bg: '#e5e7eb', fg: '#374151' }
+    { formula: '=' + statusCol + statusRow + '="Skip"',        bg: '#e5e7eb', fg: '#374151' },
+    { formula: '=' + statusCol + statusRow + '="Skip (auto)"', bg: '#f1f5f9', fg: '#64748b' }
   ];
 
   var managedFormulas = [rowDimFormula, oldFormula].concat(chipDefs.map(function(c) { return c.formula; }));
@@ -1624,7 +1715,8 @@ function _toSheetRow(job) {
     job.levelNormalized || '',
     (job.requiresPeopleMgmt === true || job.requiresPeopleMgmt === false) ? job.requiresPeopleMgmt : '',
     (job.requiredYoePm === 0 || job.requiredYoePm) ? job.requiredYoePm : '',
-    (job.requiredYoeTotal === 0 || job.requiredYoeTotal) ? job.requiredYoeTotal : ''
+    (job.requiredYoeTotal === 0 || job.requiredYoeTotal) ? job.requiredYoeTotal : '',
+    job.sortKey || ''  // scratch column; recomputed and used by sortAndRankJobs' native sort
   ];
 }
 
@@ -2184,7 +2276,9 @@ function _manualWorkflowScore(record) {
   var score = 0;
   var status = String(record.status || 'New');
 
-  if (status && status !== 'New') {
+  // A rules-set 'Skip (auto)' is a system label, not a manual workflow decision — treat it like
+  // 'New' here so a real manual status on a duplicate row always wins the merge.
+  if (status && status !== 'New' && status !== 'Skip (auto)') {
     score += 10;
   }
   if (status === 'Submitted') {
