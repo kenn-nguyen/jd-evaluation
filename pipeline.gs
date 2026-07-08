@@ -19,7 +19,7 @@ function loadRuntimeConfig() {
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
     scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
-    promptVersion: 'v11',
+    promptVersion: 'v13',
     targetProfile: String(
       settings.TARGET_PROFILE ||
       _defaultTargetProfile()
