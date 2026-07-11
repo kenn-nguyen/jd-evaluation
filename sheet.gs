@@ -1033,6 +1033,18 @@ function sortAndRankJobs() {
   for (var r = 1; r <= numRows; r++) ranks.push([r]);
   sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.rank, numRows, 1).setValues(ranks);
 
+  // Range.sort() moves per-cell formats (number format, alignment, backgrounds) with each row, and
+  // the status chip / row-dim colors are range-based conditional-format rules that re-evaluate by
+  // formula regardless of order — so none of those need re-applying. The ONE thing sort does not
+  // reliably preserve is rich-text link runs, so rebuild the job_link hyperlinks from the now-sorted
+  // job_id + merged_job_ids columns (same as _applyJobLinkRichTexts does on a full rewrite).
+  var sortedIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
+  var sortedMerged = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.merged_job_ids, numRows, 1).getValues();
+  var jobLinkRichTexts = sortedIds.map(function(row, i) {
+    return [_buildJobLinkRichText(_stringifyField(row[0]), sortedMerged[i][0])];
+  });
+  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).setRichTextValues(jobLinkRichTexts);
+
   // Self-heal the Assigned sheet on every rank (drop rows the assignee no longer owns; add active
   // ones). Build records from the values we already read — order-agnostic, so the pre-sort snapshot
   // is fine — avoiding a full getExistingJobRecords() (+ raw_data join). Include the display fields
