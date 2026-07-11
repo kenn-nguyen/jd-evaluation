@@ -544,8 +544,15 @@ function _scoreSingleJobWithRetry(job, config, initialResponse) {
   } catch (firstError) {
     Logger.log(firstError);
 
-    var isRateLimit = firstError.message && firstError.message.indexOf('429') !== -1;
-    var isCacheMiss = !isRateLimit && firstError.message && firstError.message.indexOf('404') !== -1;
+    var msg = firstError.message || '';
+    var isRateLimit = msg.indexOf('429') !== -1;
+    // Dead context cache: 404 (deleted) OR the 400 "Cache content <id> is expired." that Gemini
+    // returns once the TTL lapses mid-run. Matching only 404 (the old bug) left the expired 400
+    // undetected, so the stale ID was re-sent on every batch and every job fell into the slow
+    // per-job retry path — turning a parallel run sequential until it hit the 6-min timeout.
+    var isCacheMiss = !isRateLimit &&
+      (msg.indexOf('404') !== -1 ||
+        (/cache content|cachedcontent/i.test(msg) && /expired|not found|invalid/i.test(msg)));
     if (isCacheMiss) {
       // Cache expired — clear in-memory flag so remaining jobs this run skip the stale ID,
       // and purge from PropertiesService so the next trigger doesn't reload and reuse it.
@@ -1551,20 +1558,32 @@ function _clearScoringCacheState() {
   PropertiesService.getScriptProperties().deleteProperty(SCORING_CACHE_STATE_KEY);
 }
 
+// A persisted cache is stale once it nears Gemini's TTL. 10-min safety margin so we never hand a
+// request a cache the server is about to drop. Unknown age (pre-upgrade state with no createdAt)
+// counts as stale → recreate once, then it self-heals.
+function _isScoringCacheStale(stored) {
+  if (!stored || !stored.createdAt) return true;
+  var ageSeconds = (Date.now() - stored.createdAt) / 1000;
+  return ageSeconds >= (SCORING_CACHE_TTL_SECONDS - 600);
+}
+
 function _getOrCreateScoringCache(config) {
   if (config.aiProvider !== 'gemini') return null;
 
   var fingerprint = _getScoringCacheFingerprint(config);
   var stored = _loadScoringCacheState();
 
-  if (stored && stored.fingerprint === fingerprint && stored.name) {
+  // Reuse only a cache that is both fingerprint-matched AND still within its TTL. Without the age
+  // check the same name is reused for days, but Gemini drops it after SCORING_CACHE_TTL_SECONDS —
+  // so every run past that window would start with a dead cache and hit the expired-cache retry path.
+  if (stored && stored.fingerprint === fingerprint && stored.name && !_isScoringCacheStale(stored)) {
     return stored.name;
   }
 
   try {
     var name = _createGeminiCachedContent(config);
     if (name) {
-      _saveScoringCacheState({ name: name, fingerprint: fingerprint });
+      _saveScoringCacheState({ name: name, fingerprint: fingerprint, createdAt: Date.now() });
     }
     return name || null;
   } catch (e) {
