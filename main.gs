@@ -102,9 +102,9 @@ function sortBothSheetsNow() {
   SpreadsheetApp.getUi().alert(
     'Sort & Rank complete.' +
     (routed
-      ? '\nRouted ' + routed + ' new job(s): ' + counts.assigned + ' → assignee, ' +
-        counts.reserved + ' → your lane, ' + counts.skipped + ' → skipped.'
-      : '\nNo new jobs needed routing.')
+      ? '\nRe-ran the rules: ' + counts.assigned + ' newly assigned to the assignee, ' +
+        counts.reserved + ' left unowned for your review, ' + counts.skipped + ' auto-skipped.'
+      : '\nNo routing changes.')
   );
 }
 
@@ -202,7 +202,7 @@ function _handleJobPriorityStatusEdit(sheet, row, newValue, oldValue) {
   var assignedSheet = _getAssignedSheet();
   if (!assignedSheet || !jobId) return;
 
-  if (_isSkip(nv)) {
+  if (_isDeadStatus(nv)) {
     _removeFromAssignedSheet(assignedSheet, jobId);
     return;
   }
@@ -982,7 +982,7 @@ function reevaluateActiveBacklog() {
   var activeRunState = _buildReevaluationStateFromRecords(activeRecords, config, 'active backlog');
 
   if (!activeRunState.targetJobIds.length) {
-    SpreadsheetApp.getUi().alert('No eligible backlog rows were found. Reevaluation only targets New and Assigned rows.');
+    SpreadsheetApp.getUi().alert('No eligible backlog rows were found. Reevaluation only targets New and Networking rows.');
     return;
   }
 
@@ -1028,7 +1028,7 @@ function reevaluateSelectedRows() {
   }
 
   if (!Object.keys(selectedJobIds).length) {
-    ui.alert('No eligible rows selected. Applied and Skip rows are ignored.');
+    ui.alert('No eligible rows selected. Only New and Networking rows can be reevaluated — Filled, Submitted, Skip, and Flagged rows are ignored.');
     return;
   }
 
@@ -1043,7 +1043,7 @@ function reevaluateSelectedRows() {
   activeRunState.forceRescore = true;
 
   if (!activeRunState.targetJobIds.length) {
-    ui.alert('No eligible rows selected. Applied and Skip rows are ignored.');
+    ui.alert('No eligible rows selected. Only New and Networking rows can be reevaluated — Filled, Submitted, Skip, and Flagged rows are ignored.');
     return;
   }
 
@@ -1722,7 +1722,7 @@ function skipNoVisaJobsPrompt() {
     var idx = r.rowNumber - JOB_PRIORITY_DATA_START_ROW;
     if (idx < 0 || idx >= numRows) return;
     if (_stringifyField(r.usVisaSponsorshipPotential) !== 'No (0%)') return;
-    if (_isSkip(statusColVals[idx][0])) return; // already skipped (manual or auto)
+    if (_isDeadStatus(statusColVals[idx][0])) return; // already out of queue (Skip/Skip (auto)/Closed)
     toSkip.push(idx);
   });
 
@@ -1777,13 +1777,13 @@ function reassignJobsPrompt() {
   _reconcileAssignedSheet(getExistingJobRecords());
 
   var total = counts.assigned + counts.reserved + counts.skipped;
-  if (!total) { ui.alert('No unrouted New jobs to route.'); return; }
+  if (!total) { ui.alert('No routing changes — nothing was newly assigned, reserved, or skipped. (Only New / auto-skipped rows that are unowned or auto-assigned are re-routed.)'); return; }
 
   ui.alert(
-    'Routed ' + total + ' new job(s):\n' +
-    '• ' + counts.assigned + ' → assignee lane\n' +
+    'Re-ran the rules:\n' +
+    '• ' + counts.assigned + ' → newly assigned to the assignee lane\n' +
     '• ' + counts.reserved + ' → left unowned for your review\n' +
-    '• ' + counts.skipped + ' → skipped (low priority/excluded)'
+    '• ' + counts.skipped + ' → auto-skipped (visa No, excluded company, or low priority P06+)'
   );
 }
 

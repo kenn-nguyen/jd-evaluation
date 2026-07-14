@@ -1217,9 +1217,12 @@ function _normalizeJobDetail(item, sourceLabel, runStartedAt) {
   var publishedAt = _stringifyField(info.listed_at);
   var importedAt = runStartedAt ? new Date(runStartedAt.getTime()) : new Date();
 
-  // Flag postings LinkedIn has already closed/expired so the owner notices.
+  // Flag postings LinkedIn has already closed/expired so the owner notices, and start them in the
+  // 'Closed' status (out of the queue). If the same role is re-posted later under a new job_id, the
+  // import merge reopens it to New. A blank job_state defaults to the normal 'New'.
   var jobState = _stringifyField(info.job_state).toUpperCase();
-  var referralContact = jobState === 'CLOSED' ? '⚠ Closed/expired on LinkedIn' : '';
+  var isClosed = jobState === 'CLOSED';
+  var referralContact = isClosed ? '⚠ Closed/expired on LinkedIn' : '';
 
   // Mark the raw payload's format so the nested-aware raw-ref readers know how to dig in later.
   var markedItem = item || {};
@@ -1240,7 +1243,7 @@ function _normalizeJobDetail(item, sourceLabel, runStartedAt) {
     jdImpliedLevel: '',
     priority: '',
     score: '',
-    status: 'New',
+    status: isClosed ? 'Closed' : 'New',
     referralContact: referralContact,
     importedAt: importedAt,
     scoredAt: '',

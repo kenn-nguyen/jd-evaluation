@@ -9,10 +9,13 @@ var JOB_PRIORITY_HEADER_ROW = 6;
 var JOB_PRIORITY_DATA_START_ROW = 7;
 // 'Skip' = you skipped it manually (locked from the rules). 'Skip (auto)' = the rules skipped it
 // (visa "No (0%)", excluded company, or low-priority P06+) and the rules may re-evaluate/lift it on
-// a later run. Only the rules ever write '(auto)', so no manual action lands in the re-manageable
-// bucket. _isSkip() treats both as "skipped" for mirroring/sort/removal.
-var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Skip (auto)', 'Flagged'];
+// a later run. 'Closed' = the POSTING is no longer accepting (LinkedIn CLOSED, or expired) — unlike
+// Skip it is NOT a judgment on the role, so a genuine re-post (new job_id + newer posted date)
+// REOPENS it to New. Only the rules ever write '(auto)'; only the import merge / CLOSED signal write
+// 'Closed'. _isSkip() covers the two Skips; _isDeadStatus() covers all three "out of queue" states.
+var JOB_PRIORITY_STATUS_OPTIONS = ['New', 'Networking', 'Filled', 'Submitted', 'Skip', 'Skip (auto)', 'Closed', 'Flagged'];
 var STATUS_SKIP_AUTO = 'Skip (auto)';
+var STATUS_CLOSED = 'Closed';
 var JOB_PRIORITY_STATUS_SORT_ORDER = {
   Networking: 0,
   Filled: 1,
@@ -20,7 +23,8 @@ var JOB_PRIORITY_STATUS_SORT_ORDER = {
   New: 3,
   Submitted: 4,
   Skip: 5,
-  'Skip (auto)': 5
+  'Skip (auto)': 5,
+  Closed: 6
 };
 // 'Assignee' = a manual delegation (locked from the rules). 'Assignee (auto)' = a rules-set
 // assignment that the rules may re-evaluate/pull on later runs. Only the rules ever write the
@@ -40,6 +44,13 @@ function _isAssignee(owner) {
 function _isSkip(status) {
   var v = _stringifyField(status).trim();
   return v === 'Skip' || v === STATUS_SKIP_AUTO;
+}
+// Any "out of the active queue" status: the two Skips plus Closed. Used for Assigned-sheet removal,
+// the reconcile terminal set, and the visa-No sweep guard. (Closed differs from Skip only in that a
+// fresh re-post reopens it — handled in _mergeNewJobIntoExistingRow, not here.)
+function _isDeadStatus(status) {
+  var v = _stringifyField(status).trim();
+  return _isSkip(v) || v === STATUS_CLOSED;
 }
 var JOB_PRIORITY_VISIBLE_COLUMNS = [
   'rank',
@@ -133,9 +144,9 @@ var SETTINGS_DEFAULT_ROWS = [
   ['AUTO_RESERVE_PRIORITIES', 'P01,P02', 'Priorities never auto-delegated. Left with an empty Owner for your review (not stamped Me). See Help → Owner & lanes.'],
   ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to the assignee (Owner set to "Assignee (auto)") after each run, if they clear the visa + score filters.'],
   ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs are left unowned (empty) for your review.'],
-  ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay in your lane. See Help → Visa Signals for what each label means.'],
+  ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay unowned for your review (not delegated). See Help → Visa Signals for what each label means.'],
   ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status "Skip (auto)" during routing, regardless of priority (the role does not sponsor). "Skip (auto)" = skipped by the rules (re-evaluable); plain "Skip" = you skipped it manually (locked). Set FALSE to disable.'],
-  ['RESERVED_COMPANIES', '', 'Companies always kept in your lane, case-insensitive (e.g. Stripe,Airbnb).'],
+  ['RESERVED_COMPANIES', '', 'Companies always kept unowned for your review, never delegated to the assignee; case-insensitive (e.g. Stripe,Airbnb).'],
   ['AUTO_ASSIGN_EXCLUDE_COMPANIES', '', 'Companies to skip entirely during routing, case-insensitive (e.g. Google,Meta).'],
 
   ['# Notifications', '', ''],
@@ -180,6 +191,13 @@ var HELP_ROWS = [
   ['US required (40%)', 'Asks for US applicants / US location / US work authorization, but does not explicitly rule sponsorship out.'],
   ['Unlikely (20%)', 'Silent on sponsorship and the context leans against it — small/early-stage startup, government/defense, or staffing/contract.'],
   ['No (0%)', 'The post explicitly says no sponsorship, or requires citizenship / security clearance. These are auto-set to "Skip (auto)" (see AUTO_SKIP_VISA_NO).'],
+
+  ['# Statuses', ''],
+  ['New / Networking / Filled / Submitted', 'The active workflow: New (fresh) → Filled (form done) → Submitted (applied); Networking = working a referral. Only New and Networking are re-scoreable.'],
+  ['Skip', 'YOU skipped it manually — a deliberate "not interested in this role" decision. Locked: the rules never touch it, and a later re-post of the same JD stays hidden.'],
+  ['Skip (auto)', 'The RULES skipped it (visa No, excluded company, or low priority P06+). The rules may lift it on a later run if it re-qualifies.'],
+  ['Closed', 'The POSTING is no longer accepting (LinkedIn CLOSED / expired) — set automatically on import, or by you. NOT a judgment on the role: if the same role is re-posted under a new job_id with a newer date, it automatically REOPENS to New. Use this (not Skip) for expired postings you want to see again if they come back.'],
+  ['Flagged', 'Raised for your attention (usually by the assignee). Bounces back to you as Owner=Me with the note.'],
 
   ['# Owner & lanes', ''],
   ['What Owner means', 'The Owner column decides whose lane a job is in. Set it from the dropdown, or let the rules set it. Empty = unmanaged.'],
@@ -399,6 +417,10 @@ function writeJobs(rows) {
   }
 
   if (appendedJobs.length) {
+    // Refresh validation FIRST so a newly-appended 'Closed' status (auto-set from a CLOSED posting)
+    // is an accepted value even on a sheet that predates the 'Closed' option — otherwise setValues
+    // would be rejected by the stale requireValueInList(allowInvalid=false) rule.
+    _applyStatusValidation(sheet);
     var appends = appendedJobs.map(_toSheetRow);
     var startRow = Math.max(sheet.getLastRow() + 1, JOB_PRIORITY_DATA_START_ROW);
     sheet.getRange(startRow, 1, appends.length, JOB_PRIORITY_COLUMNS.length).setValues(appends);
@@ -456,7 +478,21 @@ function _mergeNewJobIntoExistingRow(sheet, rowNumber, newJob) {
   if (newJobId && newJobId !== primaryId) {
     var existingMerged = _stringifyField(values[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids - 1]);
     var idList = existingMerged ? existingMerged.split(/,\s*/) : [];
-    if (idList.indexOf(newJobId) === -1) idList.push(newJobId);
+    if (idList.indexOf(newJobId) === -1) {
+      idList.push(newJobId);
+      // Genuine re-post: a NEW job_id for the same JD (LinkedIn re-issues the id on re-post; a
+      // re-scrape keeps the id). If the existing row was 'Closed' (expired posting) and this re-post
+      // is newer, REOPEN it to New and hand it back to the rules — the role reappeared. Manual 'Skip'
+      // / rules 'Skip (auto)' are deliberate rejections and are NOT reopened.
+      var existingStatus = _stringifyField(values[JOB_PRIORITY_COLUMN_INDEX.status - 1]);
+      if (existingStatus === STATUS_CLOSED &&
+          _toComparableTime(newJob.posted) > _toComparableTime(values[JOB_PRIORITY_COLUMN_INDEX.posted - 1])) {
+        updates[JOB_PRIORITY_COLUMN_INDEX.status] = 'New';
+        updates[JOB_PRIORITY_COLUMN_INDEX.owner] = '';
+        var closedNote = _stringifyField(values[JOB_PRIORITY_COLUMN_INDEX.referral_contact - 1]);
+        if (closedNote.indexOf('Closed/expired') !== -1) updates[JOB_PRIORITY_COLUMN_INDEX.referral_contact] = '';
+      }
+    }
     updates[JOB_PRIORITY_COLUMN_INDEX.merged_job_ids] = idList.join(', ');
   }
 
@@ -1128,7 +1164,7 @@ function _reconcileAssignedSheet(records) {
       var id = _stringifyField(ids[i][0]).trim();
       if (!id) continue;
       var jp = jpById[id];
-      if (!jp || !_isAssignee(jp.owner) || _isSkip(jp.status)) {
+      if (!jp || !_isAssignee(jp.owner) || _isDeadStatus(jp.status)) {
         staleRows.push(ASSIGNED_DATA_START_ROW + i);
       }
     }
@@ -1140,7 +1176,7 @@ function _reconcileAssignedSheet(records) {
 
   // --- Add pass: push any active assignee-owned job not already present.
   // _pushJobsToAssignedSheet is idempotent (skips existing rows) and re-sorts after appending. ---
-  var TERMINAL = { Submitted: true, Skip: true, 'Skip (auto)': true };
+  var TERMINAL = { Submitted: true, Skip: true, 'Skip (auto)': true, Closed: true };
   var toAssign = (records || []).filter(function(r) {
     return _isAssignee(r.owner) && !TERMINAL[_stringifyField(r.status) || 'New'];
   });
@@ -1635,7 +1671,7 @@ function _applyStatusFormattingRules(sheet) {
   var statusCol = '$' + _columnToLetter(JOB_PRIORITY_COLUMN_INDEX.status);
   var statusRow = JOB_PRIORITY_DATA_START_ROW;
 
-  var rowDimFormula = '=OR(' + statusCol + statusRow + '="Submitted",' + statusCol + statusRow + '="Skip",' + statusCol + statusRow + '="Skip (auto)")';
+  var rowDimFormula = '=OR(' + statusCol + statusRow + '="Submitted",' + statusCol + statusRow + '="Skip",' + statusCol + statusRow + '="Skip (auto)",' + statusCol + statusRow + '="Closed")';
   var oldFormula = '=AND(' + statusCol + statusRow + '<>"",' + statusCol + statusRow + '<>"New")';
 
   var chipDefs = [
@@ -1645,7 +1681,8 @@ function _applyStatusFormattingRules(sheet) {
     { formula: '=' + statusCol + statusRow + '="Flagged"',    bg: '#fde68a', fg: '#92400e' },
     { formula: '=' + statusCol + statusRow + '="Submitted"',  bg: '#bbf7d0', fg: '#14532d' },
     { formula: '=' + statusCol + statusRow + '="Skip"',        bg: '#e5e7eb', fg: '#374151' },
-    { formula: '=' + statusCol + statusRow + '="Skip (auto)"', bg: '#f1f5f9', fg: '#64748b' }
+    { formula: '=' + statusCol + statusRow + '="Skip (auto)"', bg: '#f1f5f9', fg: '#64748b' },
+    { formula: '=' + statusCol + statusRow + '="Closed"',       bg: '#fee2e2', fg: '#991b1b' }
   ];
 
   var managedFormulas = [rowDimFormula, oldFormula].concat(chipDefs.map(function(c) { return c.formula; }));
@@ -2288,9 +2325,9 @@ function _manualWorkflowScore(record) {
   var score = 0;
   var status = String(record.status || 'New');
 
-  // A rules-set 'Skip (auto)' is a system label, not a manual workflow decision — treat it like
-  // 'New' here so a real manual status on a duplicate row always wins the merge.
-  if (status && status !== 'New' && status !== 'Skip (auto)') {
+  // A rules-set 'Skip (auto)' and a posting-state 'Closed' are system labels, not manual workflow
+  // decisions — treat them like 'New' here so a real manual status on a duplicate row wins the merge.
+  if (status && status !== 'New' && status !== 'Skip (auto)' && status !== 'Closed') {
     score += 10;
   }
   if (status === 'Submitted') {
