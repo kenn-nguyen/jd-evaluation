@@ -431,6 +431,10 @@ function writeJobs(rows) {
   }
 
   _applyStatusValidation(sheet);
+  // Re-assert the status chip colors + row-dim over the current range so newly-appended rows and
+  // the Skip (auto) / Closed chips render without needing a manual Initialize (the native sort does
+  // not re-apply these, and recurring runs only ever go through this append path).
+  _applyStatusFormattingRules(sheet);
 
   var assignedJobs = rows.filter(function(job) {
     return _isAssignee(job.owner);
@@ -1181,7 +1185,11 @@ function _reconcileAssignedSheet(records) {
     return _isAssignee(r.owner) && !TERMINAL[_stringifyField(r.status) || 'New'];
   });
   if (toAssign.length) {
-    _pushJobsToAssignedSheet(toAssign);
+    _pushJobsToAssignedSheet(toAssign); // re-sorts internally after appending
+  } else {
+    // No new rows to push (so _pushJobsToAssignedSheet didn't run) — still guarantee the Assigned
+    // sheet is ordered, matching the manual Sort & Rank path. Removals above may have left gaps.
+    _sortAssignedSheet(assignedSheet);
   }
 }
 
