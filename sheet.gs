@@ -127,7 +127,8 @@ var SETTINGS_DEFAULT_ROWS = [
   ['GEMINI_API_ROUTE', 'developer', 'developer = Gemini Developer API (free quota). vertex = your Google Cloud project with Vertex billing.'],
   ['VERTEX_PROJECT_ID', '', 'Required only when GEMINI_API_ROUTE=vertex. Your standard Google Cloud project id.'],
   ['VERTEX_LOCATION', 'global', 'Vertex region. Keep as global for Gemini models unless instructed otherwise.'],
-  ['SCORING_MODEL', 'gemini-2.5-flash', 'Gemini model used for scoring. gemini-2.5-flash recommended.'],
+  ['SCORING_MODEL', 'gemini-3.5-flash', 'Gemini model used for scoring. gemini-3.5-flash recommended (reasoning model, good quality/cost). gemini-3.1-flash-lite is ~6x cheaper for high volume but is NOT a reasoning model — test scoring quality before switching. Avoid Pro tiers for scoring (overkill + costly).'],
+  ['SCORING_THINKING_LEVEL', 'low', 'Thinking level for Gemini 3.x scoring: minimal | low | medium | high (blank/off = model default). low keeps the chained scoring reasoning while cutting thinking-token cost + latency vs the medium default. Ignored on 2.5 models.'],
   ['SCORING_PARALLEL_REQUESTS', '3', 'Number of AI scoring requests sent in parallel per batch. 3 is safe for most quota tiers.'],
   ['SCORING_RPM_LIMIT', '0', 'Rate limit in requests/minute. Set to your Gemini/Vertex quota (e.g. 10 for free tier). 0 = no pacing.'],
   ['SCORING_MAX_JOBS_PER_EXECUTION', '0', '0 = auto (sized to fit the 6-minute Apps Script limit; large runs continue automatically across executions). Set a number only to cap it manually.'],
@@ -319,9 +320,22 @@ function getExistingJobIndex() {
     byJobId[jobId] = _mergeDuplicateJobRecordsByJobId(groupedByJobId[jobId]);
   });
 
+  // Index SCORED rows by JD-content fingerprint so the import path can recognize a re-post (same JD,
+  // new job_id) BEFORE scoring it and reuse the stored score via the merge — instead of paying to
+  // re-score a role already in the sheet. Only rows with a scoring payload are indexed, so a match
+  // guarantees a reusable score.
+  var byJdFingerprint = {};
+  records.forEach(function(record) {
+    var fp = _stringifyField(record.jdFingerprint);
+    if (fp && !byJdFingerprint[fp] && _hasScoringPayload(record)) {
+      byJdFingerprint[fp] = record;
+    }
+  });
+
   return {
     records: records,
-    byJobId: byJobId
+    byJobId: byJobId,
+    byJdFingerprint: byJdFingerprint
   };
 }
 

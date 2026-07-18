@@ -14,7 +14,11 @@ function loadRuntimeConfig() {
   return {
     aiProvider: 'gemini',
     geminiApiRoute: String(settings.GEMINI_API_ROUTE || 'developer').toLowerCase(),
-    scoringModel: String(settings.SCORING_MODEL || 'gemini-2.5-flash'),
+    scoringModel: String(settings.SCORING_MODEL || 'gemini-3.5-flash'),
+    // Gemini 3.x thinking control (generateContent). 'minimal' | 'low' | 'medium' | 'high'; blank/off
+    // to omit. Applied only to 3.x models (2.5 used a different numeric budget field). 'low' keeps
+    // the chained scoring reasoning while cutting thinking-token cost + latency vs the 'medium' default.
+    scoringThinkingLevel: String(settings.SCORING_THINKING_LEVEL || 'low').trim().toLowerCase(),
     scoringParallelRequests: _normalizePositiveInteger(settings.SCORING_PARALLEL_REQUESTS || 3, 1, 100),
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
@@ -171,6 +175,25 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     }
 
     var existing = existingIndex.byJobId[normalizedJob.jobId];
+
+    // Re-post pre-check: a NEW job_id whose JD matches an already-SCORED existing row (LinkedIn
+    // re-issues ids on re-post). Skip scoring it — writeJobs merges it into that row by JD
+    // fingerprint (appending the new id + newest link) and keeps the stored score. Without this the
+    // re-post is scored as "new" and only merged away afterward, burning an AI call every run.
+    if (!existing && !config.forceRescore && existingIndex.byJdFingerprint) {
+      var jdFp = normalizedJob.jdFingerprint ||
+        (normalizedJob.jobDescription ? _jdContentHash(normalizedJob.jobDescription) : '');
+      if (jdFp && existingIndex.byJdFingerprint[jdFp]) {
+        // Build WITHOUT the existing row so the candidate keeps its own new job_id (so the merge
+        // records it + refreshes the link); the merge preserves the existing row's score.
+        var repost = _buildCandidateJob(normalizedJob, null);
+        rowsToWriteWithoutScoring.push(repost);
+        handledThisExecution.push(repost.jobId);
+        handledJobIdsMap[repost.jobId] = true;
+        return;
+      }
+    }
+
     var job = _buildCandidateJob(normalizedJob, existing);
 
     if (existing && !config.forceRescore) {
@@ -1407,6 +1430,14 @@ function _buildGeminiScoreRequest(job, config) {
     temperature: 0.2,
     responseMimeType: 'application/json'
   };
+  // Cap thinking on Gemini 3.x (thinkingLevel string; 2.5 used a numeric budget and would reject
+  // this field, so only attach for 3.x). Left off if the level is blank/'off'/'default'. No
+  // maxOutputTokens cap — on 3.x thinking tokens count toward output, so a cap could truncate the JSON.
+  var lvl = config.scoringThinkingLevel;
+  var is3x = /gemini-3/i.test(String(config.scoringModel || ''));
+  if (is3x && lvl && lvl !== 'off' && lvl !== 'default') {
+    generationConfig.thinkingConfig = { thinkingLevel: lvl };
+  }
   var payload;
 
   if (config._scoringCacheName) {
