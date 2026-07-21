@@ -1099,6 +1099,17 @@ function sortAndRankJobs() {
   });
   sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).setRichTextValues(jobLinkRichTexts);
 
+  // Fresh rank per pre-sort row index = its position when ordered by the sort key (same order the
+  // sheet was just sorted into). The rank column in `vals` is the PRE-sort (stale) rank, so use this
+  // instead when mirroring to the Assigned sheet — otherwise the Assigned rank lags a run behind.
+  var freshRankByValsIdx = [];
+  vals.map(function(_, i) { return i; })
+    .sort(function(a, b) {
+      var ka = sortKeys[a][0], kb = sortKeys[b][0];
+      return ka < kb ? -1 : (ka > kb ? 1 : 0);
+    })
+    .forEach(function(valsIdx, pos) { freshRankByValsIdx[valsIdx] = pos + 1; });
+
   // Self-heal the Assigned sheet on every rank (drop rows the assignee no longer owns; add active
   // ones). Build records from the values we already read — order-agnostic, so the pre-sort snapshot
   // is fine — avoiding a full getExistingJobRecords() (+ raw_data join). Include the display fields
@@ -1112,7 +1123,7 @@ function sortAndRankJobs() {
       status: row[IDX.status - 1],
       action: row[IDX.action - 1],
       mergedJobIds: row[IDX.merged_job_ids - 1],
-      rank: row[IDX.rank - 1],
+      rank: freshRankByValsIdx[i],
       priority: row[IDX.priority - 1],
       score: row[IDX.score - 1],
       usVisaSponsorshipPotential: row[IDX.us_visa - 1],
@@ -1205,6 +1216,12 @@ function _reconcileAssignedSheet(records) {
     // sheet is ordered, matching the manual Sort & Rank path. Removals above may have left gaps.
     _sortAssignedSheet(assignedSheet);
   }
+
+  // The add-pass only PUSHES new rows; rows already present keep whatever rank/priority/score they
+  // had when first mirrored. After a re-rank that leaves them stale, so refresh those fields on every
+  // active assignee row from the fresh records. Rank is display-only (Assigned sorts by priority, not
+  // rank), so this doesn't affect row order.
+  if (toAssign.length) _syncAssignedRowsForJobs(toAssign);
 }
 
 function updateRunSummary(summary) {
