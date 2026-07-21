@@ -1203,6 +1203,12 @@ function _reconcileAssignedSheet(records) {
     }
   }
 
+  // Sync rank + STATUS on the rows that stay, from the fresh Job_Priority records, BEFORE the sort —
+  // so a job now Submitted/Filled/Flagged in JP shows that status on the Assigned sheet (and Submitted
+  // sinks to the bottom as history) instead of a stale 'New' that looks like an active task. Job_Priority
+  // is the source of truth (assignee edits mirror up to it). Batched (O(1) API calls), not per-cell.
+  _refreshAssignedMirror(assignedSheet, records);
+
   // --- Add pass: push any active assignee-owned job not already present.
   // _pushJobsToAssignedSheet is idempotent (skips existing rows) and re-sorts after appending. ---
   var TERMINAL = { Submitted: true, Skip: true, 'Skip (auto)': true, Closed: true };
@@ -1216,12 +1222,61 @@ function _reconcileAssignedSheet(records) {
     // sheet is ordered, matching the manual Sort & Rank path. Removals above may have left gaps.
     _sortAssignedSheet(assignedSheet);
   }
+}
 
-  // The add-pass only PUSHES new rows; rows already present keep whatever rank/priority/score they
-  // had when first mirrored. After a re-rank that leaves them stale, so refresh those fields on every
-  // active assignee row from the fresh records. Rank is display-only (Assigned sorts by priority, not
-  // rank), so this doesn't affect row order.
-  if (toAssign.length) _syncAssignedRowsForJobs(toAssign);
+// Batched refresh of the Assigned sheet's rank + status columns from fresh records (jobId -> value),
+// matched by job_id (canonical or any merged id). O(1) API calls regardless of row count. Status is
+// synced only to values valid on the Assigned sheet; JP is authoritative (assignee edits mirror up).
+function _refreshAssignedMirror(assignedSheet, records) {
+  var lastRow = assignedSheet.getLastRow();
+  if (lastRow < ASSIGNED_DATA_START_ROW) return;
+
+  var VALID_ASSIGNED_STATUS = { New: true, Filled: true, Submitted: true, Flagged: true };
+  var rankByJobId = {};
+  var statusByJobId = {};
+  (records || []).forEach(function(r) {
+    var st = _stringifyField(r.status);
+    var hasRank = !(r.rank === '' || r.rank === undefined || r.rank === null);
+    var setFor = function(id) {
+      var key = _extractLinkedInJobId(id) || id;
+      if (!key) return;
+      if (hasRank) rankByJobId[key] = r.rank;
+      if (VALID_ASSIGNED_STATUS[st]) statusByJobId[key] = st;
+    };
+    var primary = _stringifyField(r.jobId).trim();
+    if (primary) setFor(primary);
+    if (r.mergedJobIds) {
+      _stringifyField(r.mergedJobIds).split(',').forEach(function(m) {
+        var mm = m.trim();
+        if (mm) setFor(mm);
+      });
+    }
+  });
+
+  var n = lastRow - ASSIGNED_DATA_START_ROW + 1;
+  var ids = assignedSheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.job_id, n, 1).getValues();
+  var rankCol = assignedSheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.rank, n, 1).getValues();
+  var statusCol = assignedSheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.status, n, 1).getValues();
+  var rankChanged = false;
+  var statusChanged = false;
+  for (var i = 0; i < n; i++) {
+    var jid = _stringifyField(ids[i][0]).trim();
+    var canonical = _extractLinkedInJobId(jid) || jid;
+    if (rankByJobId.hasOwnProperty(canonical) && rankCol[i][0] !== rankByJobId[canonical]) {
+      rankCol[i][0] = rankByJobId[canonical];
+      rankChanged = true;
+    }
+    if (statusByJobId.hasOwnProperty(canonical) && _stringifyField(statusCol[i][0]) !== statusByJobId[canonical]) {
+      statusCol[i][0] = statusByJobId[canonical];
+      statusChanged = true;
+    }
+  }
+  if (statusChanged) {
+    assignedSheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.status, n, 1).setValues(statusCol);
+  }
+  if (rankChanged) {
+    assignedSheet.getRange(ASSIGNED_DATA_START_ROW, ASSIGNED_COLUMN_INDEX.rank, n, 1).setValues(rankCol);
+  }
 }
 
 function updateRunSummary(summary) {
