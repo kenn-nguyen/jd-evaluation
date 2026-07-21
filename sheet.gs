@@ -1087,17 +1087,27 @@ function sortAndRankJobs() {
   for (var r = 1; r <= numRows; r++) ranks.push([r]);
   sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.rank, numRows, 1).setValues(ranks);
 
-  // Range.sort() moves per-cell formats (number format, alignment, backgrounds) with each row, and
-  // the status chip / row-dim colors are range-based conditional-format rules that re-evaluate by
-  // formula regardless of order — so none of those need re-applying. The ONE thing sort does not
-  // reliably preserve is rich-text link runs, so rebuild the job_link hyperlinks from the now-sorted
-  // job_id + merged_job_ids columns (same as _applyJobLinkRichTexts does on a full rewrite).
-  var sortedIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
-  var sortedMerged = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.merged_job_ids, numRows, 1).getValues();
-  var jobLinkRichTexts = sortedIds.map(function(row, i) {
-    return [_buildJobLinkRichText(_stringifyField(row[0]), sortedMerged[i][0])];
-  });
-  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).setRichTextValues(jobLinkRichTexts);
+  // Range.sort() moves per-cell formats and rich text WITH each row, so the job_link hyperlinks
+  // (set at import/merge time) normally survive the reorder. Rebuilding all N every sort was the
+  // O(N) cost that blew the 6-min limit on large sheets — so instead REPAIR ONLY the cells the sort
+  // left without a usable link (a rare edge, e.g. a pending cross-ref flush). This scales: if sort
+  // preserved everything (the common case) we rebuild ~0 cells; correctness is unaffected either way.
+  var linkRts = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).getRichTextValues();
+  var sortedIds = null, sortedMerged = null, repaired = false;
+  for (var lr = 0; lr < numRows; lr++) {
+    var rt = linkRts[lr][0];
+    var text = rt ? rt.getText() : '';
+    if (text) continue; // link text present -> sort preserved it, leave as-is
+    if (!sortedIds) {
+      sortedIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
+      sortedMerged = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.merged_job_ids, numRows, 1).getValues();
+    }
+    linkRts[lr][0] = _buildJobLinkRichText(_stringifyField(sortedIds[lr][0]), sortedMerged[lr][0]);
+    repaired = true;
+  }
+  if (repaired) {
+    sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).setRichTextValues(linkRts);
+  }
 
   // Fresh rank per pre-sort row index = its position when ordered by the sort key (same order the
   // sheet was just sorted into). The rank column in `vals` is the PRE-sort (stale) rank, so use this
