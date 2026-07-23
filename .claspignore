@@ -2,3 +2,5 @@ career-ops/**
 docs/**
 node_modules/**
 .git/**
+README.md
+*.md
