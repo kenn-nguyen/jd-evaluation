@@ -10,6 +10,9 @@ function loadRuntimeConfig() {
   var settings = getSettingsMap();
   var properties = PropertiesService.getScriptProperties();
   var _apifyAccountsBundle = _getApifyAccounts();
+  // The in-sheet Prompt editor (col B) is the primary source; the legacy SCORING_INSTRUCTIONS /
+  // TARGET_PROFILE Settings cells remain a fallback for workbooks that predate the Prompt sheet.
+  var _promptTexts = _getPromptSheetTexts();
 
   return {
     aiProvider: 'gemini',
@@ -22,12 +25,11 @@ function loadRuntimeConfig() {
     scoringParallelRequests: _normalizePositiveInteger(settings.SCORING_PARALLEL_REQUESTS || 3, 1, 100),
     scoringRpmLimit: _normalizePositiveInteger(settings.SCORING_RPM_LIMIT || 0, 0, 10000),
     maxJobsPerExecution: _normalizePositiveInteger(settings.SCORING_MAX_JOBS_PER_EXECUTION || 0, 0, 10000),
-    scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
+    scoringInstructions: _resolveDefaultableSetting(_promptTexts.instructions || settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions),
     promptVersion: 'v13',
-    targetProfile: String(
-      settings.TARGET_PROFILE ||
-      _defaultTargetProfile()
-    ),
+    // Prompt sheet cell wins; else the legacy Settings cell; else the built-in. Blank or 'default'
+    // in either falls back to the built-in default.
+    targetProfile: _resolveDefaultableSetting(_promptTexts.profile || settings.TARGET_PROFILE, _defaultTargetProfile),
     notifyEmail: String(settings.NOTIFY_EMAIL || '').trim(),
     forceRescore: String(settings.FORCE_RESCORE || 'FALSE').toUpperCase() === 'TRUE',
     runIntervalHours: _normalizePositiveInteger(settings.RUN_INTERVAL_HOURS || 4, 4, 12),

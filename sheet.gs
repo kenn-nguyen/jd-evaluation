@@ -1,6 +1,13 @@
 var JOB_PRIORITY_SHEET_NAME = 'Job_Priority';
 var SETTINGS_SHEET_NAME = 'Settings';
 var HELP_SHEET_NAME = 'Help';
+// In-sheet editor for the scoring prompt + profile (col B is edited directly — no dialog / no OAuth,
+// so it is immune to the multi-Google-account authorization prompt). Rows are fixed.
+var PROMPT_SHEET_NAME = 'Prompt';
+var PROMPT_PROFILE_ROW = 2;       // B2 = editable target profile (blank = built-in default)
+var PROMPT_INSTRUCTIONS_ROW = 3;  // B3 = editable scoring instructions (blank = built-in default, auto-updates)
+var PROMPT_DEFAULT_REF_ROW = 4;   // B4 = read-only reference: the current built-in instructions
+var PROMPT_CONTENT_COL = 2;
 var DEDUP_ARCHIVE_SHEET_NAME = 'Dedup_Archive';
 var RAW_DATA_SHEET_NAME = 'Raw_Data';
 var APIFY_ACCOUNTS_SHEET_NAME = 'Apify_Accounts';
@@ -132,8 +139,6 @@ var SETTINGS_DEFAULT_ROWS = [
   ['SCORING_PARALLEL_REQUESTS', '3', 'Number of AI scoring requests sent in parallel per batch. 3 is safe for most quota tiers.'],
   ['SCORING_RPM_LIMIT', '0', 'Rate limit in requests/minute. Set to your Gemini/Vertex quota (e.g. 10 for free tier). 0 = no pacing.'],
   ['SCORING_MAX_JOBS_PER_EXECUTION', '0', '0 = auto (sized to fit the 6-minute Apps Script limit; large runs continue automatically across executions). Set a number only to cap it manually.'],
-  ['TARGET_PROFILE', '', 'Blank = use the built-in profile. Paste your own resume/profile text to override.'],
-  ['SCORING_INSTRUCTIONS', 'default', 'default = use the built-in scoring prompt. Replace with your own instruction block if needed.'],
   ['FORCE_RESCORE', 'FALSE', 'Set TRUE to force re-scoring of already-scored jobs in the current fetch.'],
 
   ['# Schedule', '', ''],
@@ -165,7 +170,7 @@ var HELP_ROWS = [
   ['Step 2 — Gemini API key', 'In Apps Script editor: Project Settings → Script Properties → add GEMINI_API_KEY with your Gemini Developer API key. Leave GEMINI_API_ROUTE as developer.'],
   ['Step 3 — Vertex billing (optional)', 'To use Vertex instead: link this Apps Script project to a standard Google Cloud project, enable Vertex AI API, set GEMINI_API_ROUTE=vertex, fill in VERTEX_PROJECT_ID.'],
   ['Step 4 — Search input', 'Settings → APIFY_RUN_INPUT: paste your LinkedIn search JSON. Use {f_tpr} as a placeholder for auto-computed lookback. Example in the Apify section below.'],
-  ['Step 5 — Target profile (optional)', 'Settings → TARGET_PROFILE: paste your resume/profile text to override the built-in profile. Leave blank to use the built-in default.'],
+  ['Step 5 — Target profile', 'Open the PROMPT sheet (or Jobs Pipeline → Open Prompt & Profile) and edit the YOUR PROFILE cell (column B) directly — paste your resume/profile text. Clear the cell to use the built-in default. No permission needed.'],
   ['Step 6 — Routing (optional)', 'Settings → Routing & Delegation: configure which priorities go to you vs. your assignee, reserved companies, and visa filters.'],
   ['Step 7 — Validate and run', 'Jobs Pipeline → Maintenance → Validate Config. Then Jobs Pipeline → Run Now.'],
 
@@ -180,7 +185,7 @@ var HELP_ROWS = [
   ['Large runs', 'Large scoring batches continue automatically in chunks. If a batch approaches the 6-minute Apps Script limit, the script saves progress and schedules a continuation — no action needed.'],
   ['Parallel requests', 'SCORING_PARALLEL_REQUESTS controls how many jobs are scored simultaneously. 3 is safe for most quota tiers; increase only if you have high RPM quota.'],
   ['If AI output is invalid', 'The script retries each job once on a bad AI response. If it still fails, that job is skipped and the rest continue.'],
-  ['Resetting scoring prompt', 'Type default into SCORING_INSTRUCTIONS to restore the built-in prompt. No need to re-run Initialize Sheets.'],
+  ['Editing / resetting the scoring prompt', 'Open the PROMPT sheet: edit the SCORING INSTRUCTIONS cell (column B) directly. Leave it BLANK to use the built-in default (which auto-updates); the gray cell below shows the current default to copy from. Editing affects NEW jobs next run; run Reevaluate Selected Rows to re-score existing rows (costs API calls).'],
   ['Vertex route', 'Vertex uses the Vertex AI REST endpoint with Apps Script OAuth, billed to your linked Google Cloud project. Usage does not count against Gemini Developer API quotas.'],
 
   ['# Visa Signals (US sponsorship)', ''],
@@ -224,8 +229,15 @@ function setupJobPriorityWorkbook() {
   var assignedSheet = _getOrCreateSheet(spreadsheet, ASSIGNED_SHEET_NAME);
   var apifyAccountsSheet = _getOrCreateSheet(spreadsheet, APIFY_ACCOUNTS_SHEET_NAME);
 
+  var promptSheet = _getOrCreateSheet(spreadsheet, PROMPT_SHEET_NAME);
+  // Capture any existing SCORING_INSTRUCTIONS / TARGET_PROFILE override BEFORE _setupSettingsSheet
+  // rebuilds the Settings sheet (those rows are no longer seeded, so the rebuild drops them) — so
+  // _setupPromptSheet can still migrate the override into the Prompt sheet.
+  var _preInitSettings = getSettingsMap();
+
   _setupJobPrioritySheet(jobSheet);
   _setupSettingsSheet(settingsSheet);
+  _setupPromptSheet(promptSheet, _preInitSettings);
   _setupHelpSheet(helpSheet);
   _setupRawDataSheet(rawDataSheet);
   _setupAssignedSheet(assignedSheet);
@@ -280,6 +292,13 @@ function ensureWorkbookReadyForRuntime() {
       !_headerMatches(apifyAccountsSheet.getRange(APIFY_ACCOUNTS_HEADER_ROW, 1, 1, APIFY_ACCOUNTS_COLUMNS.length).getValues()[0], APIFY_ACCOUNTS_COLUMNS)) {
     _setupApifyAccountsSheet(apifyAccountsSheet);
   }
+
+  // Create the Prompt sheet for existing workbooks that predate it (migrates any Settings override
+  // in). Only when missing — never re-seed, so user edits are preserved.
+  if (!spreadsheet.getSheetByName(PROMPT_SHEET_NAME)) {
+    _setupPromptSheet(_getOrCreateSheet(spreadsheet, PROMPT_SHEET_NAME));
+    _protectSheetsForAssignee(spreadsheet);
+  }
 }
 
 function getSettingsMap() {
@@ -301,6 +320,7 @@ function getSettingsMap() {
 
   return settings;
 }
+
 
 function getExistingJobIndex() {
   var records = getExistingJobRecords();
@@ -1708,6 +1728,74 @@ function _setupHelpSheet(sheet) {
   sheet.getRange(1, 1, HELP_ROWS.length, 2).setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
 }
 
+// The in-sheet prompt/profile editor. Column A = labels, column B = content the user edits directly.
+// Seeds the edit cells only when empty (preserves edits on re-Initialize) and migrates any existing
+// Settings override in. The instructions default-reference (B4) is always refreshed to the current
+// built-in so users see the latest to copy from.
+function _setupPromptSheet(sheet, migrationSettings) {
+  _ensureSheetDimensions(sheet, 2, 5);
+  // migrationSettings = snapshot taken before the Settings rebuild (full Initialize path); when called
+  // standalone (auto-create path) the Settings rows are still intact, so getSettingsMap() is fine.
+  var settings = migrationSettings || getSettingsMap();
+
+  var existingProfile = _stringifyField(sheet.getRange(PROMPT_PROFILE_ROW, PROMPT_CONTENT_COL).getValue());
+  var existingInstr = _stringifyField(sheet.getRange(PROMPT_INSTRUCTIONS_ROW, PROMPT_CONTENT_COL).getValue());
+
+  // Labels / banner — always refreshed.
+  sheet.getRange(1, 1).setValue('Scoring Prompt & Profile — edit column B directly (no menu, no permission needed). ' +
+    'Changes affect NEW jobs on the next run; use Jobs Pipeline → Reevaluate Selected Rows to re-score existing rows (costs API calls).');
+  sheet.getRange(PROMPT_PROFILE_ROW, 1).setValue('YOUR PROFILE  →  the resume / skills used to score jobs. Replace with your own. Clear the cell to use the built-in default.');
+  sheet.getRange(PROMPT_INSTRUCTIONS_ROW, 1).setValue('SCORING INSTRUCTIONS  →  the rubric. Leave BLANK to use the built-in default (auto-updates). Paste your own only to customize.');
+  sheet.getRange(PROMPT_DEFAULT_REF_ROW, 1).setValue('Built-in default (READ-ONLY reference)  →  copy from here into the cell above if you want to customize the instructions.');
+
+  // Seed edit cells only when empty; migrate any Settings override in.
+  if (!existingProfile) {
+    sheet.getRange(PROMPT_PROFILE_ROW, PROMPT_CONTENT_COL)
+      .setValue(_resolveDefaultableSetting(settings.TARGET_PROFILE, _defaultTargetProfile));
+  }
+  if (!existingInstr) {
+    var instrOverride = _stringifyField(settings.SCORING_INSTRUCTIONS);
+    // Blank/'default' -> leave blank so the built-in default is used AND auto-updates with our changes.
+    sheet.getRange(PROMPT_INSTRUCTIONS_ROW, PROMPT_CONTENT_COL)
+      .setValue((instrOverride && instrOverride.toLowerCase() !== 'default') ? instrOverride : '');
+  }
+  // Reference cell: always the current built-in instructions.
+  sheet.getRange(PROMPT_DEFAULT_REF_ROW, PROMPT_CONTENT_COL).setValue(String(_defaultScoringInstructions()));
+
+  // Styling.
+  sheet.getRange(1, 1, 1, 2).merge();
+  sheet.getRange(1, 1).setFontWeight('bold').setBackground('#cfe2f3')
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP).setVerticalAlignment('middle');
+  [PROMPT_PROFILE_ROW, PROMPT_INSTRUCTIONS_ROW, PROMPT_DEFAULT_REF_ROW].forEach(function(r) {
+    sheet.getRange(r, 1).setFontWeight('bold').setVerticalAlignment('top')
+      .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+  });
+  sheet.getRange(PROMPT_PROFILE_ROW, PROMPT_CONTENT_COL).setBackground('#fff7e0')
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP).setVerticalAlignment('top');
+  sheet.getRange(PROMPT_INSTRUCTIONS_ROW, PROMPT_CONTENT_COL).setBackground('#fff7e0')
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP).setVerticalAlignment('top');
+  sheet.getRange(PROMPT_DEFAULT_REF_ROW, PROMPT_CONTENT_COL).setBackground('#f1f3f4').setFontColor('#5f6368')
+    .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP).setVerticalAlignment('top');
+  sheet.setColumnWidth(1, 300);
+  sheet.setColumnWidth(2, 820);
+  sheet.setRowHeight(PROMPT_PROFILE_ROW, 220);
+  sheet.setRowHeight(PROMPT_INSTRUCTIONS_ROW, 220);
+  sheet.setRowHeight(PROMPT_DEFAULT_REF_ROW, 300);
+  sheet.setFrozenRows(1);
+}
+
+// Reads the editable prompt/profile cells. Returns blanks if the sheet or cells are absent, so
+// loadRuntimeConfig can fall back to the Settings keys / built-in defaults.
+function _getPromptSheetTexts() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PROMPT_SHEET_NAME);
+  if (!sheet || sheet.getMaxRows() < PROMPT_INSTRUCTIONS_ROW) return { profile: '', instructions: '' };
+  var vals = sheet.getRange(PROMPT_PROFILE_ROW, PROMPT_CONTENT_COL, 2, 1).getValues(); // rows 2-3, col B
+  return {
+    profile: _stringifyField(vals[0][0]),
+    instructions: _stringifyField(vals[1][0])
+  };
+}
+
 function _ensureSheetDimensions(sheet, minColumns, minRows) {
   var currentColumns = sheet.getMaxColumns();
   var currentRows = sheet.getMaxRows();
@@ -2794,7 +2882,7 @@ function _findJobPriorityRowByJobId(jobId) {
 }
 
 function _protectSheetsForAssignee(spreadsheet) {
-  var sheetsToProtect = [JOB_PRIORITY_SHEET_NAME, SETTINGS_SHEET_NAME, HELP_SHEET_NAME, RAW_DATA_SHEET_NAME, APIFY_ACCOUNTS_SHEET_NAME];
+  var sheetsToProtect = [JOB_PRIORITY_SHEET_NAME, SETTINGS_SHEET_NAME, HELP_SHEET_NAME, RAW_DATA_SHEET_NAME, APIFY_ACCOUNTS_SHEET_NAME, PROMPT_SHEET_NAME];
 
   sheetsToProtect.forEach(function(name) {
     var sheet = spreadsheet.getSheetByName(name);

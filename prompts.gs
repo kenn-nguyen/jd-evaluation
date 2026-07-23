@@ -1,15 +1,16 @@
 /**
  * prompts.gs — Scoring prompt and candidate target profile.
  *
- * These two functions are the only place the scoring rubric and resume live.
- * They are read by loadRuntimeConfig() in pipeline.gs via:
- *   - scoringInstructions: _resolveDefaultableSetting(settings.SCORING_INSTRUCTIONS, _defaultScoringInstructions)
- *   - targetProfile:       settings.TARGET_PROFILE || _defaultTargetProfile()
+ * These two functions hold the BUILT-IN scoring rubric and candidate profile.
+ * loadRuntimeConfig() (pipeline.gs) resolves each as: Prompt-sheet cell (col B) -> legacy Settings
+ * cell (fallback for pre-Prompt-sheet workbooks) -> these built-in defaults. Blank or the literal
+ * 'default' in either cell falls back to the built-in (see _resolveDefaultableSetting).
  *
- * To make edits here take effect on the live sheet, set SCORING_INSTRUCTIONS=default
- * (or blank) and clear the TARGET_PROFILE cell so config falls back to these defaults.
- * Bump promptVersion in loadRuntimeConfig() after changing the rubric so cached
- * scores are invalidated and jobs get re-scored.
+ * Users edit the live rubric/profile on the PROMPT sheet (Jobs Pipeline -> Open Prompt & Profile),
+ * NOT here. Editing here changes the built-in default (and the Prompt sheet's read-only reference
+ * cell after a re-Initialize); it reaches any user whose Prompt cell is blank. No promptVersion bump
+ * is needed — changing this text changes the scoring fingerprint, so new jobs re-score automatically
+ * (existing rows re-score via Reevaluate Selected Rows).
  */
 
 function _defaultScoringInstructions() {

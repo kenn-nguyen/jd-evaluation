@@ -66,6 +66,8 @@ function onOpen() {
     .addSeparator()
     .addItem('Reevaluate Selected Rows', 'reevaluateSelectedRows')
     .addItem('Sort & Rank Sheets', 'sortBothSheetsNow')
+    .addSeparator()
+    .addItem('Open Prompt & Profile', 'openPromptSheet')
     .addSubMenu(ui.createMenu('Triggers')
       .addItem('Create Run Trigger', 'createRunTrigger')
       .addItem('Remove Run Triggers', 'removeHourlyTriggers'))
@@ -79,6 +81,14 @@ function onOpen() {
 
 function onInstall() {
   onOpen();
+}
+
+// Jump to the in-sheet Prompt editor (Prompt sheet, column B). Editing happens directly in the cells
+// — no dialog, no OAuth — so it works regardless of how many Google accounts are signed in.
+function openPromptSheet() {
+  ensureWorkbookReadyForRuntime(); // creates + migrates the Prompt sheet if this workbook predates it
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PROMPT_SHEET_NAME);
+  if (sheet) sheet.activate();
 }
 
 function sortBothSheetsNow() {
