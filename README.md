@@ -1,5 +1,7 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
+![version](https://img.shields.io/badge/version-0.4.0-blue) · Google Apps Script
+
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.
 
@@ -107,11 +109,12 @@ Script code is already attached. Everything below happens in your copy.
 5. That's it — no key to copy. The sheet reaches Vertex using your Google login. You'll put the Project ID in
    Settings in Step 5.
 
-**Option B — Gemini API key · quickest to test (free quota, but needs the script editor)**
+**Option B — Gemini API key · quickest to test (free quota)**
 
 1. Go to **[aistudio.google.com/apikey](https://aistudio.google.com/apikey)** → sign in → **Create API key** → copy it.
-2. This key must go in **Script Properties** (not a sheet cell): **Extensions → Apps Script → ⚙ Project Settings →
-   Script Properties → Add** → name `GEMINI_API_KEY`, value = your key.
+2. Paste it into the **Settings** sheet, `GEMINI_API_KEY` cell (Step 5), and leave `GEMINI_API_ROUTE` = `developer`.
+   - Anyone who can edit your sheet can read the key. For tighter privacy, leave the cell blank and set it in
+     **Extensions → Apps Script → ⚙ Project Settings → Script Properties** (name `GEMINI_API_KEY`) instead.
 3. Note: the free quota is rate-limited; if you hit "resource exhausted" errors during real use, switch to
    **Option A (Vertex)**.
 
@@ -131,7 +134,7 @@ On the **Settings** sheet, set (the rest have sensible defaults — see [Configu
   ready-to-edit example.
 - **AI route:**
   - Chose **Option A (Vertex)** → set `GEMINI_API_ROUTE` = `vertex` and `VERTEX_PROJECT_ID` = your Project ID.
-  - Chose **Option B (Gemini key)** → leave `GEMINI_API_ROUTE` = `developer` (the key is already in Script Properties).
+  - Chose **Option B (Gemini key)** → leave `GEMINI_API_ROUTE` = `developer` and paste your key into the `GEMINI_API_KEY` cell (or Script Properties for tighter privacy).
 - **`NOTIFY_EMAIL`** — your email (for P01 alerts + failure notices).
 
 ### Step 6 — Add your profile

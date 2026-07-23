@@ -132,6 +132,7 @@ var SETTINGS_DEFAULT_ROWS = [
 
   ['# AI Scoring', '', ''],
   ['GEMINI_API_ROUTE', 'developer', 'developer = Gemini Developer API (free quota). vertex = your Google Cloud project with Vertex billing.'],
+  ['GEMINI_API_KEY', '', 'Your Gemini Developer API key (only for GEMINI_API_ROUTE=developer). Get one at aistudio.google.com/apikey and paste it here. Anyone who can edit this sheet can read it — for tighter privacy leave this blank and set GEMINI_API_KEY in Apps Script → Project Settings → Script Properties instead. Not needed for the vertex route.'],
   ['VERTEX_PROJECT_ID', '', 'Required only when GEMINI_API_ROUTE=vertex. Your standard Google Cloud project id.'],
   ['VERTEX_LOCATION', 'global', 'Vertex region. Keep as global for Gemini models unless instructed otherwise.'],
   ['SCORING_MODEL', 'gemini-3.5-flash', 'Gemini model used for scoring. gemini-3.5-flash recommended (reasoning model, good quality/cost). gemini-3.1-flash-lite is ~6x cheaper for high volume but is NOT a reasoning model — test scoring quality before switching. Avoid Pro tiers for scoring (overkill + costly).'],
@@ -167,7 +168,7 @@ var HELP_ROWS = [
 
   ['# Quick Start', ''],
   ['Step 1 — Apify tokens', 'Run Jobs Pipeline → Maintenance → Initialize Sheets, then open the Apify_Accounts sheet. Add one row per account: Label | Batch Key | Detail Key | Active=TRUE. Get tokens at apify.com → Account → Integrations.'],
-  ['Step 2 — Gemini API key', 'In Apps Script editor: Project Settings → Script Properties → add GEMINI_API_KEY with your Gemini Developer API key. Leave GEMINI_API_ROUTE as developer.'],
+  ['Step 2 — AI key', 'Developer route: paste your Gemini Developer API key (from aistudio.google.com/apikey) into Settings → GEMINI_API_KEY, and leave GEMINI_API_ROUTE = developer. (For tighter privacy you can instead set GEMINI_API_KEY in Apps Script → Project Settings → Script Properties.) Vertex route: set GEMINI_API_ROUTE = vertex and VERTEX_PROJECT_ID — no key needed (uses your Google login).'],
   ['Step 3 — Vertex billing (optional)', 'To use Vertex instead: link this Apps Script project to a standard Google Cloud project, enable Vertex AI API, set GEMINI_API_ROUTE=vertex, fill in VERTEX_PROJECT_ID.'],
   ['Step 4 — Search input', 'Settings → APIFY_RUN_INPUT: paste your LinkedIn search JSON. Use {f_tpr} as a placeholder for auto-computed lookback. Example in the Apify section below.'],
   ['Step 5 — Target profile', 'Open the PROMPT sheet (or Jobs Pipeline → Open Prompt & Profile) and edit the YOUR PROFILE cell (column B) directly — paste your resume/profile text. Clear the cell to use the built-in default. No permission needed.'],

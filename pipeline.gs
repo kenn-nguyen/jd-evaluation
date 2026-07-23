@@ -58,7 +58,8 @@ function loadRuntimeConfig() {
     apifyMaxLookbackHours: Number(settings.APIFY_MAX_LOOKBACK_HOURS) || 168,
     vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
-    geminiApiKey: properties.getProperty('GEMINI_API_KEY'),
+    // Settings cell wins (easy, no editor); Script Properties is the fallback / more-private option.
+    geminiApiKey: _stringifyField(settings.GEMINI_API_KEY) || properties.getProperty('GEMINI_API_KEY') || '',
     openAiApiKey: properties.getProperty('OPENAI_API_KEY'),
     autoAssignPriorities: _splitCsv(settings.AUTO_ASSIGN_PRIORITIES || 'P04,P05'),
     reservePriorities: _splitCsv(settings.AUTO_RESERVE_PRIORITIES || 'P01,P02,P03'),
@@ -89,7 +90,7 @@ function validateRuntimeConfig(config) {
   }
 
   if (config.geminiApiRoute === 'developer' && !config.geminiApiKey) {
-    throw new Error('Missing GEMINI_API_KEY in Script Properties.');
+    throw new Error('Missing GEMINI_API_KEY — add it on the Settings sheet (or Script Properties) for the developer route, or switch GEMINI_API_ROUTE to vertex.');
   }
 
   if (config.geminiApiRoute === 'vertex' && !config.vertexProjectId) {

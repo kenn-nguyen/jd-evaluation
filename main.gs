@@ -1,3 +1,5 @@
+var APP_VERSION = '0.4.0';  // bump on each release; surfaced in the menu + Validate Config + README
+
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
 var ACTIVE_RUN_STATE_PROPERTY_KEY = 'ACTIVE_JOB_IMPORT_RUN_STATE';
@@ -56,7 +58,7 @@ function _createProgressTracker(initialState) {
 
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
-  ui.createMenu('Jobs Pipeline')
+  ui.createMenu('Jobs Pipeline (v' + APP_VERSION + ')')
     .addItem('Run Now', 'runJobImportAndScoringNow')
     .addItem('Import Jobs Manually…', 'importJobsManuallyPrompt')
     .addItem('Cancel Run', 'cancelRunPrompt')
@@ -916,6 +918,7 @@ function validateConfiguration() {
 
   SpreadsheetApp.getUi().alert(
     'Config looks valid.\n' +
+    'Version: ' + APP_VERSION + '\n' +
     'Provider: Gemini\n' +
     'Route: ' + config.geminiApiRoute + '\n' +
     'Vertex project: ' + (config.geminiApiRoute === 'vertex' ? config.vertexProjectId : '(not used)') + '\n' +
