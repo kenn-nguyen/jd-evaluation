@@ -1,6 +1,6 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
-![version](https://img.shields.io/badge/version-0.4.0-blue) · Google Apps Script
+![version](https://img.shields.io/badge/version-0.5.0-blue) · Google Apps Script
 
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.

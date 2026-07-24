@@ -1,4 +1,4 @@
-var APP_VERSION = '0.4.0';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.5.0';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -147,7 +147,7 @@ function handleSheetEdit(e) {
     if (row < ASSIGNED_DATA_START_ROW) return;
     try {
       if (col === ASSIGNED_COLUMN_INDEX.status) {
-        _handleAssignedStatusEdit(sheet, row, e.value);
+        _handleAssignedStatusEdit(sheet, row, e.value, e.oldValue);
       } else if (col === ASSIGNED_COLUMN_INDEX.notes) {
         _handleAssignedNotesEdit(sheet, row, e.oldValue);
       }
@@ -238,11 +238,24 @@ function _handleJobPriorityActionEdit(sheet, row) {
 }
 
 // Status edited on the Assigned sheet: mirror up, handle bounce-backs and terminal cleanup.
-function _handleAssignedStatusEdit(sheet, row, newValue) {
+function _handleAssignedStatusEdit(sheet, row, newValue, oldValue) {
   var jobId = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.job_id).getValue()).trim();
   if (!jobId) return;
 
   var nv = _stringifyField(newValue);
+
+  // Flagging requires a reason. If the Notes cell is empty, bounce the status back and ask for a note
+  // (an edit trigger can't show a popup, so we use a toast + revert). With a note present, flag proceeds.
+  if (nv === 'Flagged' && !_stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.notes).getValue())) {
+    var revertTo = _stringifyField(oldValue);
+    if (!revertTo || revertTo === 'Flagged') revertTo = 'New';
+    sheet.getRange(row, ASSIGNED_COLUMN_INDEX.status).setValue(revertTo);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Add a note explaining the flag in the Notes column, then set Flagged again.',
+      '⚑ Flag needs a note', 8);
+    return;
+  }
+
   var jpRow = _findJobPriorityRowByJobId(jobId);
   var jobSheet = _getJobPrioritySheet();
   var now = _formatNow();
@@ -1785,9 +1798,11 @@ function reassignJobsPrompt() {
   var counts = _routeNewJobs(config);
   // Reconcile the Assigned sheet so routing's un-assignments propagate immediately: a job whose
   // owner was just cleared (no longer qualifies) gets its stale Assigned row removed here rather
-  // than lingering until the next Sort & Rank. Idempotent.
+  // than lingering until the next Sort & Rank. Idempotent. Build the records straight from the sheet
+  // (no Raw_Data join) so this scales — getExistingJobRecords here was a second heavy read that timed
+  // out large sheets.
   SpreadsheetApp.flush();
-  _reconcileAssignedSheet(getExistingJobRecords());
+  _reconcileAssignedSheet(_buildReconcileRecordsFromSheet(_getJobPrioritySheet()));
 
   var total = counts.assigned + counts.reserved + counts.skipped;
   if (!total) { ui.alert('No routing changes — nothing was newly assigned, reserved, or skipped. (Only New / auto-skipped rows that are unowned or auto-assigned are re-routed.)'); return; }

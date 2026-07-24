@@ -841,51 +841,63 @@ function deduplicateExistingJobRows() {
 
 function pruneExpiredJobRows(days) {
   var EXPIRY_DAYS = (days !== undefined && days !== null && days !== '') ? Number(days) : 90;
-  var now = new Date();
+  var sheet = _getJobPrioritySheet();
+  if (!sheet) return { checkedCount: 0, prunedCount: 0, remainingCount: 0 };
+  var lastRow = sheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return { checkedCount: 0, prunedCount: 0, remainingCount: 0 };
+
+  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var IDX = JOB_PRIORITY_COLUMN_INDEX;
+  var nowMs = new Date().getTime();
   var expiryMs = EXPIRY_DAYS * 24 * 60 * 60 * 1000;
-  var records = getExistingJobRecords();
-  var keepRecords = [];
+  var PRUNE_KEY = '~~~~~~~~'; // '~' > any digit, so pruned rows sort AFTER every real (digit) sort_key
+
+  // Decide keep/prune from CHEAP column reads — no Raw_Data join and no per-row record build
+  // (getExistingJobRecords), and no full-sheet rewrite (replaceAllJobs) — both timed out at scale.
+  var statuses = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.status, numRows, 1).getValues();
+  var owners = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.owner, numRows, 1).getValues();
+  var importedAts = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.imported_at, numRows, 1).getValues();
+  var posteds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.posted, numRows, 1).getValues();
+  var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
+
   var prunedCount = 0;
-
-  records.forEach(function(record) {
-    // Always keep: active outreach, last-mile items, and assignee work — never silently prune these.
-    var protectedStatus = record.status === 'Submitted' || record.status === 'Networking' ||
-                          record.status === 'Flagged';
-    if (protectedStatus || _isAssignee(record.owner)) {
-      keepRecords.push(record);
-      return;
+  for (var i = 0; i < numRows; i++) {
+    var status = _stringifyField(statuses[i][0]);
+    // Always keep: active outreach, last-mile items, and assignee work.
+    if (status === 'Submitted' || status === 'Networking' || status === 'Flagged' || _isAssignee(owners[i][0])) {
+      continue;
     }
-
-    var importedTime = _toComparableTime(record.importedAt);
-    // posted is a formatted date for most jobs (parses) or a relative label like "2 weeks ago"
-    // (returns 0 → ignored, falls back to importedAt). An old posting is likely filled/closed
-    // regardless of when we scraped it, so prune on posting age too — same threshold.
-    var postedTime = _toComparableTime(record.posted);
-    // No usable timestamp at all → keep (never silently purge records without any date).
-    if (!importedTime && !postedTime) {
-      keepRecords.push(record);
-      return;
-    }
-    var nowMs = now.getTime();
+    var importedTime = _toComparableTime(importedAts[i][0]);
+    // posted parses to a date for most jobs, or 0 for a relative label ("2 weeks ago") → falls back
+    // to importedAt. An old posting is likely filled/closed, so prune on posting age too.
+    var postedTime = _toComparableTime(posteds[i][0]);
+    if (!importedTime && !postedTime) continue; // no usable timestamp → keep
     var importOld = importedTime && (nowMs - importedTime) > expiryMs;
     var postedOld = postedTime && (nowMs - postedTime) > expiryMs;
-    // Prune when stale by EITHER how long it has sat in the pipeline or its posting age.
     if (importOld || postedOld) {
+      sortKeys[i][0] = PRUNE_KEY; // mark to sort to the bottom for a single bulk delete
       prunedCount++;
-      return;
     }
-    keepRecords.push(record);
-  });
-
-  if (prunedCount > 0) {
-    replaceAllJobs(keepRecords);
   }
 
-  return {
-    checkedCount: records.length,
-    prunedCount: prunedCount,
-    remainingCount: keepRecords.length
-  };
+  if (prunedCount === 0) {
+    return { checkedCount: numRows, prunedCount: 0, remainingCount: numRows };
+  }
+
+  // Write the markers, push pruned rows to the bottom with a native sort (moves rich text + formats
+  // with each row — same mechanism as Sort & Rank), then delete the trailing block in ONE deleteRows.
+  // O(few reads + 1 sort + 1 delete) regardless of row count. A later Sort & Rank re-ranks + repairs
+  // any link the sort didn't carry; ranks may have gaps until then.
+  var keyRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1);
+  keyRange.setNumberFormat('@');
+  keyRange.setValues(sortKeys);
+  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, numRows, JOB_PRIORITY_COLUMNS.length)
+    .sort([{ column: IDX.sort_key, ascending: true }]);
+
+  var keepCount = numRows - prunedCount;
+  sheet.deleteRows(JOB_PRIORITY_DATA_START_ROW + keepCount, prunedCount);
+
+  return { checkedCount: numRows, prunedCount: prunedCount, remainingCount: keepCount };
 }
 
 function deduplicateSimilarJdRows() {
@@ -1196,6 +1208,41 @@ function _padSortNum(n, width) {
 //   Add    — ensure every active assignee-owned job (owner='Assignee', status not Submitted/Skip)
 //            is present, covering bulk Owner→Assignee edits the single-cell onEdit handler misses.
 // Reuses the already-loaded JP records; both passes are idempotent.
+// Lightweight reconcile records read straight from the Job_Priority columns — no Raw_Data join and no
+// per-job record build (unlike getExistingJobRecords), so it scales to large sheets. Mirrors the fields
+// sortAndRankJobs builds inline; rank = the current rank column (callers that don't re-rank want that).
+function _buildReconcileRecordsFromSheet(sheet) {
+  if (!sheet) return [];
+  var lastRow = sheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return [];
+  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var IDX = JOB_PRIORITY_COLUMN_INDEX;
+  var vals = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, numRows, JOB_PRIORITY_COLUMNS.length).getValues();
+  var linkFormulas = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_link, numRows, 1).getFormulas();
+  return vals.map(function(row, i) {
+    var rawId = _stringifyField(row[IDX.job_id - 1]);
+    var url = _extractUrlFromHyperlinkFormula(linkFormulas[i][0] || '');
+    return {
+      jobId: _extractLinkedInJobId(rawId) || _extractLinkedInJobId(url) || rawId,
+      owner: row[IDX.owner - 1],
+      status: row[IDX.status - 1],
+      action: row[IDX.action - 1],
+      mergedJobIds: row[IDX.merged_job_ids - 1],
+      rank: row[IDX.rank - 1],
+      priority: row[IDX.priority - 1],
+      score: row[IDX.score - 1],
+      usVisaSponsorshipPotential: row[IDX.us_visa - 1],
+      usVisaReason: row[IDX.us_visa_reason - 1],
+      company: row[IDX.company - 1],
+      title: row[IDX.title - 1],
+      location: row[IDX.location - 1],
+      posted: row[IDX.posted - 1],
+      summary: row[IDX.summary - 1],
+      why: row[IDX.why - 1]
+    };
+  });
+}
+
 function _reconcileAssignedSheet(records) {
   var assignedSheet = _getAssignedSheet();
   if (!assignedSheet) return;
