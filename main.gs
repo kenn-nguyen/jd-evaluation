@@ -1,4 +1,4 @@
-var APP_VERSION = '0.6.2';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.7.0';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -513,7 +513,20 @@ function backfillRawDataPostedAtPrompt() {
     ? 'Sheet layout was repaired first:\n  before: ' + headerBefore + '\n  after:  ' + headerAfter + '\n\n'
     : '';
 
-  var result = backfillRawDataPostedAt();
+  // v0.7.0 changed what posted_at MEANS (first posted, not last listed), so rows filled before it
+  // hold the repost date and the blanks-only fast path would skip them forever. Offer the one-time
+  // re-derive explicitly rather than silently re-parsing every payload on every run — that is the
+  // expensive path and it is what breaks resumability on a big sheet.
+  var answer = ui.alert(
+    'Re-derive dates that are already filled in?',
+    'YES  — re-read every payload and correct dates stored under the old meaning.\n' +
+    '       Run this ONCE after upgrading to v0.7.0. Slower, and not resumable.\n\n' +
+    'NO   — fill only blank dates. Fast and resumable; use this normally.',
+    ui.ButtonSet.YES_NO_CANCEL
+  );
+  if (answer === ui.Button.CANCEL) return;
+
+  var result = backfillRawDataPostedAt({ overwrite: answer === ui.Button.YES });
 
   if (result.abortedReason) {
     ui.alert(
@@ -536,7 +549,8 @@ function backfillRawDataPostedAtPrompt() {
     'Raw_Data date backfill completed.\n' +
     'Rows checked: ' + result.checkedCount + '\n' +
     'Dates filled in: ' + result.filledCount + '\n' +
-    'Already had a date: ' + result.alreadySetCount + '\n' +
+    (result.rederivedCount ? 'Dates corrected (old meaning): ' + result.rederivedCount + '\n' : '') +
+    'Already correct: ' + result.alreadySetCount + '\n' +
     'Left blank: ' + result.unresolvedCount + '\n' +
     (result.skippedPayloadCount ? 'Skipped (cell held a payload): ' + result.skippedPayloadCount + '\n' : '') +
     '\nOnly the posted_at column was written; raw_ref was read, never modified.\n\n' +

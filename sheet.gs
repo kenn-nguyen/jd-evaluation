@@ -839,6 +839,31 @@ function deduplicateExistingJobRows() {
   };
 }
 
+// job_id -> posting time (ms), read from Raw_Data. Deliberately reads only the two narrow date/id
+// columns and never raw_ref — the payload column is what made earlier Raw_Data joins time out.
+function _getRawDataPostedAtByJobId() {
+  var map = {};
+  var sheet = _getRawDataSheet();
+  if (!sheet) return map;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return map;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+  var idCol = headers.indexOf('job_id') + 1;
+  var postedCol = headers.indexOf('posted_at') + 1;
+  if (!idCol || !postedCol) return map;
+
+  var ids = sheet.getRange(2, idCol, lastRow - 1, 1).getValues();
+  var dates = sheet.getRange(2, postedCol, lastRow - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) {
+    var id = _stringifyField(ids[i][0]).trim();
+    if (!id) continue;
+    var d = _coerceValidPostedDate(dates[i][0]);
+    if (d) map[id] = d.getTime();
+  }
+  return map;
+}
+
 function pruneExpiredJobRows(days) {
   var EXPIRY_DAYS = (days !== undefined && days !== null && days !== '') ? Number(days) : 90;
   var sheet = _getJobPrioritySheet();
@@ -858,7 +883,14 @@ function pruneExpiredJobRows(days) {
   var owners = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.owner, numRows, 1).getValues();
   var importedAts = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.imported_at, numRows, 1).getValues();
   var posteds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.posted, numRows, 1).getValues();
+  var jobIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
   var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
+  // Posting age comes from Raw_Data.posted_at, which is always a real Date. The 'posted' column
+  // here is a DISPLAY value and frequently does not parse: a detail-actor job stores a raw epoch
+  // string, and new Date("1741082400000") is Invalid, so _toComparableTime returned 0 and this
+  // whole rule silently collapsed to imported_at — letting a long-dead posting scraped last week
+  // look brand new forever. Two narrow date columns, never the payload, so the join stays cheap.
+  var postedAtByJobId = _getRawDataPostedAtByJobId();
 
   var prunedCount = 0;
   for (var i = 0; i < numRows; i++) {
@@ -870,7 +902,7 @@ function pruneExpiredJobRows(days) {
     var importedTime = _toComparableTime(importedAts[i][0]);
     // posted parses to a date for most jobs, or 0 for a relative label ("2 weeks ago") → falls back
     // to importedAt. An old posting is likely filled/closed, so prune on posting age too.
-    var postedTime = _toComparableTime(posteds[i][0]);
+    var postedTime = postedAtByJobId[_stringifyField(jobIds[i][0]).trim()] || _toComparableTime(posteds[i][0]);
     if (!importedTime && !postedTime) continue; // no usable timestamp → keep
     var importOld = importedTime && (nowMs - importedTime) > expiryMs;
     var postedOld = postedTime && (nowMs - postedTime) > expiryMs;
@@ -2411,7 +2443,11 @@ function _extractPostedAtFromRawRef(rawRef) {
   if (!parsed) return '';
 
   var sources = [parsed.job_info || {}, parsed];
-  var keys = ['listed_at', 'original_listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted'];
+  // original_listed_at FIRST: posted_at means "when was this role first posted", not "when did this
+  // listing last go live". LinkedIn refreshes and reposts, so listed_at can be months newer than
+  // the real opening date — and a refreshed-but-ancient posting that reads as fresh is exactly what
+  // must not survive an age-based prune.
+  var keys = ['original_listed_at', 'listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted'];
 
   for (var s = 0; s < sources.length; s++) {
     for (var i = 0; i < keys.length; i++) {
@@ -2579,9 +2615,14 @@ function _buildRawDataPayload(job, existing) {
 // re-import that arrives without a date never erases a date we previously worked out.
 // A relative label resolves to '' at every step, which is correct: that row is not age-prunable.
 function _resolveRawDataPostedAt(job, existing) {
-  return _coerceValidPostedDate(job && job.publishedAt) ||
+  // The raw payload comes FIRST because it is the only source that still distinguishes
+  // original_listed_at from listed_at — job.publishedAt is already flattened to listed_at by
+  // _normalizeJobDetail, so trusting it would quietly reinstate the repost date. For search-actor
+  // items the payload has no original_listed_at and this resolves to the same value publishedAt
+  // would have given, so nothing is lost.
+  return _extractPostedAtFromRawRef(job && job.rawRef) ||
+    _coerceValidPostedDate(job && job.publishedAt) ||
     _coerceValidPostedDate(job && job.posted) ||
-    _extractPostedAtFromRawRef(job && job.rawRef) ||
     _coerceValidPostedDate(existing && existing.postedAt) ||
     '';
 }
@@ -2602,10 +2643,11 @@ function _toRawDataRow(rawData) {
 // blows the memory ceiling on a large sheet. Rows that already carry a usable date are skipped, so
 // if a run hits the 6-minute limit, running it again resumes where it stopped instead of redoing
 // the work.
-function backfillRawDataPostedAt() {
+function backfillRawDataPostedAt(options) {
+  var overwrite = !!(options && options.overwrite);
   var result = {
     checkedCount: 0, filledCount: 0, alreadySetCount: 0, unresolvedCount: 0,
-    skippedPayloadCount: 0, abortedReason: ''
+    skippedPayloadCount: 0, rederivedCount: 0, abortedReason: ''
   };
   var sheet = _getRawDataSheet();
   if (!sheet) return result;
@@ -2651,18 +2693,27 @@ function backfillRawDataPostedAt() {
         result.skippedPayloadCount++;
         continue;
       }
-      if (_coerceValidPostedDate(current)) {
+      var existingDate = _coerceValidPostedDate(current);
+      if (existingDate && !overwrite) {
         result.alreadySetCount++;
         continue;
       }
+
       var found = _extractPostedAtFromRawRef(rawRefs[i][0]);
-      if (found) {
-        posted[i][0] = found;
-        result.filledCount++;
-        dirty = true;
-      } else {
-        result.unresolvedCount++;
+      if (!found) {
+        // Never wipe a date we cannot re-derive — a missing payload is not evidence of no date.
+        if (existingDate) result.alreadySetCount++;
+        else result.unresolvedCount++;
+        continue;
       }
+      if (existingDate && found.getTime() === existingDate.getTime()) {
+        result.alreadySetCount++;
+        continue;
+      }
+      posted[i][0] = found;
+      if (existingDate) result.rederivedCount++;
+      else result.filledCount++;
+      dirty = true;
     }
 
     if (dirty) sheet.getRange(start, postedCol, count, 1).setValues(posted);

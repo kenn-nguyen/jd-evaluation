@@ -1,6 +1,6 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
-![version](https://img.shields.io/badge/version-0.6.2-blue) · Google Apps Script
+![version](https://img.shields.io/badge/version-0.7.0-blue) · Google Apps Script
 
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.
@@ -227,7 +227,9 @@ Everything is driven from the **Jobs Pipeline** menu:
 - **Triggers** — create/remove the scheduled auto-run.
 - **Maintenance** — Prune Old Data, Backfill Raw_Data Dates, Skip All No-Visa Jobs, Initialize Sheets, Validate Config.
   - *Prune Old Data* takes an age threshold for Job_Priority and Assigned, and additionally — regardless of age — deletes every Skip / Skip (auto) row, drops Raw_Data payloads for Submitted / Closed / Skip jobs, and drops orphaned Raw_Data rows. Run Sort & Rank afterwards to close rank gaps.
-  - *Backfill Raw_Data Dates* fills `posted_at` for rows written before v0.6.1 by re-reading each stored payload. It writes only the `posted_at` column — `raw_ref` is read, never modified — and refuses to run at all if the sheet's content shows the header is mislabelling which column is which. Chunked and resumable if it times out.
+  - *Backfill Raw_Data Dates* fills `posted_at` by re-reading each stored payload. It writes only the `posted_at` column — `raw_ref` is read, never modified — and refuses to run at all if the sheet's content shows the header is mislabelling which column is which. Asks whether to re-derive dates that are already filled: answer **Yes once** after upgrading to v0.7.0 (the column's meaning changed), **No** normally — that path is fast and resumable.
+
+`posted_at` means **when the role was first posted** (`original_listed_at`), not when the listing last went live (`listed_at`). LinkedIn refreshes and reposts, so those can be months apart; the age prune uses the first-posted date so a refreshed-but-ancient posting cannot look fresh forever.
 
 **Priorities:** `P01` (rare bullseye) → `P04` (solid, default) → `P10` (skip). Most jobs land P03–P05.
 
