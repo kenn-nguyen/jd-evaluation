@@ -1,4 +1,4 @@
-var APP_VERSION = '0.9.2';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.10.0';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -459,10 +459,33 @@ function runManualDetailImport() {
 
 function pruneOldDataPrompt() {
   var ui = SpreadsheetApp.getUi();
+
+  // Which dates to age on are the PRUNE_ON_* checkboxes on the Settings sheet. Apps Script's
+  // prompt/alert cannot host a checkbox, and an HtmlService dialog would reintroduce the
+  // multi-account OAuth problem the in-sheet Prompt editor exists to avoid — so the ticks live in
+  // cells, like every other setting, and are echoed here so a run is never a surprise.
+  ensureWorkbookReadyForRuntime();
+  var config = loadRuntimeConfig();
+  var chosen = [];
+  if (config.pruneOnListedAt) chosen.push('listed_at (listing last went live)');
+  if (config.pruneOnPostedAt) chosen.push('posted_at (role first posted)');
+  if (config.pruneOnImportedAt) chosen.push('imported_at (time sitting in the sheet)');
+
+  if (!chosen.length) {
+    ui.alert(
+      'No date selected — nothing would be pruned.\n\n' +
+      'Tick at least one of PRUNE_ON_LISTED_AT / PRUNE_ON_POSTED_AT /\n' +
+      'PRUNE_ON_IMPORTED_AT on the Settings sheet, then run this again.'
+    );
+    return;
+  }
+
   var response = ui.prompt(
     'Prune Old Data',
     'Age threshold in days?\n(Leave blank for 90)\n\n' +
-    'Job_Priority rows age out on listed_at — when the listing last went live.\n' +
+    'Ageing rows out on:\n  • ' + chosen.join('\n  • ') + '\n' +
+    (chosen.length > 1 ? '(a row goes if ANY of these is older than the threshold)\n' : '') +
+    '\nChange the ticks in Settings → PRUNE_ON_… to pick different dates.\n\n' +
     'ONLY Submitted and Networking are never pruned, at any age.\n' +
     'New / Filled / Flagged / Skip / Skip (auto) / Closed all age out.\n\n' +
     'Also runs regardless of age:\n' +
@@ -483,12 +506,17 @@ function pruneOldDataPrompt() {
 
   // Order matters: the Job_Priority delete runs FIRST so the rows it removes show up as orphans to
   // pruneRawData and pruneAssignedRows, which key off what is still tracked in Job_Priority.
-  var jpDeleted = pruneExpiredJobRows(days);
+  var jpDeleted = pruneExpiredJobRows(days, {
+    listedAt: config.pruneOnListedAt,
+    postedAt: config.pruneOnPostedAt,
+    importedAt: config.pruneOnImportedAt
+  });
   var rawDeleted = pruneRawData();
   var assignedDeleted = pruneAssignedRows(days);
 
   ui.alert(
-    'Job_Priority: ' + (jpDeleted.prunedCount || 0) + ' row(s) deleted (aged out on listed_at).\n' +
+    'Job_Priority: ' + (jpDeleted.prunedCount || 0) + ' row(s) deleted.\n' +
+    'Aged out on: ' + chosen.join(', ') + '\n' +
     'Raw_Data: ' + rawDeleted + ' row(s) dropped (orphans + JD text for Submitted/Closed/Skip jobs).\n' +
     'Assigned: ' + assignedDeleted + ' row(s) deleted.\n\n' +
     'Never pruned: Submitted and Networking rows in Job_Priority (a Submitted row keeps its\n' +

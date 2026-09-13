@@ -1,6 +1,6 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
-![version](https://img.shields.io/badge/version-0.9.2-blue) · Google Apps Script
+![version](https://img.shields.io/badge/version-0.10.0-blue) · Google Apps Script
 
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.
@@ -226,7 +226,7 @@ Everything is driven from the **Jobs Pipeline** menu:
 - **Open Prompt & Profile** — jump to the Prompt sheet.
 - **Triggers** — create/remove the scheduled auto-run.
 - **Maintenance** — Prune Old Data, Backfill Raw_Data Dates, Skip All No-Visa Jobs, Initialize Sheets, Validate Config.
-  - *Prune Old Data* takes an age threshold. Job_Priority rows age out on `listed_at` — when the listing last went live — so a role LinkedIn has recently re-posted survives. **Only `Submitted` and `Networking` are never pruned**; `New`, `Filled`, `Flagged`, `Skip`, `Skip (auto)` and `Closed` all age out. Regardless of age it also drops Raw_Data payloads for Submitted / Closed / Skip jobs and drops orphaned Raw_Data rows. Run Sort & Rank afterwards to close rank gaps.
+  - *Prune Old Data* takes an age threshold. Which date(s) rows age out on is set by the `PRUNE_ON_LISTED_AT` / `PRUNE_ON_POSTED_AT` / `PRUNE_ON_IMPORTED_AT` **checkboxes on the Settings sheet** (defaults: listed_at and imported_at ticked). With more than one ticked, a row goes if **any** ticked date is older than the threshold, so ticking more prunes more. The menu echoes the current selection before it runs. **Only `Submitted` and `Networking` are never pruned**; `New`, `Filled`, `Flagged`, `Skip`, `Skip (auto)` and `Closed` all age out. Regardless of age it also drops Raw_Data payloads for Submitted / Closed / Skip jobs and drops orphaned Raw_Data rows. Run Sort & Rank afterwards to close rank gaps.
   - *Backfill Raw_Data Dates* fills `posted_at` by re-reading each stored payload. It writes only the `posted_at` column — `raw_ref` is read, never modified — and refuses to run at all if the sheet's content shows the header is mislabelling which column is which. Asks whether to re-derive dates that are already filled: answer **Yes once** after upgrading to v0.7.0 (the column's meaning changed), **No** normally — that path is fast and resumable.
 
 Three dates on Raw_Data, deliberately different. **`imported_at`** is when the scrape run that fetched the payload started — it is also the anchor a relative label ("4 days ago") is resolved against, so it must stay in lockstep with `raw_ref`. **`posted_at`** is the *first-posted* date (`original_listed_at`) and is what the age prune reads. **`listed_at`** is when this listing went live, mirroring the **`posted` column** on Job_Priority and Assigned, which drives display, sorting, and re-post detection. LinkedIn refreshes and reposts, so the two can be months apart; a job can therefore display as recent and still be pruned, which is intended.

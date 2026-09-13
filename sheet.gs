@@ -153,6 +153,9 @@ var ASSIGNED_HEADER_ROW    = 3;  // row with column headers (rows 1-2 = instruct
 var ASSIGNED_DATA_START_ROW = 4;  // first data row
 // Section header rows use '# Section Name' as the key.
 // getSettingsMap() skips them; _setupSettingsSheet() styles them as visual dividers.
+// Settings rendered as real tickable checkboxes rather than typed TRUE/FALSE text.
+var SETTINGS_CHECKBOX_KEYS = ['PRUNE_ON_LISTED_AT', 'PRUNE_ON_POSTED_AT', 'PRUNE_ON_IMPORTED_AT'];
+
 var SETTINGS_DEFAULT_ROWS = [
   ['setting_key', 'setting_value', 'notes'],
 
@@ -183,6 +186,11 @@ var SETTINGS_DEFAULT_ROWS = [
   ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to the assignee (Owner set to "Assignee (auto)") after each run, if they clear the visa + score filters.'],
   ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs are left unowned (empty) for your review.'],
   ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay unowned for your review (not delegated). See Help → Visa Signals for what each label means.'],
+  ['# Pruning', '', ''],
+  ['PRUNE_ON_LISTED_AT', true, 'Tick to age rows out on listed_at — when the listing last went live. A role LinkedIn recently re-posted survives. This is the usual choice.'],
+  ['PRUNE_ON_POSTED_AT', false, 'Tick to age rows out on posted_at — when the ROLE was first posted. Catches long-open reqs that keep getting re-advertised.'],
+  ['PRUNE_ON_IMPORTED_AT', true, 'Tick to age rows out on imported_at — how long the row has sat in Job_Priority, regardless of the posting dates.'],
+
   ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status "Skip (auto)" during routing, regardless of priority (the role does not sponsor). "Skip (auto)" = skipped by the rules (re-evaluable); plain "Skip" = you skipped it manually (locked). Set FALSE to disable.'],
   ['RESERVED_COMPANIES', '', 'Companies always kept unowned for your review, never delegated to the assignee; case-insensitive (e.g. Stripe,Airbnb).'],
   ['AUTO_ASSIGN_EXCLUDE_COMPANIES', '', 'Companies to skip entirely during routing, case-insensitive (e.g. Google,Meta).'],
@@ -899,7 +907,7 @@ function _getRawDataDateByJobId(columnName) {
   return map;
 }
 
-function pruneExpiredJobRows(days) {
+function pruneExpiredJobRows(days, options) {
   var EXPIRY_DAYS = (days !== undefined && days !== null && days !== '') ? Number(days) : 90;
   var sheet = _getJobPrioritySheet();
   if (!sheet) return { checkedCount: 0, prunedCount: 0, remainingCount: 0 };
@@ -919,15 +927,25 @@ function pruneExpiredJobRows(days) {
   var posteds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.posted, numRows, 1).getValues();
   var jobIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
   var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
-  // Posting age comes from Raw_Data.listed_at — when THIS LISTING went live. A role LinkedIn has
-  // recently re-posted is still being actively advertised, so it survives; the prune is targeting
-  // listings nobody has refreshed in `days`. (posted_at, the first-posted date, would instead age
-  // out a long-open-but-still-advertised role, which is not what we want here.)
+  // Which dates age a row out is chosen by the Settings checkboxes; a row goes when ANY ticked
+  // date it actually has is older than the threshold, so ticking more prunes more. A date the row
+  // does not carry never contributes — blank is not treated as ancient.
   //
-  // Falling back to the Job_Priority 'posted' column is consistent rather than approximate: that
-  // column is also the listing date. It is a DISPLAY value though, and does not always parse, so
-  // Raw_Data is preferred. Two narrow columns, never the payload, so the join stays cheap.
-  var listedAtByJobId = _getRawDataDateByJobId('listed_at');
+  //   listed_at   — when THIS LISTING went live. A role LinkedIn recently re-posted survives, so
+  //                 this targets listings nobody has refreshed. Falls back to the Job_Priority
+  //                 'posted' column, which carries the same meaning (it is a DISPLAY value though,
+  //                 and does not always parse, so Raw_Data is preferred).
+  //   posted_at   — when the ROLE was first posted. Catches long-open reqs that keep being
+  //                 re-advertised. No fallback: no other column carries first-posted semantics.
+  //   imported_at — read straight off Job_Priority, which always has it; this is time-in-sheet
+  //                 rather than anything about the posting.
+  //
+  // Only the maps actually needed are built, and each reads two narrow columns, never the payload.
+  var useListedAt = !options || options.listedAt !== false;
+  var usePostedAt = !!(options && options.postedAt);
+  var useImportedAt = !options || options.importedAt !== false;
+  var listedAtByJobId = useListedAt ? _getRawDataDateByJobId('listed_at') : {};
+  var postedAtByJobId = usePostedAt ? _getRawDataDateByJobId('posted_at') : {};
 
   var prunedCount = 0;
   for (var i = 0; i < numRows; i++) {
@@ -938,14 +956,21 @@ function pruneExpiredJobRows(days) {
     if (status === 'Submitted' || status === 'Networking') {
       continue;
     }
-    var importedTime = _toComparableTime(importedAts[i][0]);
-    // posted parses to a date for most jobs, or 0 for a relative label ("2 weeks ago") → falls back
-    // to importedAt. An old posting is likely filled/closed, so prune on posting age too.
-    var postedTime = listedAtByJobId[_stringifyField(jobIds[i][0]).trim()] || _toComparableTime(posteds[i][0]);
-    if (!importedTime && !postedTime) continue; // no usable timestamp → keep
-    var importOld = importedTime && (nowMs - importedTime) > expiryMs;
-    var postedOld = postedTime && (nowMs - postedTime) > expiryMs;
-    if (importOld || postedOld) {
+    var jobId = _stringifyField(jobIds[i][0]).trim();
+    var isExpired = function(time) { return !!time && (nowMs - time) > expiryMs; };
+    var expired = false;
+
+    if (useListedAt) {
+      expired = expired || isExpired(listedAtByJobId[jobId] || _toComparableTime(posteds[i][0]));
+    }
+    if (usePostedAt) {
+      expired = expired || isExpired(postedAtByJobId[jobId]);
+    }
+    if (useImportedAt) {
+      expired = expired || isExpired(_toComparableTime(importedAts[i][0]));
+    }
+
+    if (expired) {
       sortKeys[i][0] = PRUNE_KEY; // mark to sort to the bottom for a single bulk delete
       prunedCount++;
     }
@@ -1918,6 +1943,31 @@ function _setupSettingsSheet(sheet) {
   sheet.setColumnWidth(1, 220);
   sheet.setColumnWidth(2, 300);
   sheet.setColumnWidth(3, 420);
+
+  // clearContents() above leaves data validation behind, so wipe the value column's rules before
+  // re-applying them — otherwise a checkbox stays pinned to whatever row it used to occupy when
+  // the settings list changes shape.
+  if (outputRows.length > 1) {
+    sheet.getRange(2, 2, outputRows.length - 1, 1).clearDataValidations();
+  }
+  var checkbox = SpreadsheetApp.newDataValidation().requireCheckbox().build();
+  for (var k = 1; k < outputRows.length; k++) {
+    if (SETTINGS_CHECKBOX_KEYS.indexOf(String(outputRows[k][0] || '').trim()) === -1) continue;
+    var cell = sheet.getRange(k + 1, 2);
+    cell.setDataValidation(checkbox);
+    cell.setValue(_parseBooleanSetting(outputRows[k][1], true));
+  }
+}
+
+// A ticked checkbox is the boolean true and an unticked one is the boolean FALSE — which is why the
+// `String(value || 'TRUE')` idiom used for the older text settings cannot be reused here: `false`
+// is falsy, so the default would win and an unticked box would read as ticked. Typed text is still
+// accepted so a hand-edited or pre-checkbox sheet keeps working.
+function _parseBooleanSetting(value, defaultValue) {
+  if (value === true || value === false) return value;
+  var v = _stringifyField(value).trim().toUpperCase();
+  if (v === '') return defaultValue;
+  return v === 'TRUE' || v === 'YES' || v === 'Y' || v === '1';
 }
 
 function _setupHelpSheet(sheet) {
