@@ -1395,7 +1395,18 @@ function _parseRelativePosted(postedLabel, anchorDate) {
     return anchorDate ? new Date(anchorDate.getTime()) : new Date();
   }
 
-  var match = label.match(/(\d+)\s*(minute|minutes|min|m|hour|hours|hr|h|day|days|d|week|weeks|w)\s*(?:ago)?/);
+  // Two things in this pattern are load-bearing:
+  //
+  //   Longest-first ordering. Regex alternation is first-match, not longest-match, so listing the
+  //   bare 'm' before 'months' made "2 months ago" match 'm' and resolve to 2 MINUTES. A half-year-
+  //   old posting came out fresher than one from yesterday — and since the age prune reads this,
+  //   the stalest listings were precisely the ones that could never age out.
+  //
+  //   The trailing \b. Without it 'm' still matches the leading m of "months" on backtracking;
+  //   the boundary forces a unit to end where the word does.
+  var match = label.match(
+    /(\d+)\s*(minutes|minute|mins|min|hours|hour|hrs|hr|days|day|weeks|week|months|month|mos|mo|years|year|yrs|yr|m|h|d|w|y)\b/
+  );
 
   if (!match) {
     return '';
@@ -1404,17 +1415,16 @@ function _parseRelativePosted(postedLabel, anchorDate) {
   var amount = Number(match[1]);
   var unit = match[2];
   var now = anchorDate ? new Date(anchorDate.getTime()) : new Date();
-  var minutes = 0;
-
-  if (unit === 'minute' || unit === 'minutes' || unit === 'min' || unit === 'm') {
-    minutes = amount;
-  } else if (unit === 'hour' || unit === 'hours' || unit === 'hr' || unit === 'h') {
-    minutes = amount * 60;
-  } else if (unit === 'day' || unit === 'days' || unit === 'd') {
-    minutes = amount * 60 * 24;
-  } else if (unit === 'week' || unit === 'weeks' || unit === 'w') {
-    minutes = amount * 60 * 24 * 7;
-  }
+  var MINUTES_PER = {
+    minutes: 1, minute: 1, mins: 1, min: 1, m: 1,
+    hours: 60, hour: 60, hrs: 60, hr: 60, h: 60,
+    days: 1440, day: 1440, d: 1440,
+    weeks: 10080, week: 10080, w: 10080,
+    // LinkedIn's own buckets, so calendar-exact months and years buy nothing here.
+    months: 43200, month: 43200, mos: 43200, mo: 43200,
+    years: 525600, year: 525600, yrs: 525600, yr: 525600, y: 525600
+  };
+  var minutes = MINUTES_PER[unit] ? amount * MINUTES_PER[unit] : 0;
 
   return new Date(now.getTime() - minutes * 60 * 1000);
 }
