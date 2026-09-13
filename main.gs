@@ -1,4 +1,4 @@
-var APP_VERSION = '0.10.1';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.10.2';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -487,19 +487,39 @@ function _parsePruneDateFlags(input) {
 function pruneOldDataPrompt() {
   var ui = SpreadsheetApp.getUi();
 
-  // Asked for here rather than stored on the Settings sheet: one prompt, nothing to initialise
-  // first. A real checkbox grid would need an HtmlService dialog, which is what the in-sheet Prompt
-  // editor (c1f4920) exists to avoid — it breaks when several Google accounts are signed in.
+  // Two prompts, because ui.prompt has a single input field and an HtmlService dialog is what the
+  // in-sheet Prompt editor (c1f4920) exists to avoid — it breaks with several Google accounts
+  // signed in. The age threshold is asked FIRST: it is the familiar input, and asking for the date
+  // flags first meant a day count typed into that box stripped to no selection, failed, and never
+  // reached step 2. Each title says which step it is so a second dialog is never a surprise.
+  var daysResponse = ui.prompt(
+    'Prune Old Data — step 1 of 2: how many days?',
+    'Delete rows older than how many days?\n(Leave blank for 90)\n\n' +
+    'Step 2 asks which date to measure that age against.\n\n' +
+    'ONLY Submitted and Networking are never pruned, at any age.\n' +
+    'New / Filled / Flagged / Skip / Skip (auto) / Closed all age out.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (daysResponse.getSelectedButton() !== ui.Button.OK) return;
+
+  var input = String(daysResponse.getResponseText() || '').trim();
+  var days = input === '' ? 90 : parseInt(input, 10);
+  if (isNaN(days) || days <= 0) {
+    ui.alert('Invalid input. Please enter a positive number of days.');
+    return;
+  }
+
   var lines = PRUNE_DATE_CHOICES.map(function(choice, i) {
     return '  ' + (i + 1) + '.  ' + choice.label + '   (' + choice.blurb + ')';
   });
 
   var dateResponse = ui.prompt(
-    'Prune Old Data — which dates?',
+    'Prune Old Data — step 2 of 2: which dates?',
+    'Deleting rows older than ' + days + ' days. Measured against which date?\n\n' +
     'Type 1 to use a date, 0 to skip it — one digit per line, in order:\n\n' +
     lines.join('\n') + '\n\n' +
     'So "011" = listed_at + imported_at, "100" = posted_at only.\n' +
-    'A row is deleted if ANY chosen date is older than the threshold.\n\n' +
+    'A row is deleted if ANY chosen date is older than ' + days + ' days.\n\n' +
     'Leave blank for ' + PRUNE_DATE_DEFAULT + '.',
     ui.ButtonSet.OK_CANCEL
   );
@@ -509,37 +529,15 @@ function pruneOldDataPrompt() {
   var dateSelection = _parsePruneDateFlags(typed === '' ? PRUNE_DATE_DEFAULT : typed);
   if (!dateSelection) {
     ui.alert(
-      'No date selected, so nothing would be pruned.\n\n' +
-      'Type one digit per line — for example ' + PRUNE_DATE_DEFAULT + ' — with at least one 1.'
+      'Nothing was pruned — "' + typed + '" selected no date.\n\n' +
+      'This step wants one digit per date, not a number of days (that was step 1).\n' +
+      'Type ' + PRUNE_DATE_DEFAULT + ' for listed_at + imported_at, or leave it blank for the same.'
     );
     return;
   }
 
   var chosen = PRUNE_DATE_CHOICES.filter(function(choice) { return dateSelection[choice.key]; })
     .map(function(choice) { return choice.label + ' (' + choice.blurb + ')'; });
-
-  var response = ui.prompt(
-    'Prune Old Data — age threshold',
-    'Delete rows older than how many days?\n(Leave blank for 90)\n\n' +
-    'Ageing rows out on:\n  • ' + chosen.join('\n  • ') + '\n' +
-    (chosen.length > 1 ? '(a row goes if ANY of these is older than the threshold)\n' : '') +
-    '\nONLY Submitted and Networking are never pruned, at any age.\n' +
-    'New / Filled / Flagged / Skip / Skip (auto) / Closed all age out.\n\n' +
-    'Also runs regardless of age:\n' +
-    '  • drops Raw_Data JD text for Submitted / Closed / Skip jobs\n' +
-    '  • drops orphaned Raw_Data rows',
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (response.getSelectedButton() !== ui.Button.OK) return;
-
-  var input = String(response.getResponseText() || '').trim();
-  var days = input === '' ? 90 : parseInt(input, 10);
-
-  if (isNaN(days) || days <= 0) {
-    ui.alert('Invalid input. Please enter a positive number of days.');
-    return;
-  }
 
   ensureWorkbookReadyForRuntime();
 
@@ -550,8 +548,9 @@ function pruneOldDataPrompt() {
   var assignedDeleted = pruneAssignedRows(days);
 
   ui.alert(
+    'Pruned rows older than ' + days + ' days.\n' +
+    'Measured on: ' + chosen.join(', ') + '\n\n' +
     'Job_Priority: ' + (jpDeleted.prunedCount || 0) + ' row(s) deleted.\n' +
-    'Aged out on: ' + chosen.join(', ') + '\n' +
     'Raw_Data: ' + rawDeleted + ' row(s) dropped (orphans + JD text for Submitted/Closed/Skip jobs).\n' +
     'Assigned: ' + assignedDeleted + ' row(s) deleted.\n\n' +
     'Never pruned: Submitted and Networking rows in Job_Priority (a Submitted row keeps its\n' +
