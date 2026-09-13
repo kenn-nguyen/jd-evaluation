@@ -94,7 +94,15 @@ var JOB_PRIORITY_HIDDEN_COLUMNS = [
   'sort_key'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
-var RAW_DATA_COLUMNS = ['job_id', 'raw_ref', 'posted_at'];
+var RAW_DATA_COLUMNS = ['job_id', 'raw_ref', 'posted_at', 'listed_at'];
+// The derived date columns, in one place so setup, backfill and formatting stay in step.
+// posted_at = when the ROLE was first posted (drives the age prune); listed_at = when THIS LISTING
+// went live (mirrors the 'posted' column on Job_Priority and Assigned). LinkedIn reposts, so the
+// two can sit months apart — which is the whole reason both are worth showing.
+var RAW_DATA_DATE_COLUMNS = [
+  { name: 'posted_at', extract: function(r) { return _extractPostedAtFromRawRef(r); } },
+  { name: 'listed_at', extract: function(r) { return _extractListedAtFromRawRef(r); } }
+];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
   var map = {};
   for (var i = 0; i < JOB_PRIORITY_COLUMNS.length; i += 1) {
@@ -587,6 +595,7 @@ function getRawDataIndex() {
   var rawRefColIndex = headers.indexOf('raw_ref');
   if (rawRefColIndex === -1) rawRefColIndex = RAW_DATA_COLUMNS.indexOf('raw_ref');
   var postedAtColIndex = headers.indexOf('posted_at'); // -1 on a pre-migration sheet
+  var listedAtColIndex = headers.indexOf('listed_at');
 
   var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
 
@@ -600,6 +609,7 @@ function getRawDataIndex() {
       rowNumber: offset + 2,
       jobId: jobId,
       postedAt: postedAtColIndex === -1 ? '' : (row[postedAtColIndex] || ''),
+      listedAt: listedAtColIndex === -1 ? '' : (row[listedAtColIndex] || ''),
       rawRef: row[rawRefColIndex] || ''
     };
   });
@@ -1569,82 +1579,81 @@ function _rawDataSchemaIsCurrent(sheet) {
   return _headerMatches(sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).getValues()[0], RAW_DATA_COLUMNS);
 }
 
-// Finds the raw_ref and posted_at columns by CONTENT, sampling the first data rows: a payload is a
-// string starting with '{', a date is a real Date. Header labels are not trusted here, because a
-// v0.6.0 sheet that took an import before its schema was migrated ended up with its labels and its
-// data in different columns — so the labels are exactly what cannot be believed.
+// Finds the raw_ref column by CONTENT, sampling the first data rows: a payload is a string
+// starting with '{'. Header labels are not trusted here, because a sheet that took an import
+// before its schema was migrated ended up with its labels and its data in different columns — so
+// the labels are exactly what cannot be believed. Only the payload is looked for: it is the one
+// irreplaceable value, while every date column can be re-derived from it.
 function _detectRawDataColumns(sheet, lastRow, maxCols) {
-  var found = { rawRefCol: 0, postedAtCol: 0 };
-  if (lastRow < 2) return found;
+  if (lastRow < 2) return 0;
 
   var sampleRows = Math.min(lastRow - 1, 30);
   var sample = sheet.getRange(2, 1, sampleRows, maxCols).getValues();
   var jsonHits = [];
-  var dateHits = [];
   var c;
-  for (c = 0; c < maxCols; c++) { jsonHits[c] = 0; dateHits[c] = 0; }
+  for (c = 0; c < maxCols; c++) jsonHits[c] = 0;
 
   for (var r = 0; r < sampleRows; r++) {
     for (c = 0; c < maxCols; c++) {
       var v = sample[r][c];
-      if (v instanceof Date) dateHits[c] += 1;
-      else if (typeof v === 'string' && v.charAt(0) === '{') jsonHits[c] += 1;
+      if (typeof v === 'string' && v.charAt(0) === '{') jsonHits[c] += 1;
     }
   }
 
-  var bestJson = 0;
-  var bestDate = 0;
+  var best = 0;
+  var bestCol = 0;
   for (c = 1; c < maxCols; c++) { // never column 1 — that is job_id
-    if (jsonHits[c] > bestJson) { bestJson = jsonHits[c]; found.rawRefCol = c + 1; }
-    if (dateHits[c] > bestDate) { bestDate = dateHits[c]; found.postedAtCol = c + 1; }
+    if (jsonHits[c] > best) { best = jsonHits[c]; bestCol = c + 1; }
   }
-  return found;
+  return bestCol;
 }
 
-// Brings Raw_Data to ['job_id', 'raw_ref', 'posted_at'] from any earlier layout, including the ones
-// the v0.6.0 column-insert produced. posted_at is APPENDED rather than inserted, so raw_ref keeps
-// column 2 exactly where every pre-existing reader expects it and no payload ever moves on a fresh
-// upgrade — the whole class of column-slide bug goes away.
+// Brings Raw_Data to ['job_id', 'raw_ref', 'posted_at', 'listed_at'] from any earlier layout.
+// Date columns are APPENDED, never inserted, so raw_ref keeps column 2 exactly where every
+// pre-existing reader expects it and no payload moves on a routine upgrade.
 //
-// The payload is relocated with copyTo (a server-side range op) so a 40k-char column is never
-// pulled into memory. posted_at is carried across when it can be found, and is re-derivable from
-// the payload by backfillRawDataPostedAt() when it cannot.
+// The payload is the only irreplaceable value, so it is located by content and relocated with
+// copyTo (a server-side range op) so a 40k-char column is never pulled into memory. Date columns
+// are derived data: carried over by header name where that is possible, and rebuilt from the
+// payload by backfillRawDataPostedAt() where it is not.
 function _normalizeRawDataSchema(sheet) {
   _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
 
   var RAW_COL = RAW_DATA_COLUMNS.indexOf('raw_ref') + 1;
-  var POSTED_COL = RAW_DATA_COLUMNS.indexOf('posted_at') + 1;
   var lastRow = sheet.getLastRow();
   var maxCols = sheet.getMaxColumns();
   var dataRows = Math.max(lastRow - 1, 0);
+  var oldHeader = lastRow >= 1 ? sheet.getRange(1, 1, 1, maxCols).getValues()[0] : [];
   var stampHeader = function() {
     sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
   };
 
-  var found = _detectRawDataColumns(sheet, lastRow, maxCols);
+  var rawRefCol = _detectRawDataColumns(sheet, lastRow, maxCols);
 
-  // No payloads stored yet, or already laid out correctly — label it and leave the data alone.
-  if (!found.rawRefCol ||
-      (found.rawRefCol === RAW_COL && (!found.postedAtCol || found.postedAtCol === POSTED_COL))) {
+  // Nothing stored yet, or the payload is already in place: label the sheet — which is also what
+  // adds a newly appended column — and leave every existing value untouched.
+  if (!rawRefCol || rawRefCol === RAW_COL) {
     stampHeader();
     return false;
   }
 
-  var savedDates = (found.postedAtCol && dataRows)
-    ? sheet.getRange(2, found.postedAtCol, dataRows, 1).getValues()
-    : null;
+  var carried = [];
+  RAW_DATA_COLUMNS.forEach(function(name, i) {
+    if (name === 'job_id' || name === 'raw_ref' || !dataRows) return;
+    var src = oldHeader.indexOf(name) + 1;
+    if (!src || src === rawRefCol) return;
+    carried.push({ col: i + 1, values: sheet.getRange(2, src, dataRows, 1).getValues() });
+  });
 
-  if (found.rawRefCol !== RAW_COL) {
-    sheet.getRange(1, found.rawRefCol, lastRow, 1).copyTo(sheet.getRange(1, RAW_COL, lastRow, 1));
-  }
+  sheet.getRange(1, rawRefCol, lastRow, 1).copyTo(sheet.getRange(1, RAW_COL, lastRow, 1));
 
   if (dataRows) {
-    // Anything past the schema is debris from an older layout.
-    if (maxCols > RAW_DATA_COLUMNS.length) {
-      sheet.getRange(2, RAW_DATA_COLUMNS.length + 1, dataRows, maxCols - RAW_DATA_COLUMNS.length).clearContent();
-    }
-    sheet.getRange(2, POSTED_COL, dataRows, 1).clearContent();
-    if (savedDates) sheet.getRange(2, POSTED_COL, dataRows, 1).setValues(savedDates);
+    // Everything past raw_ref is either debris from an older layout or a date column about to be
+    // rewritten from the values captured above.
+    sheet.getRange(2, RAW_COL + 1, dataRows, maxCols - RAW_COL).clearContent();
+    carried.forEach(function(entry) {
+      sheet.getRange(2, entry.col, dataRows, 1).setValues(entry.values);
+    });
   }
 
   stampHeader();
@@ -1658,13 +1667,16 @@ function _setupRawDataSheet(sheet) {
     .setBackground('#d0e0e3');
   sheet.setFrozenRows(1);
 
-  var postedCol = RAW_DATA_COLUMNS.indexOf('posted_at') + 1;
   var rawRefCol = RAW_DATA_COLUMNS.indexOf('raw_ref') + 1;
+  var dataRowSpan = Math.max(sheet.getMaxRows() - 1, 1);
   sheet.setColumnWidth(1, 120);
   sheet.setColumnWidth(rawRefCol, 180);
-  sheet.setColumnWidth(postedCol, 140);
-  sheet.getRange(2, postedCol, Math.max(sheet.getMaxRows() - 1, 1), 1).setNumberFormat('yyyy-mm-dd hh:mm');
-  // Only raw_ref is hidden; job_id and posted_at stay visible so the sheet can be eyeballed.
+  RAW_DATA_DATE_COLUMNS.forEach(function(spec) {
+    var col = RAW_DATA_COLUMNS.indexOf(spec.name) + 1;
+    sheet.setColumnWidth(col, 140);
+    sheet.getRange(2, col, dataRowSpan, 1).setNumberFormat('yyyy-mm-dd hh:mm');
+  });
+  // Only raw_ref is hidden; job_id and both date columns stay visible so the sheet can be eyeballed.
   sheet.hideColumns(rawRefCol, 1);
 }
 
@@ -2423,15 +2435,15 @@ function _extractJobDescriptionFromRawRef(rawRef) {
   return '';
 }
 
-// Digs the posting date back out of a stored raw_ref blob. Mirrors _extractSourceUrlFromRawRef:
-// the linkedin-job-detail actor nests its fields under job_info, the search actor keeps them flat,
-// and _serializeRawRef's compact (>40k) form keeps a flat publishedAt — so try the nested object
+// Walks a stored raw_ref blob for the first key that yields a usable absolute date. The
+// linkedin-job-detail actor nests its fields under job_info, the search actor keeps them flat, and
+// _serializeRawRef's compact (>40k) form keeps a flat publishedAt — so the nested object is tried
 // first, then the top level.
 //
-// Relative labels ('2 weeks ago') are deliberately NOT parsed: they only mean something relative to
-// the run that scraped them, and that anchor is gone by the time the row is read back. Such a row
-// resolves to '' and simply is not age-prunable, which beats inventing a wrong date.
-function _extractPostedAtFromRawRef(rawRef) {
+// Relative labels ('2 weeks ago') are deliberately never parsed here: they only mean something
+// relative to the run that scraped them, and that anchor is gone by the time the row is read back.
+// Such a row resolves to '' and is simply not age-prunable, which beats inventing a date.
+function _extractDateFromRawRef(rawRef, keys) {
   if (!_stringifyField(rawRef)) return '';
 
   var parsed;
@@ -2443,12 +2455,6 @@ function _extractPostedAtFromRawRef(rawRef) {
   if (!parsed) return '';
 
   var sources = [parsed.job_info || {}, parsed];
-  // original_listed_at FIRST: posted_at means "when was this role first posted", not "when did this
-  // listing last go live". LinkedIn refreshes and reposts, so listed_at can be months newer than
-  // the real opening date — and a refreshed-but-ancient posting that reads as fresh is exactly what
-  // must not survive an age-based prune.
-  var keys = ['original_listed_at', 'listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted'];
-
   for (var s = 0; s < sources.length; s++) {
     for (var i = 0; i < keys.length; i++) {
       var hit = _coerceValidPostedDate(sources[s][keys[i]]);
@@ -2456,6 +2462,24 @@ function _extractPostedAtFromRawRef(rawRef) {
     }
   }
   return '';
+}
+
+// posted_at — when the ROLE WAS FIRST POSTED. original_listed_at wins, because LinkedIn refreshes
+// and reposts and listed_at can be months newer than the real opening date. This is the date the
+// age prune reads: a refreshed-but-ancient posting must not read as fresh.
+function _extractPostedAtFromRawRef(rawRef) {
+  return _extractDateFromRawRef(rawRef,
+    ['original_listed_at', 'listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted']);
+}
+
+// listed_at — when THIS LISTING WENT LIVE. Mirrors the 'posted' column on Job_Priority and
+// Assigned. original_listed_at is deliberately absent: when the two differ, the gap between this
+// column and posted_at is exactly the information worth seeing, so collapsing them would hide it.
+// A source that only ever reports one date (the search actor) yields the same value in both, which
+// is correct rather than redundant.
+function _extractListedAtFromRawRef(rawRef) {
+  return _extractDateFromRawRef(rawRef,
+    ['listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted']);
 }
 
 function _extractSourceUrlFromRawRef(rawRef) {
@@ -2604,7 +2628,8 @@ function _buildRawDataPayload(job, existing) {
   return {
     jobId: _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId),
     rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || '',
-    postedAt: _resolveRawDataPostedAt(job, existing)
+    postedAt: _resolveRawDataPostedAt(job, existing),
+    listedAt: _resolveRawDataListedAt(job, existing)
   };
 }
 
@@ -2627,11 +2652,23 @@ function _resolveRawDataPostedAt(job, existing) {
     '';
 }
 
+// listed_at is the listing date, matching the 'posted' column on Job_Priority and Assigned. Unlike
+// posted_at it takes job.publishedAt readily — _normalizeJobDetail sets that from info.listed_at,
+// which is precisely this column's meaning.
+function _resolveRawDataListedAt(job, existing) {
+  return _extractListedAtFromRawRef(job && job.rawRef) ||
+    _coerceValidPostedDate(job && job.publishedAt) ||
+    _coerceValidPostedDate(job && job.posted) ||
+    _coerceValidPostedDate(existing && existing.listedAt) ||
+    '';
+}
+
 function _toRawDataRow(rawData) {
   return [
     rawData.jobId || '',
     rawData.rawRef || '',
-    rawData.postedAt || ''
+    rawData.postedAt || '',
+    rawData.listedAt || ''
   ];
 }
 
@@ -2657,66 +2694,82 @@ function backfillRawDataPostedAt(options) {
 
   var maxCols = sheet.getMaxColumns();
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
-  var postedCol = headers.indexOf('posted_at') + 1;
   var rawRefCol = headers.indexOf('raw_ref') + 1;
-  if (!postedCol || !rawRefCol) return result; // sheet has not been migrated yet
+  if (!rawRefCol) return result; // sheet has not been migrated yet
 
-  // This function writes exactly ONE column — posted_at — and reads raw_ref without ever writing
-  // it. The danger is not which range is written but which column that range resolves to: postedCol
-  // comes from the header, and on a mangled sheet the header is precisely what is wrong. Writing a
-  // date over a payload cell destroys the JD irrecoverably, so confirm by CONTENT (sampled) that
-  // the header-derived columns are the real ones, and refuse to touch anything if they are not.
-  var detected = _detectRawDataColumns(sheet, lastRow, maxCols);
-  if (detected.rawRefCol && detected.rawRefCol === postedCol) {
-    result.abortedReason = 'the posted_at column (column ' + postedCol + ') actually holds raw payloads';
-    return result;
-  }
-  if (detected.rawRefCol && detected.rawRefCol !== rawRefCol) {
-    result.abortedReason = 'the header puts raw_ref in column ' + rawRefCol +
-      ' but the payloads are in column ' + detected.rawRefCol;
-    return result;
+  var targets = [];
+  RAW_DATA_DATE_COLUMNS.forEach(function(spec) {
+    var col = headers.indexOf(spec.name) + 1;
+    if (col) targets.push({ col: col, extract: spec.extract, name: spec.name });
+  });
+  if (!targets.length) return result;
+
+  // This function writes ONLY date columns and reads raw_ref without ever writing it. The exposure
+  // is not which range is written but which column that range resolves to: the targets come from
+  // the header, and on a mangled sheet the header is precisely what is wrong. A date written over
+  // a payload cell destroys the JD irrecoverably, so confirm by CONTENT (sampled) that the
+  // header-derived columns are the real ones, and refuse to touch anything if they are not.
+  var detectedRawRefCol = _detectRawDataColumns(sheet, lastRow, maxCols);
+  if (detectedRawRefCol) {
+    if (detectedRawRefCol !== rawRefCol) {
+      result.abortedReason = 'the header puts raw_ref in column ' + rawRefCol +
+        ' but the payloads are in column ' + detectedRawRefCol;
+      return result;
+    }
+    for (var t = 0; t < targets.length; t++) {
+      if (targets[t].col === detectedRawRefCol) {
+        result.abortedReason = 'the ' + targets[t].name + ' column (column ' + targets[t].col +
+          ') actually holds raw payloads';
+        return result;
+      }
+    }
   }
 
   var CHUNK = 300;
   for (var start = 2; start <= lastRow; start += CHUNK) {
     var count = Math.min(CHUNK, lastRow - start + 1);
-    var posted = sheet.getRange(start, postedCol, count, 1).getValues();
     var rawRefs = sheet.getRange(start, rawRefCol, count, 1).getValues();
-    var dirty = false;
 
-    for (var i = 0; i < count; i++) {
-      result.checkedCount++;
-      var current = posted[i][0];
-      // Belt and braces: the sampled check above can only see the rows it sampled, so never
-      // overwrite an individual cell that looks like a payload, whatever the header claims.
-      if (typeof current === 'string' && current.charAt(0) === '{') {
-        result.skippedPayloadCount++;
-        continue;
-      }
-      var existingDate = _coerceValidPostedDate(current);
-      if (existingDate && !overwrite) {
-        result.alreadySetCount++;
-        continue;
+    for (var ti = 0; ti < targets.length; ti++) {
+      var target = targets[ti];
+      var current = sheet.getRange(start, target.col, count, 1).getValues();
+      var dirty = false;
+
+      for (var i = 0; i < count; i++) {
+        result.checkedCount++;
+        var cell = current[i][0];
+        // Belt and braces: the sampled check above can only see the rows it sampled, so never
+        // overwrite an individual cell that looks like a payload, whatever the header claims.
+        if (typeof cell === 'string' && cell.charAt(0) === '{') {
+          result.skippedPayloadCount++;
+          continue;
+        }
+
+        var existingDate = _coerceValidPostedDate(cell);
+        if (existingDate && !overwrite) {
+          result.alreadySetCount++;
+          continue;
+        }
+
+        var found = target.extract(rawRefs[i][0]);
+        if (!found) {
+          // Never wipe a date we cannot re-derive — a missing payload is not evidence of no date.
+          if (existingDate) result.alreadySetCount++;
+          else result.unresolvedCount++;
+          continue;
+        }
+        if (existingDate && found.getTime() === existingDate.getTime()) {
+          result.alreadySetCount++;
+          continue;
+        }
+        current[i][0] = found;
+        if (existingDate) result.rederivedCount++;
+        else result.filledCount++;
+        dirty = true;
       }
 
-      var found = _extractPostedAtFromRawRef(rawRefs[i][0]);
-      if (!found) {
-        // Never wipe a date we cannot re-derive — a missing payload is not evidence of no date.
-        if (existingDate) result.alreadySetCount++;
-        else result.unresolvedCount++;
-        continue;
-      }
-      if (existingDate && found.getTime() === existingDate.getTime()) {
-        result.alreadySetCount++;
-        continue;
-      }
-      posted[i][0] = found;
-      if (existingDate) result.rederivedCount++;
-      else result.filledCount++;
-      dirty = true;
+      if (dirty) sheet.getRange(start, target.col, count, 1).setValues(current);
     }
-
-    if (dirty) sheet.getRange(start, postedCol, count, 1).setValues(posted);
   }
 
   return result;

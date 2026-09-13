@@ -1,6 +1,6 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
-![version](https://img.shields.io/badge/version-0.7.1-blue) · Google Apps Script
+![version](https://img.shields.io/badge/version-0.7.2-blue) · Google Apps Script
 
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.
@@ -68,7 +68,7 @@ and a re-posted role that's already scored is **not** paid for again.
 | **Prompt** | Where you edit **your profile** and the **scoring instructions** (see [Customizing scoring](#customizing-the-scoring)). |
 | **Settings** | All configuration (keys, model, schedule, routing rules). |
 | **Apify_Accounts** | Your Apify API token(s) — supports rotating multiple accounts. |
-| **Raw_Data** | Raw scraped payloads, one row per job: `job_id`, `raw_ref`, `posted_at`. Kept only for jobs still in the queue *and* still scoreable — a job that reaches Submitted / Closed / Skip has its payload dropped, since nothing re-reads a JD once the job leaves scoring. |
+| **Raw_Data** | Raw scraped payloads, one row per job: `job_id`, `raw_ref`, `posted_at`, `listed_at`. Kept only for jobs still in the queue *and* still scoreable — a job that reaches Submitted / Closed / Skip has its payload dropped, since nothing re-reads a JD once the job leaves scoring. |
 | **Help** | In-sheet reference for statuses, owners, visa signals, and settings. |
 
 ---
@@ -229,7 +229,7 @@ Everything is driven from the **Jobs Pipeline** menu:
   - *Prune Old Data* takes an age threshold for Job_Priority and Assigned, and additionally — regardless of age — deletes every Skip / Skip (auto) row, drops Raw_Data payloads for Submitted / Closed / Skip jobs, and drops orphaned Raw_Data rows. Run Sort & Rank afterwards to close rank gaps.
   - *Backfill Raw_Data Dates* fills `posted_at` by re-reading each stored payload. It writes only the `posted_at` column — `raw_ref` is read, never modified — and refuses to run at all if the sheet's content shows the header is mislabelling which column is which. Asks whether to re-derive dates that are already filled: answer **Yes once** after upgrading to v0.7.0 (the column's meaning changed), **No** normally — that path is fast and resumable.
 
-Two posting dates, deliberately different. The **`posted` column** on Job_Priority and Assigned is the *listing* date (`listed_at`) — it drives display, sorting, and re-post detection. **`Raw_Data.posted_at`** is the *first-posted* date (`original_listed_at`) and is what the age prune reads. LinkedIn refreshes and reposts, so the two can be months apart; a job can therefore display as recent and still be pruned, which is intended.
+Two posting dates, deliberately different, and Raw_Data now shows both side by side. **`posted_at`** is the *first-posted* date (`original_listed_at`) and is what the age prune reads. **`listed_at`** is when this listing went live, mirroring the **`posted` column** on Job_Priority and Assigned, which drives display, sorting, and re-post detection. LinkedIn refreshes and reposts, so the two can be months apart; a job can therefore display as recent and still be pruned, which is intended.
 
 **Priorities:** `P01` (rare bullseye) → `P04` (solid, default) → `P10` (skip). Most jobs land P03–P05.
 

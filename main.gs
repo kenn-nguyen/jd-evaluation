@@ -1,4 +1,4 @@
-var APP_VERSION = '0.7.1';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.7.2';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
