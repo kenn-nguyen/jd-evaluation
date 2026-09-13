@@ -2757,6 +2757,7 @@ function backfillRawDataPostedAt(options) {
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
   var rawRefCol = headers.indexOf('raw_ref') + 1;
   var idCol = headers.indexOf('job_id') + 1;
+  var importedCol = headers.indexOf('imported_at') + 1;
   if (!rawRefCol || !idCol) return result; // sheet has not been migrated yet
 
   var targets = [];
@@ -2787,10 +2788,15 @@ function backfillRawDataPostedAt(options) {
     }
   }
 
-  // A relative label ('4 days ago') only means something against the run that scraped it, and that
-  // anchor is Job_Priority.imported_at. Without it, listed_at would fall back to publishedAt, which
-  // is pinned to the ORIGINAL posting — older than the real listing date, so the age prune would
-  // retire rows that are still actively listed.
+  // A relative label ('4 days ago') only means something against the run that scraped it. Without
+  // an anchor, listed_at falls back to publishedAt, which is pinned to the ORIGINAL posting —
+  // older than the real listing date, so the age prune would retire rows still actively listed.
+  //
+  // Raw_Data's own imported_at is preferred over Job_Priority's, because it is written in lockstep
+  // with raw_ref and so always describes the run that produced THAT payload. The Job_Priority value
+  // can legitimately differ: _mergeSimilarJdGroup keeps the EARLIEST importedAt across a merged
+  // group, so after a dedup the surviving row can be stamped older than the crawl its stored
+  // payload actually came from — and anchoring to that would back-date every label inside it.
   var importedAtByJobId = _getJobPriorityImportedAtByJobId();
 
   var CHUNK = 300;
@@ -2798,6 +2804,7 @@ function backfillRawDataPostedAt(options) {
     var count = Math.min(CHUNK, lastRow - start + 1);
     var rawRefs = sheet.getRange(start, rawRefCol, count, 1).getValues();
     var ids = sheet.getRange(start, idCol, count, 1).getValues();
+    var storedAnchors = importedCol ? sheet.getRange(start, importedCol, count, 1).getValues() : null;
 
     for (var ti = 0; ti < targets.length; ti++) {
       var target = targets[ti];
@@ -2820,7 +2827,9 @@ function backfillRawDataPostedAt(options) {
           continue;
         }
 
-        var found = target.resolve(rawRefs[i][0], importedAtByJobId[_stringifyField(ids[i][0]).trim()]);
+        var anchor = (storedAnchors && _coerceValidPostedDate(storedAnchors[i][0])) ||
+          importedAtByJobId[_stringifyField(ids[i][0]).trim()];
+        var found = target.resolve(rawRefs[i][0], anchor);
         if (!found) {
           // Never wipe a date we cannot re-derive — a missing payload is not evidence of no date.
           if (existingDate) result.alreadySetCount++;
