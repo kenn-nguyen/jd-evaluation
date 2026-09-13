@@ -1356,22 +1356,33 @@ function _extractLinkedInJobId(value) {
   return '';
 }
 
+// Resolves the date shown in the 'posted' column of Job_Priority and Assigned.
+//
+// This is the LISTING date — when this posting went live — NOT when the role was first opened.
+// That distinction is deliberate: _mergeNewJobIntoExistingRow reopens a 'Closed' row only when a
+// re-post is NEWER than the row it is merging into, and a first-posted date would compare equal
+// between a posting and its own re-post, so nothing would ever reopen. First-posted lives in
+// Raw_Data.posted_at, which is what the age prune reads. original_listed_at is therefore not
+// consulted here — except as the last resort below, when there is no listing date at all.
 function _derivePostedDate(item, postedLabel, anchorDate) {
   var relativeDate = _parseRelativePosted(postedLabel, anchorDate);
-  var directDate = _pickFirstValue(item, ['publishedAt', 'listedAt', 'postedAt', 'createdAt']);
-
   if (relativeDate) {
     return relativeDate;
   }
 
+  // 'listed_at' (snake_case) is what the linkedin-job-detail actor emits; the camelCase-only list
+  // never matched it, so its epoch timestamp fell straight through and got displayed verbatim as
+  // a raw number — which also read as 0 through _toComparableTime, silently disabling re-post
+  // detection and sinking those rows in the Assigned sort.
+  var directDate = _coerceValidPostedDate(
+    _pickFirstValue(item, ['publishedAt', 'listedAt', 'listed_at', 'postedAt', 'createdAt'])
+  );
   if (directDate) {
-    var parsedDate = new Date(directDate);
-    if (!isNaN(parsedDate.getTime())) {
-      return parsedDate;
-    }
+    return directDate;
   }
 
-  return '';
+  // The label itself may already be an absolute timestamp rather than a relative phrase.
+  return _coerceValidPostedDate(postedLabel) || '';
 }
 
 function _parseRelativePosted(postedLabel, anchorDate) {
