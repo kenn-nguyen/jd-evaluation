@@ -2603,17 +2603,37 @@ function _toRawDataRow(rawData) {
 // if a run hits the 6-minute limit, running it again resumes where it stopped instead of redoing
 // the work.
 function backfillRawDataPostedAt() {
-  var result = { checkedCount: 0, filledCount: 0, alreadySetCount: 0, unresolvedCount: 0 };
+  var result = {
+    checkedCount: 0, filledCount: 0, alreadySetCount: 0, unresolvedCount: 0,
+    skippedPayloadCount: 0, abortedReason: ''
+  };
   var sheet = _getRawDataSheet();
   if (!sheet) return result;
 
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return result;
 
-  var headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+  var maxCols = sheet.getMaxColumns();
+  var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
   var postedCol = headers.indexOf('posted_at') + 1;
   var rawRefCol = headers.indexOf('raw_ref') + 1;
   if (!postedCol || !rawRefCol) return result; // sheet has not been migrated yet
+
+  // This function writes exactly ONE column — posted_at — and reads raw_ref without ever writing
+  // it. The danger is not which range is written but which column that range resolves to: postedCol
+  // comes from the header, and on a mangled sheet the header is precisely what is wrong. Writing a
+  // date over a payload cell destroys the JD irrecoverably, so confirm by CONTENT (sampled) that
+  // the header-derived columns are the real ones, and refuse to touch anything if they are not.
+  var detected = _detectRawDataColumns(sheet, lastRow, maxCols);
+  if (detected.rawRefCol && detected.rawRefCol === postedCol) {
+    result.abortedReason = 'the posted_at column (column ' + postedCol + ') actually holds raw payloads';
+    return result;
+  }
+  if (detected.rawRefCol && detected.rawRefCol !== rawRefCol) {
+    result.abortedReason = 'the header puts raw_ref in column ' + rawRefCol +
+      ' but the payloads are in column ' + detected.rawRefCol;
+    return result;
+  }
 
   var CHUNK = 300;
   for (var start = 2; start <= lastRow; start += CHUNK) {
@@ -2624,7 +2644,14 @@ function backfillRawDataPostedAt() {
 
     for (var i = 0; i < count; i++) {
       result.checkedCount++;
-      if (_coerceValidPostedDate(posted[i][0])) {
+      var current = posted[i][0];
+      // Belt and braces: the sampled check above can only see the rows it sampled, so never
+      // overwrite an individual cell that looks like a payload, whatever the header claims.
+      if (typeof current === 'string' && current.charAt(0) === '{') {
+        result.skippedPayloadCount++;
+        continue;
+      }
+      if (_coerceValidPostedDate(current)) {
         result.alreadySetCount++;
         continue;
       }

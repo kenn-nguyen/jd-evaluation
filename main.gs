@@ -1,4 +1,4 @@
-var APP_VERSION = '0.6.1';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.6.2';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -497,27 +497,61 @@ function pruneOldDataPrompt() {
 }
 
 // One-shot after the posted_at migration: every Raw_Data row written before it has a blank date.
-// ensureWorkbookReadyForRuntime() performs the column insert if this workbook is still on the old
-// ['job_id', 'raw_ref'] schema, so this is safe to run as the very first action after an update.
+//
+// The backfill itself writes ONLY the posted_at column and never raw_ref — and refuses to write at
+// all if the sheet's content says the header is lying about which column is which. The one thing
+// here that CAN move columns is the schema repair inside ensureWorkbookReadyForRuntime(), so the
+// header is captured before and after and any change is reported rather than done silently.
 function backfillRawDataPostedAtPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var headerBefore = _readRawDataHeaderSnapshot();
+
   ensureWorkbookReadyForRuntime();
 
+  var headerAfter = _readRawDataHeaderSnapshot();
+  var repaired = headerBefore && headerAfter && headerBefore !== headerAfter
+    ? 'Sheet layout was repaired first:\n  before: ' + headerBefore + '\n  after:  ' + headerAfter + '\n\n'
+    : '';
+
   var result = backfillRawDataPostedAt();
-  if (!result.checkedCount) {
-    SpreadsheetApp.getUi().alert('Raw_Data has no rows to backfill.');
+
+  if (result.abortedReason) {
+    ui.alert(
+      repaired +
+      'Backfill did NOT run — nothing was written.\n\n' +
+      'Reason: ' + result.abortedReason + '.\n\n' +
+      'Writing here would have overwritten raw job descriptions, so it stopped instead.\n' +
+      'Re-run Initialize Sheets to repair the layout, then try again.'
+    );
     return;
   }
 
-  SpreadsheetApp.getUi().alert(
+  if (!result.checkedCount) {
+    ui.alert(repaired + 'Raw_Data has no rows to backfill.');
+    return;
+  }
+
+  ui.alert(
+    repaired +
     'Raw_Data date backfill completed.\n' +
     'Rows checked: ' + result.checkedCount + '\n' +
     'Dates filled in: ' + result.filledCount + '\n' +
     'Already had a date: ' + result.alreadySetCount + '\n' +
-    'Left blank: ' + result.unresolvedCount + '\n\n' +
+    'Left blank: ' + result.unresolvedCount + '\n' +
+    (result.skippedPayloadCount ? 'Skipped (cell held a payload): ' + result.skippedPayloadCount + '\n' : '') +
+    '\nOnly the posted_at column was written; raw_ref was read, never modified.\n\n' +
     'Blank rows carry no absolute posting date — the source gave only a relative label\n' +
     '("2 weeks ago"), or the raw payload is gone. They stay out of any date-based prune.\n\n' +
     'If the run timed out, just run it again — it resumes where it stopped.'
   );
+}
+
+function _readRawDataHeaderSnapshot() {
+  var sheet = _getRawDataSheet();
+  if (!sheet || sheet.getLastRow() < 1) return '';
+  return sheet.getRange(1, 1, 1, Math.min(sheet.getMaxColumns(), 6)).getValues()[0]
+    .map(function(v) { return _stringifyField(v).trim() || '-'; })
+    .join(' | ');
 }
 
 function importApifyRunByIdPrompt() {

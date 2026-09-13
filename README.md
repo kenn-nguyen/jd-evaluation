@@ -1,6 +1,6 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
-![version](https://img.shields.io/badge/version-0.6.1-blue) · Google Apps Script
+![version](https://img.shields.io/badge/version-0.6.2-blue) · Google Apps Script
 
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.
@@ -227,7 +227,7 @@ Everything is driven from the **Jobs Pipeline** menu:
 - **Triggers** — create/remove the scheduled auto-run.
 - **Maintenance** — Prune Old Data, Backfill Raw_Data Dates, Skip All No-Visa Jobs, Initialize Sheets, Validate Config.
   - *Prune Old Data* takes an age threshold for Job_Priority and Assigned, and additionally — regardless of age — deletes every Skip / Skip (auto) row, drops Raw_Data payloads for Submitted / Closed / Skip jobs, and drops orphaned Raw_Data rows. Run Sort & Rank afterwards to close rank gaps.
-  - *Backfill Raw_Data Dates* fills `posted_at` for rows written before v0.6.1 by re-reading each stored payload. Run it once after upgrading; it is chunked and resumable if it times out.
+  - *Backfill Raw_Data Dates* fills `posted_at` for rows written before v0.6.1 by re-reading each stored payload. It writes only the `posted_at` column — `raw_ref` is read, never modified — and refuses to run at all if the sheet's content shows the header is mislabelling which column is which. Chunked and resumable if it times out.
 
 **Priorities:** `P01` (rare bullseye) → `P04` (solid, default) → `P10` (skip). Most jobs land P03–P05.
 
