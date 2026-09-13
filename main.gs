@@ -1,4 +1,4 @@
-var APP_VERSION = '0.5.0';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.6.0';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -75,6 +75,7 @@ function onOpen() {
       .addItem('Remove Run Triggers', 'removeHourlyTriggers'))
     .addSubMenu(ui.createMenu('Maintenance')
       .addItem('Prune Old Data...', 'pruneOldDataPrompt')
+      .addItem('Backfill Raw_Data Dates', 'backfillRawDataPostedAtPrompt')
       .addItem('Skip All No-Visa Jobs', 'skipNoVisaJobsPrompt')
       .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
       .addItem('Validate Config', 'validateConfiguration'))
@@ -458,7 +459,15 @@ function runManualDetailImport() {
 
 function pruneOldDataPrompt() {
   var ui = SpreadsheetApp.getUi();
-  var response = ui.prompt('Prune Old Data', 'Delete rows older than how many days from Job_Priority, Raw_Data, and Assigned?\n(Leave blank for 90)', ui.ButtonSet.OK_CANCEL);
+  var response = ui.prompt(
+    'Prune Old Data',
+    'Age threshold in days for Job_Priority and Assigned?\n(Leave blank for 90)\n\n' +
+    'Also runs regardless of age:\n' +
+    '  • deletes ALL Skip / Skip (auto) rows from Job_Priority\n' +
+    '  • drops Raw_Data JD text for Submitted / Closed / Skip jobs\n' +
+    '  • drops orphaned Raw_Data rows',
+    ui.ButtonSet.OK_CANCEL
+  );
 
   if (response.getSelectedButton() !== ui.Button.OK) return;
 
@@ -470,14 +479,44 @@ function pruneOldDataPrompt() {
     return;
   }
 
+  // Order matters: both Job_Priority deletes run FIRST so the rows they remove show up as orphans
+  // to pruneRawData and pruneAssignedRows, which key off what is still tracked in Job_Priority.
   var jpDeleted = pruneExpiredJobRows(days);
-  var rawDeleted = pruneRawData(days);
+  var skipDeleted = pruneSkippedJobRows();
+  var rawDeleted = pruneRawData();
   var assignedDeleted = pruneAssignedRows(days);
 
   ui.alert(
-    'Deleted ' + (jpDeleted.prunedCount || 0) + ' from Job_Priority, ' +
-    rawDeleted + ' from Raw_Data, ' +
-    assignedDeleted + ' from Assigned.\n(Submitted rows in Job_Priority and active/flagged rows in Assigned are never pruned.)'
+    'Job_Priority: ' + (jpDeleted.prunedCount || 0) + ' expired + ' + skipDeleted + ' skipped row(s) deleted.\n' +
+    'Raw_Data: ' + rawDeleted + ' row(s) dropped (orphans + JD text for Submitted/Closed/Skip jobs).\n' +
+    'Assigned: ' + assignedDeleted + ' row(s) deleted.\n\n' +
+    'Kept: Submitted / Networking / Flagged and assignee-owned rows in Job_Priority (their JD text\n' +
+    'is dropped but the row stays), and active/flagged rows in Assigned.\n\n' +
+    'Run Sort & Rank to close the rank gaps left by the deletions.'
+  );
+}
+
+// One-shot after the posted_at migration: every Raw_Data row written before it has a blank date.
+// ensureWorkbookReadyForRuntime() performs the column insert if this workbook is still on the old
+// ['job_id', 'raw_ref'] schema, so this is safe to run as the very first action after an update.
+function backfillRawDataPostedAtPrompt() {
+  ensureWorkbookReadyForRuntime();
+
+  var result = backfillRawDataPostedAt();
+  if (!result.checkedCount) {
+    SpreadsheetApp.getUi().alert('Raw_Data has no rows to backfill.');
+    return;
+  }
+
+  SpreadsheetApp.getUi().alert(
+    'Raw_Data date backfill completed.\n' +
+    'Rows checked: ' + result.checkedCount + '\n' +
+    'Dates filled in: ' + result.filledCount + '\n' +
+    'Already had a date: ' + result.alreadySetCount + '\n' +
+    'Left blank: ' + result.unresolvedCount + '\n\n' +
+    'Blank rows carry no absolute posting date — the source gave only a relative label\n' +
+    '("2 weeks ago"), or the raw payload is gone. They stay out of any date-based prune.\n\n' +
+    'If the run timed out, just run it again — it resumes where it stopped.'
   );
 }
 

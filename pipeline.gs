@@ -56,7 +56,7 @@ function loadRuntimeConfig() {
     apifyRunInput: String(settings.APIFY_RUN_INPUT || '').trim() || null,
     apifyLookbackHours: Number(settings.APIFY_LOOKBACK_HOURS) || 0,
     apifyMaxLookbackHours: Number(settings.APIFY_MAX_LOOKBACK_HOURS) || 168,
-    vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || ''),
+    vertexProjectId: String(settings.VERTEX_PROJECT_ID || properties.getProperty('VERTEX_PROJECT_ID') || '').trim(),
     vertexLocation: String(settings.VERTEX_LOCATION || 'global'),
     // Settings cell wins (easy, no editor); Script Properties is the fallback / more-private option.
     geminiApiKey: _stringifyField(settings.GEMINI_API_KEY) || properties.getProperty('GEMINI_API_KEY') || '',
@@ -2175,6 +2175,43 @@ function _toDateField(value) {
   if (value instanceof Date) return isNaN(value.getTime()) ? '' : value;
   var d = new Date(value);
   return isNaN(d.getTime()) ? '' : d;
+}
+
+// Coerces a scraped timestamp into a real Date, or '' when it is not a usable ABSOLUTE date.
+// Handles the three shapes the actors emit: a Date, an ISO-ish string, and a Unix epoch in seconds
+// or milliseconds — as a number OR a numeric string, which is how the linkedin-job-detail actor's
+// job_info.listed_at arrives. That last case has to be converted explicitly, because
+// new Date("1699999999999") is an Invalid Date while new Date(1699999999999) is not.
+//
+// Two classes of junk are rejected rather than stored, both of which would otherwise be immortal in
+// a date-based prune: pre-1970 timestamps (epoch 0 / empty fields coerced to a date) and dates in
+// the FUTURE. A day of slack absorbs clock and timezone skew; anything beyond that is bad scraper
+// data, and '' (not age-prunable) is a safer answer than a date that never gets old.
+function _coerceValidPostedDate(value) {
+  if (value === undefined || value === null || value === '') return '';
+
+  var date;
+  if (value instanceof Date) {
+    date = value;
+  } else {
+    var text = String(value).trim();
+    if (!text) return '';
+    if (/^\d+$/.test(text)) {
+      // An all-digit value is an epoch or it is nothing. Never hand one to new Date(): it parses
+      // "0" as the year 2000 and "2020" as 2020-01-01, silently inventing a posting date out of a
+      // sentinel or a stray number.
+      if (text.length === 10) date = new Date(Number(text) * 1000);
+      else if (text.length === 13) date = new Date(Number(text));
+      else return '';
+    } else {
+      date = new Date(text);
+    }
+  }
+
+  if (isNaN(date.getTime())) return '';
+  if (date.getTime() <= 0) return '';
+  if (date.getTime() > Date.now() + 24 * 60 * 60 * 1000) return '';
+  return date;
 }
 
 function _pickFirstValue(item, keys) {

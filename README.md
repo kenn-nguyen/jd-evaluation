@@ -1,6 +1,6 @@
 # Job Priority — AI-powered LinkedIn job tracker & scorer in Google Sheets
 
-![version](https://img.shields.io/badge/version-0.5.0-blue) · Google Apps Script
+![version](https://img.shields.io/badge/version-0.6.0-blue) · Google Apps Script
 
 Turn a firehose of LinkedIn postings into a **ranked, de-duplicated shortlist** — scored by AI against
 *your own* résumé, right inside a Google Sheet.
@@ -68,7 +68,7 @@ and a re-posted role that's already scored is **not** paid for again.
 | **Prompt** | Where you edit **your profile** and the **scoring instructions** (see [Customizing scoring](#customizing-the-scoring)). |
 | **Settings** | All configuration (keys, model, schedule, routing rules). |
 | **Apify_Accounts** | Your Apify API token(s) — supports rotating multiple accounts. |
-| **Raw_Data** | Raw scraped payloads (kept only for jobs still in the queue). |
+| **Raw_Data** | Raw scraped payloads, one row per job: `job_id`, `posted_at`, `raw_ref`. Kept only for jobs still in the queue *and* still scoreable — a job that reaches Submitted / Closed / Skip has its payload dropped, since nothing re-reads a JD once the job leaves scoring. |
 | **Help** | In-sheet reference for statuses, owners, visa signals, and settings. |
 
 ---
@@ -225,7 +225,9 @@ Everything is driven from the **Jobs Pipeline** menu:
 - **Sort & Rank Sheets** — re-rank and re-mirror both sheets.
 - **Open Prompt & Profile** — jump to the Prompt sheet.
 - **Triggers** — create/remove the scheduled auto-run.
-- **Maintenance** — Prune Old Data, Skip All No-Visa Jobs, Initialize Sheets, Validate Config.
+- **Maintenance** — Prune Old Data, Backfill Raw_Data Dates, Skip All No-Visa Jobs, Initialize Sheets, Validate Config.
+  - *Prune Old Data* takes an age threshold for Job_Priority and Assigned, and additionally — regardless of age — deletes every Skip / Skip (auto) row, drops Raw_Data payloads for Submitted / Closed / Skip jobs, and drops orphaned Raw_Data rows. Run Sort & Rank afterwards to close rank gaps.
+  - *Backfill Raw_Data Dates* fills `posted_at` for rows written before v0.6.0 by re-reading each stored payload. Run it once after upgrading; it is chunked and resumable if it times out.
 
 **Priorities:** `P01` (rare bullseye) → `P04` (solid, default) → `P10` (skip). Most jobs land P03–P05.
 

@@ -94,7 +94,7 @@ var JOB_PRIORITY_HIDDEN_COLUMNS = [
   'sort_key'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
-var RAW_DATA_COLUMNS = ['job_id', 'raw_ref'];
+var RAW_DATA_COLUMNS = ['job_id', 'posted_at', 'raw_ref'];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
   var map = {};
   for (var i = 0; i < JOB_PRIORITY_COLUMNS.length; i += 1) {
@@ -587,7 +587,8 @@ function getRawDataIndex() {
   var maxCols = sheet.getMaxColumns();
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
   var rawRefColIndex = headers.indexOf('raw_ref');
-  if (rawRefColIndex === -1) rawRefColIndex = 1; // fallback: col 2 (0-based index 1)
+  if (rawRefColIndex === -1) rawRefColIndex = RAW_DATA_COLUMNS.indexOf('raw_ref');
+  var postedAtColIndex = headers.indexOf('posted_at'); // -1 on a pre-migration sheet
 
   var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
 
@@ -600,6 +601,7 @@ function getRawDataIndex() {
     byJobId[jobId] = {
       rowNumber: offset + 2,
       jobId: jobId,
+      postedAt: postedAtColIndex === -1 ? '' : (row[postedAtColIndex] || ''),
       rawRef: row[rawRefColIndex] || ''
     };
   });
@@ -898,6 +900,48 @@ function pruneExpiredJobRows(days) {
   sheet.deleteRows(JOB_PRIORITY_DATA_START_ROW + keepCount, prunedCount);
 
   return { checkedCount: numRows, prunedCount: prunedCount, remainingCount: keepCount };
+}
+
+// Deletes EVERY 'Skip' and 'Skip (auto)' row from Job_Priority regardless of age. Unlike the age
+// prune above this is unconditional, so it is wired only into the explicit 'Prune Old Data' menu
+// action and never into an automatic run.
+//
+// Trade-off worth knowing: the JP row IS the memory that a job was already judged. Once it is gone,
+// a later scrape re-imports that job as 'New' and it will be re-scored. The rules re-skip it on the
+// next routing pass, but a manual 'Skip' judgment is genuinely lost.
+//
+// Same mechanism as pruneExpiredJobRows — mark the sort key, one native sort (which carries rich
+// text + formats with each row), one deleteRows — so it stays O(1) in sheet ops at any size.
+function pruneSkippedJobRows() {
+  var sheet = _getJobPrioritySheet();
+  if (!sheet) return 0;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return 0;
+
+  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var IDX = JOB_PRIORITY_COLUMN_INDEX;
+  var PRUNE_KEY = '~~~~~~~~'; // '~' > any digit, so pruned rows sort AFTER every real (digit) sort_key
+
+  var statuses = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.status, numRows, 1).getValues();
+  var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
+
+  var prunedCount = 0;
+  for (var i = 0; i < numRows; i++) {
+    if (!_isSkip(statuses[i][0])) continue;
+    sortKeys[i][0] = PRUNE_KEY;
+    prunedCount++;
+  }
+
+  if (prunedCount === 0) return 0;
+
+  var keyRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1);
+  keyRange.setNumberFormat('@');
+  keyRange.setValues(sortKeys);
+  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, numRows, JOB_PRIORITY_COLUMNS.length)
+    .sort([{ column: IDX.sort_key, ascending: true }]);
+
+  sheet.deleteRows(JOB_PRIORITY_DATA_START_ROW + (numRows - prunedCount), prunedCount);
+  return prunedCount;
 }
 
 function deduplicateSimilarJdRows() {
@@ -1486,16 +1530,41 @@ function _backfillJdFingerprints() {
   }
 }
 
+// v0.5.0 and earlier stored Raw_Data as ['job_id', 'raw_ref']. posted_at sits BETWEEN them, so the
+// column has to be physically INSERTED: letting _setupRawDataSheet just rewrite the header in place
+// would relabel the existing raw_ref column as posted_at, and every stored JD would go invisible to
+// getRawDataIndex (which looks the column up by header name). insertColumnAfter shifts the existing
+// values right, so raw_ref keeps its data and lands under its own header again.
+function _migrateRawDataSchema(sheet) {
+  if (sheet.getLastRow() < 1 || sheet.getMaxColumns() < 2) return false;
+  var header = sheet.getRange(1, 1, 1, 2).getValues()[0];
+  if (_stringifyField(header[0]).trim() !== 'job_id') return false;
+  if (_stringifyField(header[1]).trim() !== 'raw_ref') return false;
+
+  sheet.insertColumnAfter(1);
+  sheet.getRange(1, 2).setValue('posted_at');
+  return true;
+}
+
 function _setupRawDataSheet(sheet) {
+  _migrateRawDataSchema(sheet);
   _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
   sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
   sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length)
     .setFontWeight('bold')
     .setBackground('#d0e0e3');
   sheet.setFrozenRows(1);
+
+  var postedCol = RAW_DATA_COLUMNS.indexOf('posted_at') + 1;
+  var rawRefCol = RAW_DATA_COLUMNS.indexOf('raw_ref') + 1;
   sheet.setColumnWidth(1, 120);
-  sheet.setColumnWidth(2, 180);
-  sheet.hideColumns(2, RAW_DATA_COLUMNS.length - 1);
+  sheet.setColumnWidth(postedCol, 140);
+  sheet.setColumnWidth(rawRefCol, 180);
+  // An inserted column inherits the format of the one to its left — that is job_id's '@' (plain
+  // text), which would render every Date as a raw string. Force a real date format instead.
+  sheet.getRange(2, postedCol, Math.max(sheet.getMaxRows() - 1, 1), 1).setNumberFormat('yyyy-mm-dd hh:mm');
+  // Only raw_ref is hidden; job_id and posted_at stay visible so the sheet can be eyeballed.
+  sheet.hideColumns(rawRefCol, 1);
 }
 
 function _getApifyAccountsSheet() {
@@ -2253,6 +2322,37 @@ function _extractJobDescriptionFromRawRef(rawRef) {
   return '';
 }
 
+// Digs the posting date back out of a stored raw_ref blob. Mirrors _extractSourceUrlFromRawRef:
+// the linkedin-job-detail actor nests its fields under job_info, the search actor keeps them flat,
+// and _serializeRawRef's compact (>40k) form keeps a flat publishedAt — so try the nested object
+// first, then the top level.
+//
+// Relative labels ('2 weeks ago') are deliberately NOT parsed: they only mean something relative to
+// the run that scraped them, and that anchor is gone by the time the row is read back. Such a row
+// resolves to '' and simply is not age-prunable, which beats inventing a wrong date.
+function _extractPostedAtFromRawRef(rawRef) {
+  if (!_stringifyField(rawRef)) return '';
+
+  var parsed;
+  try {
+    parsed = JSON.parse(String(rawRef));
+  } catch (e) {
+    return '';
+  }
+  if (!parsed) return '';
+
+  var sources = [parsed.job_info || {}, parsed];
+  var keys = ['listed_at', 'original_listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted'];
+
+  for (var s = 0; s < sources.length; s++) {
+    for (var i = 0; i < keys.length; i++) {
+      var hit = _coerceValidPostedDate(sources[s][keys[i]]);
+      if (hit) return hit;
+    }
+  }
+  return '';
+}
+
 function _extractSourceUrlFromRawRef(rawRef) {
   if (!rawRef) return '';
   try {
@@ -2395,15 +2495,81 @@ function _upsertRawDataRows(jobs) {
 function _buildRawDataPayload(job, existing) {
   return {
     jobId: _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId),
+    postedAt: _resolveRawDataPostedAt(job, existing),
     rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || ''
   };
+}
+
+// The absolute posting date, stored alongside job_id so Raw_Data can be aged on its own without
+// joining back to Job_Priority. Preference order: the structured timestamp the actor gave us, then
+// the displayed 'posted' value (already an absolute date whenever _derivePostedDate could resolve
+// one), then whatever is recoverable from the raw blob, then whatever the row already had — so a
+// re-import that arrives without a date never erases a date we previously worked out.
+// A relative label resolves to '' at every step, which is correct: that row is not age-prunable.
+function _resolveRawDataPostedAt(job, existing) {
+  return _coerceValidPostedDate(job && job.publishedAt) ||
+    _coerceValidPostedDate(job && job.posted) ||
+    _extractPostedAtFromRawRef(job && job.rawRef) ||
+    _coerceValidPostedDate(existing && existing.postedAt) ||
+    '';
 }
 
 function _toRawDataRow(rawData) {
   return [
     rawData.jobId || '',
+    rawData.postedAt || '',
     rawData.rawRef || ''
   ];
+}
+
+// Fills posted_at for Raw_Data rows that do not have one yet, by digging the date back out of each
+// stored raw_ref. Needed once after the schema migration (every pre-existing row has a blank
+// posted_at), and harmless to re-run afterwards.
+//
+// Chunked because raw_ref holds up to 40k chars per row — reading the whole column at once is what
+// blows the memory ceiling on a large sheet. Rows that already carry a usable date are skipped, so
+// if a run hits the 6-minute limit, running it again resumes where it stopped instead of redoing
+// the work.
+function backfillRawDataPostedAt() {
+  var result = { checkedCount: 0, filledCount: 0, alreadySetCount: 0, unresolvedCount: 0 };
+  var sheet = _getRawDataSheet();
+  if (!sheet) return result;
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return result;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
+  var postedCol = headers.indexOf('posted_at') + 1;
+  var rawRefCol = headers.indexOf('raw_ref') + 1;
+  if (!postedCol || !rawRefCol) return result; // sheet has not been migrated yet
+
+  var CHUNK = 300;
+  for (var start = 2; start <= lastRow; start += CHUNK) {
+    var count = Math.min(CHUNK, lastRow - start + 1);
+    var posted = sheet.getRange(start, postedCol, count, 1).getValues();
+    var rawRefs = sheet.getRange(start, rawRefCol, count, 1).getValues();
+    var dirty = false;
+
+    for (var i = 0; i < count; i++) {
+      result.checkedCount++;
+      if (_coerceValidPostedDate(posted[i][0])) {
+        result.alreadySetCount++;
+        continue;
+      }
+      var found = _extractPostedAtFromRawRef(rawRefs[i][0]);
+      if (found) {
+        posted[i][0] = found;
+        result.filledCount++;
+        dirty = true;
+      } else {
+        result.unresolvedCount++;
+      }
+    }
+
+    if (dirty) sheet.getRange(start, postedCol, count, 1).setValues(posted);
+  }
+
+  return result;
 }
 
 function _hasAnyRawPayload(record) {
@@ -2411,7 +2577,7 @@ function _hasAnyRawPayload(record) {
 }
 
 // Returns a set (plain object) of all job IDs tracked in Job_Priority — both canonical and merged.
-// Used by pruneRawData to avoid deleting raw_refs for jobs that are still being tracked.
+// Used by pruneAssignedRows to detect Assigned rows whose Job_Priority parent is gone.
 function _getActiveJobPriorityIds() {
   var result = {};
   var jpSheet = _getJobPrioritySheet();
@@ -2430,16 +2596,48 @@ function _getActiveJobPriorityIds() {
   return result;
 }
 
-function pruneRawData(days) {
+// Returns a map of job ID -> Job_Priority status, covering canonical AND merged IDs (a merged ID
+// inherits its primary row's status). A blank status cell normalizes to 'New', matching how the
+// rest of the workbook reads an empty status — so every value is truthy and key presence alone
+// means "this ID is still tracked in Job_Priority".
+function _getJobPriorityStatusByJobId() {
+  var result = {};
+  var jpSheet = _getJobPrioritySheet();
+  if (!jpSheet) return result;
+  var lastRow = jpSheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return result;
+  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var primaryIds = jpSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.job_id, rowCount, 1).getValues();
+  var mergedIds  = jpSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.merged_job_ids, rowCount, 1).getValues();
+  var statuses   = jpSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, rowCount, 1).getValues();
+  for (var i = 0; i < primaryIds.length; i++) {
+    var status = _stringifyField(statuses[i][0]).trim() || 'New';
+    var pid = _stringifyField(primaryIds[i][0]).trim();
+    if (pid) result[pid] = status;
+    var m = _stringifyField(mergedIds[i][0]);
+    if (m) m.split(',').forEach(function(s) { var id = s.trim(); if (id) result[id] = status; });
+  }
+  return result;
+}
+
+// Statuses the routing rules can never move back into a scoreable state, so the job's JD text will
+// never be read again. 'Skip (auto)' is deliberately NOT here: _routeNewJobs may lift it back to
+// 'New', which makes it reevaluation-eligible again — and reevaluation needs the JD.
+function _isRawRefExpendableStatus(status) {
+  var v = _stringifyField(status).trim();
+  return v === 'Submitted' || v === STATUS_CLOSED || v === 'Skip';
+}
+
+function pruneRawData() {
   var sheet = _getRawDataSheet();
   if (!sheet) return 0;
 
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return 0;
 
-  // Load all IDs still in Job_Priority so we never orphan their raw job descriptions.
-  // A row whose job is still tracked in JP is kept regardless of age.
-  var activeJobIds = _getActiveJobPriorityIds();
+  // One JP scan gives both facts we need per raw row: whether the job is still tracked at all,
+  // and (if so) its status. Key presence = tracked; the value decides whether the JD is still live.
+  var jpStatusById = _getJobPriorityStatusByJobId();
 
   var maxCols = sheet.getMaxColumns();
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
@@ -2449,12 +2647,20 @@ function pruneRawData(days) {
   var dataRowCount = lastRow - 1;
   var values = sheet.getRange(2, 1, dataRowCount, maxCols).getValues();
 
-  // Keep raw_refs for jobs still tracked in Job_Priority (primary OR merged id) — their JD may be
-  // needed for re-scoring. Every other row is an ORPHAN (its JP row was deleted/pruned, or a
-  // scrape that never landed in JP), so its raw_ref is dead weight — dropped regardless of age.
+  // Two ways a raw row becomes dead weight, both dropped regardless of age:
+  //   ORPHAN   — no JP row tracks this id (its JP row was deleted/pruned, or the scrape never
+  //              landed in JP), so nothing can ever read the JD back.
+  //   TERMINAL — a JP row tracks it, but at a status no rule can return to scoring (Submitted /
+  //              Closed / manual Skip). The JP row itself stays — that is your application history
+  //              and the dedup memory that stops a re-scrape re-adding the job as 'New'. Only the
+  //              JD blob goes, and that blob is up to 40k chars per job (see _serializeRawRef).
+  // Everything else is live backlog and keeps its JD for re-scoring.
   var keep = values.filter(function(row) {
     var id = _stringifyField(row[jobIdColIndex]).trim();
-    return id && activeJobIds[id];
+    if (!id) return false;
+    var status = jpStatusById[id];
+    if (!status) return false;
+    return !_isRawRefExpendableStatus(status);
   });
 
   var deletedCount = dataRowCount - keep.length;
