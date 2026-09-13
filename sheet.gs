@@ -99,9 +99,26 @@ var RAW_DATA_COLUMNS = ['job_id', 'raw_ref', 'posted_at', 'listed_at'];
 // posted_at = when the ROLE was first posted (drives the age prune); listed_at = when THIS LISTING
 // went live (mirrors the 'posted' column on Job_Priority and Assigned). LinkedIn reposts, so the
 // two can sit months apart — which is the whole reason both are worth showing.
+// Each column's resolve(rawRef, anchor) mirrors the order its write-path counterpart uses, so a
+// backfilled row lands on the same value the crawl would have written. `anchor` is the scrape time
+// (Job_Priority.imported_at) and may be absent, in which case the relative-label path is skipped.
 var RAW_DATA_DATE_COLUMNS = [
-  { name: 'posted_at', extract: function(r) { return _extractPostedAtFromRawRef(r); } },
-  { name: 'listed_at', extract: function(r) { return _extractListedAtFromRawRef(r); } }
+  {
+    name: 'posted_at',
+    resolve: function(rawRef, anchor) {
+      // Absolute first-posted fields win; a scraped label is only a last resort.
+      return _extractPostedAtFromRawRef(rawRef) || _extractRelativeDateFromRawRef(rawRef, anchor) || '';
+    }
+  },
+  {
+    name: 'listed_at',
+    resolve: function(rawRef, anchor) {
+      // The relative label IS the listing date and moves when a job is re-posted, so it beats
+      // publishedAt, which stays pinned to the original posting. Same precedence as
+      // _resolveRawDataListedAt, which reads job.posted (the resolved label) before the payload.
+      return _extractRelativeDateFromRawRef(rawRef, anchor) || _extractListedAtFromRawRef(rawRef) || '';
+    }
+  }
 ];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
   var map = {};
@@ -2444,6 +2461,58 @@ function _extractListedAtFromRawRef(rawRef) {
     ['listed_at', 'publishedAt', 'postedAt', 'listedAt', 'createdAt', 'postedTime', 'posted']);
 }
 
+// Reconstructs the date a relative label ('4 days ago') pointed at. Raw_Data does not store the
+// label's anchor, but Job_Priority.imported_at IS that anchor: _normalizeJob sets both the resolved
+// posted date and importedAt from the same runStartedAt. So this reproduces the value the crawl
+// originally computed rather than estimating it — anchoring to "now" instead would drift by exactly
+// however long ago the scrape ran.
+//
+// The label is picked with the same _pickFirstValue key order _normalizeJob uses, so the same field
+// is chosen here as was chosen then.
+function _extractRelativeDateFromRawRef(rawRef, anchorDate) {
+  if (!anchorDate || !_stringifyField(rawRef)) return '';
+
+  var parsed;
+  try {
+    parsed = JSON.parse(String(rawRef));
+  } catch (e) {
+    return '';
+  }
+  if (!parsed) return '';
+
+  var keys = ['postedTime', 'postedAt', 'posted', 'publishedAt', 'listedAt'];
+  var label = _stringifyField(_pickFirstValue(parsed.job_info || {}, keys)) ||
+    _stringifyField(_pickFirstValue(parsed, keys));
+
+  var resolved = _parseRelativePosted(label, anchorDate);
+  return resolved ? _coerceValidPostedDate(resolved) : '';
+}
+
+// job_id -> scrape time, covering canonical AND merged IDs. Reads only the three narrow columns it
+// needs; Job_Priority rows are cheap, but the payload is never involved either way.
+function _getJobPriorityImportedAtByJobId() {
+  var map = {};
+  var jpSheet = _getJobPrioritySheet();
+  if (!jpSheet) return map;
+  var lastRow = jpSheet.getLastRow();
+  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return map;
+
+  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
+  var ids = jpSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.job_id, rowCount, 1).getValues();
+  var mergedIds = jpSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.merged_job_ids, rowCount, 1).getValues();
+  var importedAts = jpSheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.imported_at, rowCount, 1).getValues();
+
+  for (var i = 0; i < ids.length; i++) {
+    var at = _coerceValidPostedDate(importedAts[i][0]);
+    if (!at) continue;
+    var pid = _stringifyField(ids[i][0]).trim();
+    if (pid) map[pid] = at;
+    var m = _stringifyField(mergedIds[i][0]);
+    if (m) m.split(',').forEach(function(x) { var id = x.trim(); if (id) map[id] = at; });
+  }
+  return map;
+}
+
 function _extractSourceUrlFromRawRef(rawRef) {
   if (!rawRef) return '';
   try {
@@ -2665,12 +2734,13 @@ function backfillRawDataPostedAt(options) {
   var maxCols = sheet.getMaxColumns();
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
   var rawRefCol = headers.indexOf('raw_ref') + 1;
-  if (!rawRefCol) return result; // sheet has not been migrated yet
+  var idCol = headers.indexOf('job_id') + 1;
+  if (!rawRefCol || !idCol) return result; // sheet has not been migrated yet
 
   var targets = [];
   RAW_DATA_DATE_COLUMNS.forEach(function(spec) {
     var col = headers.indexOf(spec.name) + 1;
-    if (col) targets.push({ col: col, extract: spec.extract, name: spec.name });
+    if (col) targets.push({ col: col, resolve: spec.resolve, name: spec.name });
   });
   if (!targets.length) return result;
 
@@ -2695,10 +2765,17 @@ function backfillRawDataPostedAt(options) {
     }
   }
 
+  // A relative label ('4 days ago') only means something against the run that scraped it, and that
+  // anchor is Job_Priority.imported_at. Without it, listed_at would fall back to publishedAt, which
+  // is pinned to the ORIGINAL posting — older than the real listing date, so the age prune would
+  // retire rows that are still actively listed.
+  var importedAtByJobId = _getJobPriorityImportedAtByJobId();
+
   var CHUNK = 300;
   for (var start = 2; start <= lastRow; start += CHUNK) {
     var count = Math.min(CHUNK, lastRow - start + 1);
     var rawRefs = sheet.getRange(start, rawRefCol, count, 1).getValues();
+    var ids = sheet.getRange(start, idCol, count, 1).getValues();
 
     for (var ti = 0; ti < targets.length; ti++) {
       var target = targets[ti];
@@ -2721,7 +2798,7 @@ function backfillRawDataPostedAt(options) {
           continue;
         }
 
-        var found = target.extract(rawRefs[i][0]);
+        var found = target.resolve(rawRefs[i][0], importedAtByJobId[_stringifyField(ids[i][0]).trim()]);
         if (!found) {
           // Never wipe a date we cannot re-derive — a missing payload is not evidence of no date.
           if (existingDate) result.alreadySetCount++;

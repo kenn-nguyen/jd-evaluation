@@ -1,4 +1,4 @@
-var APP_VERSION = '0.8.1';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.8.2';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -554,7 +554,9 @@ function backfillRawDataPostedAtPrompt() {
     'Already correct: ' + result.alreadySetCount + '\n' +
     'Left blank: ' + result.unresolvedCount + '\n' +
     (result.skippedPayloadCount ? 'Skipped (cell held a payload): ' + result.skippedPayloadCount + '\n' : '') +
-    '\nOnly the posted_at column was written; raw_ref was read, never modified.\n\n' +
+    '\nOnly the date columns were written; raw_ref was read, never modified.\n' +
+    'Relative labels ("4 days ago") are resolved against that row\'s imported_at — the run\n' +
+    'that scraped it — so a backfilled date matches what the crawl would have written.\n\n' +
     'Blank rows carry no absolute posting date — the source gave only a relative label\n' +
     '("2 weeks ago"), or the raw payload is gone. They stay out of any date-based prune.\n\n' +
     'If the run timed out, just run it again — it resumes where it stopped.'
