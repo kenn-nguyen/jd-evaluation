@@ -2614,13 +2614,21 @@ function _resolveRawDataPostedAt(job, existing) {
     '';
 }
 
-// listed_at is the listing date, matching the 'posted' column on Job_Priority and Assigned. Unlike
-// posted_at it takes job.publishedAt readily — _normalizeJobDetail sets that from info.listed_at,
-// which is precisely this column's meaning.
+// listed_at is the listing date, matching the 'posted' column on Job_Priority and Assigned.
+//
+// job.posted comes FIRST, and that ordering is the whole point. _derivePostedDate already resolves
+// a relative label ("4 days ago") against the run clock, and on LinkedIn search results that label
+// IS the listing date — it tracks re-posts, while publishedAt stays pinned to the original. A real
+// JPMorganChase row had publishedAt 2026-08-22 and postedTime "4 days ago" on 2026-09-13: eighteen
+// days apart. Reading the payload first could only ever see publishedAt, so listed_at silently
+// collapsed onto posted_at and the re-post was invisible.
+//
+// The payload is still consulted next, for the detail actor's job_info.listed_at, and publishedAt
+// remains the last resort for items that carry no label at all.
 function _resolveRawDataListedAt(job, existing) {
-  return _extractListedAtFromRawRef(job && job.rawRef) ||
+  return _coerceValidPostedDate(job && job.posted) ||
+    _extractListedAtFromRawRef(job && job.rawRef) ||
     _coerceValidPostedDate(job && job.publishedAt) ||
-    _coerceValidPostedDate(job && job.posted) ||
     _coerceValidPostedDate(existing && existing.listedAt) ||
     '';
 }
