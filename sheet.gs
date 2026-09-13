@@ -94,7 +94,7 @@ var JOB_PRIORITY_HIDDEN_COLUMNS = [
   'sort_key'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
-var RAW_DATA_COLUMNS = ['job_id', 'raw_ref', 'posted_at', 'listed_at'];
+var RAW_DATA_COLUMNS = ['job_id', 'raw_ref', 'posted_at', 'listed_at', 'imported_at'];
 // The derived date columns, in one place so setup, backfill and formatting stay in step.
 // posted_at = when the ROLE was first posted (drives the age prune); listed_at = when THIS LISTING
 // went live (mirrors the 'posted' column on Job_Priority and Assigned). LinkedIn reposts, so the
@@ -118,6 +118,12 @@ var RAW_DATA_DATE_COLUMNS = [
       // _resolveRawDataListedAt, which reads job.posted (the resolved label) before the payload.
       return _extractRelativeDateFromRawRef(rawRef, anchor) || _extractListedAtFromRawRef(rawRef) || '';
     }
+  },
+  {
+    name: 'imported_at',
+    // When the scrape run that produced this payload started. Not derivable from the payload —
+    // it is the anchor itself, which is exactly what `anchor` already carries.
+    resolve: function(rawRef, anchor) { return anchor || ''; }
   }
 ];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
@@ -613,6 +619,7 @@ function getRawDataIndex() {
   if (rawRefColIndex === -1) rawRefColIndex = RAW_DATA_COLUMNS.indexOf('raw_ref');
   var postedAtColIndex = headers.indexOf('posted_at'); // -1 on a pre-migration sheet
   var listedAtColIndex = headers.indexOf('listed_at');
+  var importedAtColIndex = headers.indexOf('imported_at');
 
   var values = sheet.getRange(2, 1, lastRow - 1, maxCols).getValues();
 
@@ -627,6 +634,7 @@ function getRawDataIndex() {
       jobId: jobId,
       postedAt: postedAtColIndex === -1 ? '' : (row[postedAtColIndex] || ''),
       listedAt: listedAtColIndex === -1 ? '' : (row[listedAtColIndex] || ''),
+      importedAt: importedAtColIndex === -1 ? '' : (row[importedAtColIndex] || ''),
       rawRef: row[rawRefColIndex] || ''
     };
   });
@@ -2660,7 +2668,8 @@ function _buildRawDataPayload(job, existing) {
     jobId: _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId),
     rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || '',
     postedAt: _resolveRawDataPostedAt(job, existing),
-    listedAt: _resolveRawDataListedAt(job, existing)
+    listedAt: _resolveRawDataListedAt(job, existing),
+    importedAt: _resolveRawDataImportedAt(job, existing)
   };
 }
 
@@ -2702,12 +2711,25 @@ function _resolveRawDataListedAt(job, existing) {
     '';
 }
 
+// When the scrape run that produced the stored payload started. It must stay in lockstep with
+// raw_ref: imported_at is the anchor every relative label in that payload is resolved against, so
+// advancing it while raw_ref stays put would silently re-date every one of them. It therefore only
+// moves when this crawl actually brought a new payload — mirroring how rawRef itself is chosen
+// above, which keeps the existing blob when the incoming job has none.
+function _resolveRawDataImportedAt(job, existing) {
+  var broughtPayload = !!_stringifyField(job && job.rawRef);
+  var incoming = _coerceValidPostedDate(job && job.importedAt);
+  var stored = _coerceValidPostedDate(existing && existing.importedAt);
+  return (broughtPayload ? (incoming || stored) : (stored || incoming)) || '';
+}
+
 function _toRawDataRow(rawData) {
   return [
     rawData.jobId || '',
     rawData.rawRef || '',
     rawData.postedAt || '',
-    rawData.listedAt || ''
+    rawData.listedAt || '',
+    rawData.importedAt || ''
   ];
 }
 
