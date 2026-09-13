@@ -1,4 +1,4 @@
-var APP_VERSION = '0.7.2';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.8.0';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -461,9 +461,11 @@ function pruneOldDataPrompt() {
   var ui = SpreadsheetApp.getUi();
   var response = ui.prompt(
     'Prune Old Data',
-    'Age threshold in days for Job_Priority and Assigned?\n(Leave blank for 90)\n\n' +
+    'Age threshold in days?\n(Leave blank for 90)\n\n' +
+    'Job_Priority rows age out on listed_at — when the listing last went live.\n' +
+    'ONLY Submitted and Networking are never pruned, at any age.\n' +
+    'New / Filled / Flagged / Skip / Skip (auto) / Closed all age out.\n\n' +
     'Also runs regardless of age:\n' +
-    '  • deletes ALL Skip / Skip (auto) rows from Job_Priority\n' +
     '  • drops Raw_Data JD text for Submitted / Closed / Skip jobs\n' +
     '  • drops orphaned Raw_Data rows',
     ui.ButtonSet.OK_CANCEL
@@ -479,19 +481,18 @@ function pruneOldDataPrompt() {
     return;
   }
 
-  // Order matters: both Job_Priority deletes run FIRST so the rows they remove show up as orphans
-  // to pruneRawData and pruneAssignedRows, which key off what is still tracked in Job_Priority.
+  // Order matters: the Job_Priority delete runs FIRST so the rows it removes show up as orphans to
+  // pruneRawData and pruneAssignedRows, which key off what is still tracked in Job_Priority.
   var jpDeleted = pruneExpiredJobRows(days);
-  var skipDeleted = pruneSkippedJobRows();
   var rawDeleted = pruneRawData();
   var assignedDeleted = pruneAssignedRows(days);
 
   ui.alert(
-    'Job_Priority: ' + (jpDeleted.prunedCount || 0) + ' expired + ' + skipDeleted + ' skipped row(s) deleted.\n' +
+    'Job_Priority: ' + (jpDeleted.prunedCount || 0) + ' row(s) deleted (aged out on listed_at).\n' +
     'Raw_Data: ' + rawDeleted + ' row(s) dropped (orphans + JD text for Submitted/Closed/Skip jobs).\n' +
     'Assigned: ' + assignedDeleted + ' row(s) deleted.\n\n' +
-    'Kept: Submitted / Networking / Flagged and assignee-owned rows in Job_Priority (their JD text\n' +
-    'is dropped but the row stays), and active/flagged rows in Assigned.\n\n' +
+    'Never pruned: Submitted and Networking rows in Job_Priority (a Submitted row keeps its\n' +
+    'place but loses its JD text), and active/flagged rows in Assigned.\n\n' +
     'Run Sort & Rank to close the rank gaps left by the deletions.'
   );
 }

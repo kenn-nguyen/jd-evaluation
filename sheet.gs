@@ -849,9 +849,9 @@ function deduplicateExistingJobRows() {
   };
 }
 
-// job_id -> posting time (ms), read from Raw_Data. Deliberately reads only the two narrow date/id
+// job_id -> time (ms) from one Raw_Data date column. Deliberately reads only the two narrow id/date
 // columns and never raw_ref — the payload column is what made earlier Raw_Data joins time out.
-function _getRawDataPostedAtByJobId() {
+function _getRawDataDateByJobId(columnName) {
   var map = {};
   var sheet = _getRawDataSheet();
   if (!sheet) return map;
@@ -860,11 +860,11 @@ function _getRawDataPostedAtByJobId() {
 
   var headers = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
   var idCol = headers.indexOf('job_id') + 1;
-  var postedCol = headers.indexOf('posted_at') + 1;
-  if (!idCol || !postedCol) return map;
+  var dateCol = headers.indexOf(columnName) + 1;
+  if (!idCol || !dateCol) return map;
 
   var ids = sheet.getRange(2, idCol, lastRow - 1, 1).getValues();
-  var dates = sheet.getRange(2, postedCol, lastRow - 1, 1).getValues();
+  var dates = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues();
   for (var i = 0; i < ids.length; i++) {
     var id = _stringifyField(ids[i][0]).trim();
     if (!id) continue;
@@ -890,29 +890,33 @@ function pruneExpiredJobRows(days) {
   // Decide keep/prune from CHEAP column reads — no Raw_Data join and no per-row record build
   // (getExistingJobRecords), and no full-sheet rewrite (replaceAllJobs) — both timed out at scale.
   var statuses = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.status, numRows, 1).getValues();
-  var owners = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.owner, numRows, 1).getValues();
   var importedAts = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.imported_at, numRows, 1).getValues();
   var posteds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.posted, numRows, 1).getValues();
   var jobIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
   var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
-  // Posting age comes from Raw_Data.posted_at, which is always a real Date. The 'posted' column
-  // here is a DISPLAY value and frequently does not parse: a detail-actor job stores a raw epoch
-  // string, and new Date("1741082400000") is Invalid, so _toComparableTime returned 0 and this
-  // whole rule silently collapsed to imported_at — letting a long-dead posting scraped last week
-  // look brand new forever. Two narrow date columns, never the payload, so the join stays cheap.
-  var postedAtByJobId = _getRawDataPostedAtByJobId();
+  // Posting age comes from Raw_Data.listed_at — when THIS LISTING went live. A role LinkedIn has
+  // recently re-posted is still being actively advertised, so it survives; the prune is targeting
+  // listings nobody has refreshed in `days`. (posted_at, the first-posted date, would instead age
+  // out a long-open-but-still-advertised role, which is not what we want here.)
+  //
+  // Falling back to the Job_Priority 'posted' column is consistent rather than approximate: that
+  // column is also the listing date. It is a DISPLAY value though, and does not always parse, so
+  // Raw_Data is preferred. Two narrow columns, never the payload, so the join stays cheap.
+  var listedAtByJobId = _getRawDataDateByJobId('listed_at');
 
   var prunedCount = 0;
   for (var i = 0; i < numRows; i++) {
     var status = _stringifyField(statuses[i][0]);
-    // Always keep: active outreach, last-mile items, and assignee work.
-    if (status === 'Submitted' || status === 'Networking' || status === 'Flagged' || _isAssignee(owners[i][0])) {
+    // The only two statuses that survive at any age. Everything else — New, Filled, Flagged,
+    // Skip, Skip (auto), Closed — ages out on listed_at. Note that pruning an assignee-owned row
+    // orphans its Assigned row, which pruneAssignedRows then removes in the same run.
+    if (status === 'Submitted' || status === 'Networking') {
       continue;
     }
     var importedTime = _toComparableTime(importedAts[i][0]);
     // posted parses to a date for most jobs, or 0 for a relative label ("2 weeks ago") → falls back
     // to importedAt. An old posting is likely filled/closed, so prune on posting age too.
-    var postedTime = postedAtByJobId[_stringifyField(jobIds[i][0]).trim()] || _toComparableTime(posteds[i][0]);
+    var postedTime = listedAtByJobId[_stringifyField(jobIds[i][0]).trim()] || _toComparableTime(posteds[i][0]);
     if (!importedTime && !postedTime) continue; // no usable timestamp → keep
     var importOld = importedTime && (nowMs - importedTime) > expiryMs;
     var postedOld = postedTime && (nowMs - postedTime) > expiryMs;
@@ -940,48 +944,6 @@ function pruneExpiredJobRows(days) {
   sheet.deleteRows(JOB_PRIORITY_DATA_START_ROW + keepCount, prunedCount);
 
   return { checkedCount: numRows, prunedCount: prunedCount, remainingCount: keepCount };
-}
-
-// Deletes EVERY 'Skip' and 'Skip (auto)' row from Job_Priority regardless of age. Unlike the age
-// prune above this is unconditional, so it is wired only into the explicit 'Prune Old Data' menu
-// action and never into an automatic run.
-//
-// Trade-off worth knowing: the JP row IS the memory that a job was already judged. Once it is gone,
-// a later scrape re-imports that job as 'New' and it will be re-scored. The rules re-skip it on the
-// next routing pass, but a manual 'Skip' judgment is genuinely lost.
-//
-// Same mechanism as pruneExpiredJobRows — mark the sort key, one native sort (which carries rich
-// text + formats with each row), one deleteRows — so it stays O(1) in sheet ops at any size.
-function pruneSkippedJobRows() {
-  var sheet = _getJobPrioritySheet();
-  if (!sheet) return 0;
-  var lastRow = sheet.getLastRow();
-  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return 0;
-
-  var numRows = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
-  var IDX = JOB_PRIORITY_COLUMN_INDEX;
-  var PRUNE_KEY = '~~~~~~~~'; // '~' > any digit, so pruned rows sort AFTER every real (digit) sort_key
-
-  var statuses = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.status, numRows, 1).getValues();
-  var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
-
-  var prunedCount = 0;
-  for (var i = 0; i < numRows; i++) {
-    if (!_isSkip(statuses[i][0])) continue;
-    sortKeys[i][0] = PRUNE_KEY;
-    prunedCount++;
-  }
-
-  if (prunedCount === 0) return 0;
-
-  var keyRange = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1);
-  keyRange.setNumberFormat('@');
-  keyRange.setValues(sortKeys);
-  sheet.getRange(JOB_PRIORITY_DATA_START_ROW, 1, numRows, JOB_PRIORITY_COLUMNS.length)
-    .sort([{ column: IDX.sort_key, ascending: true }]);
-
-  sheet.deleteRows(JOB_PRIORITY_DATA_START_ROW + (numRows - prunedCount), prunedCount);
-  return prunedCount;
 }
 
 function deduplicateSimilarJdRows() {
