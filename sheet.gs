@@ -94,7 +94,7 @@ var JOB_PRIORITY_HIDDEN_COLUMNS = [
   'sort_key'
 ];
 var JOB_PRIORITY_COLUMNS = JOB_PRIORITY_VISIBLE_COLUMNS.concat(JOB_PRIORITY_HIDDEN_COLUMNS);
-var RAW_DATA_COLUMNS = ['job_id', 'posted_at', 'raw_ref'];
+var RAW_DATA_COLUMNS = ['job_id', 'raw_ref', 'posted_at'];
 var JOB_PRIORITY_COLUMN_INDEX = (function() {
   var map = {};
   for (var i = 0; i < JOB_PRIORITY_COLUMNS.length; i += 1) {
@@ -278,9 +278,7 @@ function ensureWorkbookReadyForRuntime() {
     _syncJobPrioritySchemaForRuntime(jobSheet);
   }
 
-  if (rawDataSheet.getMaxColumns() < RAW_DATA_COLUMNS.length ||
-      rawDataSheet.getLastRow() < 1 ||
-      !_headerMatches(rawDataSheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).getValues()[0], RAW_DATA_COLUMNS)) {
+  if (!_rawDataSchemaIsCurrent(rawDataSheet)) {
     _setupRawDataSheet(rawDataSheet);
   }
 
@@ -1530,26 +1528,99 @@ function _backfillJdFingerprints() {
   }
 }
 
-// v0.5.0 and earlier stored Raw_Data as ['job_id', 'raw_ref']. posted_at sits BETWEEN them, so the
-// column has to be physically INSERTED: letting _setupRawDataSheet just rewrite the header in place
-// would relabel the existing raw_ref column as posted_at, and every stored JD would go invisible to
-// getRawDataIndex (which looks the column up by header name). insertColumnAfter shifts the existing
-// values right, so raw_ref keeps its data and lands under its own header again.
-function _migrateRawDataSchema(sheet) {
-  if (sheet.getLastRow() < 1 || sheet.getMaxColumns() < 2) return false;
-  var header = sheet.getRange(1, 1, 1, 2).getValues()[0];
-  if (_stringifyField(header[0]).trim() !== 'job_id') return false;
-  if (_stringifyField(header[1]).trim() !== 'raw_ref') return false;
+// True only when Raw_Data already has exactly the current header. Every path that WRITES to
+// Raw_Data checks this first — checking getMaxColumns() instead was the v0.6.0 bug: a normal sheet
+// carries 26 columns by default, so a width test passes on an unmigrated sheet and the writer lays
+// down rows in the new column order while the header still describes the old one.
+function _rawDataSchemaIsCurrent(sheet) {
+  if (!sheet || sheet.getMaxColumns() < RAW_DATA_COLUMNS.length || sheet.getLastRow() < 1) return false;
+  return _headerMatches(sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).getValues()[0], RAW_DATA_COLUMNS);
+}
 
-  sheet.insertColumnAfter(1);
-  sheet.getRange(1, 2).setValue('posted_at');
+// Finds the raw_ref and posted_at columns by CONTENT, sampling the first data rows: a payload is a
+// string starting with '{', a date is a real Date. Header labels are not trusted here, because a
+// v0.6.0 sheet that took an import before its schema was migrated ended up with its labels and its
+// data in different columns — so the labels are exactly what cannot be believed.
+function _detectRawDataColumns(sheet, lastRow, maxCols) {
+  var found = { rawRefCol: 0, postedAtCol: 0 };
+  if (lastRow < 2) return found;
+
+  var sampleRows = Math.min(lastRow - 1, 30);
+  var sample = sheet.getRange(2, 1, sampleRows, maxCols).getValues();
+  var jsonHits = [];
+  var dateHits = [];
+  var c;
+  for (c = 0; c < maxCols; c++) { jsonHits[c] = 0; dateHits[c] = 0; }
+
+  for (var r = 0; r < sampleRows; r++) {
+    for (c = 0; c < maxCols; c++) {
+      var v = sample[r][c];
+      if (v instanceof Date) dateHits[c] += 1;
+      else if (typeof v === 'string' && v.charAt(0) === '{') jsonHits[c] += 1;
+    }
+  }
+
+  var bestJson = 0;
+  var bestDate = 0;
+  for (c = 1; c < maxCols; c++) { // never column 1 — that is job_id
+    if (jsonHits[c] > bestJson) { bestJson = jsonHits[c]; found.rawRefCol = c + 1; }
+    if (dateHits[c] > bestDate) { bestDate = dateHits[c]; found.postedAtCol = c + 1; }
+  }
+  return found;
+}
+
+// Brings Raw_Data to ['job_id', 'raw_ref', 'posted_at'] from any earlier layout, including the ones
+// the v0.6.0 column-insert produced. posted_at is APPENDED rather than inserted, so raw_ref keeps
+// column 2 exactly where every pre-existing reader expects it and no payload ever moves on a fresh
+// upgrade — the whole class of column-slide bug goes away.
+//
+// The payload is relocated with copyTo (a server-side range op) so a 40k-char column is never
+// pulled into memory. posted_at is carried across when it can be found, and is re-derivable from
+// the payload by backfillRawDataPostedAt() when it cannot.
+function _normalizeRawDataSchema(sheet) {
+  _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
+
+  var RAW_COL = RAW_DATA_COLUMNS.indexOf('raw_ref') + 1;
+  var POSTED_COL = RAW_DATA_COLUMNS.indexOf('posted_at') + 1;
+  var lastRow = sheet.getLastRow();
+  var maxCols = sheet.getMaxColumns();
+  var dataRows = Math.max(lastRow - 1, 0);
+  var stampHeader = function() {
+    sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
+  };
+
+  var found = _detectRawDataColumns(sheet, lastRow, maxCols);
+
+  // No payloads stored yet, or already laid out correctly — label it and leave the data alone.
+  if (!found.rawRefCol ||
+      (found.rawRefCol === RAW_COL && (!found.postedAtCol || found.postedAtCol === POSTED_COL))) {
+    stampHeader();
+    return false;
+  }
+
+  var savedDates = (found.postedAtCol && dataRows)
+    ? sheet.getRange(2, found.postedAtCol, dataRows, 1).getValues()
+    : null;
+
+  if (found.rawRefCol !== RAW_COL) {
+    sheet.getRange(1, found.rawRefCol, lastRow, 1).copyTo(sheet.getRange(1, RAW_COL, lastRow, 1));
+  }
+
+  if (dataRows) {
+    // Anything past the schema is debris from an older layout.
+    if (maxCols > RAW_DATA_COLUMNS.length) {
+      sheet.getRange(2, RAW_DATA_COLUMNS.length + 1, dataRows, maxCols - RAW_DATA_COLUMNS.length).clearContent();
+    }
+    sheet.getRange(2, POSTED_COL, dataRows, 1).clearContent();
+    if (savedDates) sheet.getRange(2, POSTED_COL, dataRows, 1).setValues(savedDates);
+  }
+
+  stampHeader();
   return true;
 }
 
 function _setupRawDataSheet(sheet) {
-  _migrateRawDataSchema(sheet);
-  _ensureSheetDimensions(sheet, RAW_DATA_COLUMNS.length, 2);
-  sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length).setValues([RAW_DATA_COLUMNS]);
+  _normalizeRawDataSchema(sheet);
   sheet.getRange(1, 1, 1, RAW_DATA_COLUMNS.length)
     .setFontWeight('bold')
     .setBackground('#d0e0e3');
@@ -1558,10 +1629,8 @@ function _setupRawDataSheet(sheet) {
   var postedCol = RAW_DATA_COLUMNS.indexOf('posted_at') + 1;
   var rawRefCol = RAW_DATA_COLUMNS.indexOf('raw_ref') + 1;
   sheet.setColumnWidth(1, 120);
-  sheet.setColumnWidth(postedCol, 140);
   sheet.setColumnWidth(rawRefCol, 180);
-  // An inserted column inherits the format of the one to its left — that is job_id's '@' (plain
-  // text), which would render every Date as a raw string. Force a real date format instead.
+  sheet.setColumnWidth(postedCol, 140);
   sheet.getRange(2, postedCol, Math.max(sheet.getMaxRows() - 1, 1), 1).setNumberFormat('yyyy-mm-dd hh:mm');
   // Only raw_ref is hidden; job_id and posted_at stay visible so the sheet can be eyeballed.
   sheet.hideColumns(rawRefCol, 1);
@@ -2439,7 +2508,10 @@ function _upsertRawDataRows(jobs) {
   }
 
   var sheet = _getRawDataSheet() || _getOrCreateSheet(SpreadsheetApp.getActiveSpreadsheet(), RAW_DATA_SHEET_NAME);
-  if (sheet.getMaxColumns() < RAW_DATA_COLUMNS.length || sheet.getLastRow() < 1) {
+  // Must be a HEADER check, not a width check: this is the only thing standing between an import
+  // and a half-migrated sheet, and writing new-order rows into an old-order sheet slides the
+  // columns past each other (dates into raw_ref, payloads into the column after it).
+  if (!_rawDataSchemaIsCurrent(sheet)) {
     _setupRawDataSheet(sheet);
   }
   var rawDataIndex = getRawDataIndex().byJobId;
@@ -2495,8 +2567,8 @@ function _upsertRawDataRows(jobs) {
 function _buildRawDataPayload(job, existing) {
   return {
     jobId: _extractLinkedInJobId(job && job.jobId) || _stringifyField(job && job.jobId),
-    postedAt: _resolveRawDataPostedAt(job, existing),
-    rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || ''
+    rawRef: _stringifyField(job && job.rawRef) || (existing && existing.rawRef) || '',
+    postedAt: _resolveRawDataPostedAt(job, existing)
   };
 }
 
@@ -2517,8 +2589,8 @@ function _resolveRawDataPostedAt(job, existing) {
 function _toRawDataRow(rawData) {
   return [
     rawData.jobId || '',
-    rawData.postedAt || '',
-    rawData.rawRef || ''
+    rawData.rawRef || '',
+    rawData.postedAt || ''
   ];
 }
 
