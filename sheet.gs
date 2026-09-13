@@ -153,9 +153,6 @@ var ASSIGNED_HEADER_ROW    = 3;  // row with column headers (rows 1-2 = instruct
 var ASSIGNED_DATA_START_ROW = 4;  // first data row
 // Section header rows use '# Section Name' as the key.
 // getSettingsMap() skips them; _setupSettingsSheet() styles them as visual dividers.
-// Settings rendered as real tickable checkboxes rather than typed TRUE/FALSE text.
-var SETTINGS_CHECKBOX_KEYS = ['PRUNE_ON_LISTED_AT', 'PRUNE_ON_POSTED_AT', 'PRUNE_ON_IMPORTED_AT'];
-
 var SETTINGS_DEFAULT_ROWS = [
   ['setting_key', 'setting_value', 'notes'],
 
@@ -186,11 +183,6 @@ var SETTINGS_DEFAULT_ROWS = [
   ['AUTO_ASSIGN_PRIORITIES', 'P03,P04,P05', 'Priorities auto-routed to the assignee (Owner set to "Assignee (auto)") after each run, if they clear the visa + score filters.'],
   ['AUTO_ASSIGN_MIN_SCORE', '', 'Minimum score (0-100) for assignee routing. Blank = no minimum. Sub-threshold jobs are left unowned (empty) for your review.'],
   ['AUTO_ASSIGN_VISA', 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)', 'Comma-separated visa signals eligible for assignee routing. Jobs with weaker signals stay unowned for your review (not delegated). See Help → Visa Signals for what each label means.'],
-  ['# Pruning', '', ''],
-  ['PRUNE_ON_LISTED_AT', true, 'Tick to age rows out on listed_at — when the listing last went live. A role LinkedIn recently re-posted survives. This is the usual choice.'],
-  ['PRUNE_ON_POSTED_AT', false, 'Tick to age rows out on posted_at — when the ROLE was first posted. Catches long-open reqs that keep getting re-advertised.'],
-  ['PRUNE_ON_IMPORTED_AT', true, 'Tick to age rows out on imported_at — how long the row has sat in Job_Priority, regardless of the posting dates.'],
-
   ['AUTO_SKIP_VISA_NO', 'TRUE', 'TRUE = jobs scored "No (0%)" are auto-set to status "Skip (auto)" during routing, regardless of priority (the role does not sponsor). "Skip (auto)" = skipped by the rules (re-evaluable); plain "Skip" = you skipped it manually (locked). Set FALSE to disable.'],
   ['RESERVED_COMPANIES', '', 'Companies always kept unowned for your review, never delegated to the assignee; case-insensitive (e.g. Stripe,Airbnb).'],
   ['AUTO_ASSIGN_EXCLUDE_COMPANIES', '', 'Companies to skip entirely during routing, case-insensitive (e.g. Google,Meta).'],
@@ -1944,30 +1936,12 @@ function _setupSettingsSheet(sheet) {
   sheet.setColumnWidth(2, 300);
   sheet.setColumnWidth(3, 420);
 
-  // clearContents() above leaves data validation behind, so wipe the value column's rules before
-  // re-applying them — otherwise a checkbox stays pinned to whatever row it used to occupy when
-  // the settings list changes shape.
+  // v0.10.0 briefly put PRUNE_ON_* checkboxes here; the selection is asked for in the prune prompt
+  // instead now. clearContents() leaves data validation behind, so strip any rule left on the value
+  // column — otherwise those checkboxes stay stuck to whatever rows they used to occupy.
   if (outputRows.length > 1) {
     sheet.getRange(2, 2, outputRows.length - 1, 1).clearDataValidations();
   }
-  var checkbox = SpreadsheetApp.newDataValidation().requireCheckbox().build();
-  for (var k = 1; k < outputRows.length; k++) {
-    if (SETTINGS_CHECKBOX_KEYS.indexOf(String(outputRows[k][0] || '').trim()) === -1) continue;
-    var cell = sheet.getRange(k + 1, 2);
-    cell.setDataValidation(checkbox);
-    cell.setValue(_parseBooleanSetting(outputRows[k][1], true));
-  }
-}
-
-// A ticked checkbox is the boolean true and an unticked one is the boolean FALSE — which is why the
-// `String(value || 'TRUE')` idiom used for the older text settings cannot be reused here: `false`
-// is falsy, so the default would win and an unticked box would read as ticked. Typed text is still
-// accepted so a hand-edited or pre-checkbox sheet keeps working.
-function _parseBooleanSetting(value, defaultValue) {
-  if (value === true || value === false) return value;
-  var v = _stringifyField(value).trim().toUpperCase();
-  if (v === '') return defaultValue;
-  return v === 'TRUE' || v === 'YES' || v === 'Y' || v === '1';
 }
 
 function _setupHelpSheet(sheet) {

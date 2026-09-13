@@ -66,11 +66,6 @@ function loadRuntimeConfig() {
     reservedCompanies: _splitCsv(settings.RESERVED_COMPANIES || 'amazon,amazon web services (aws),amazon music,microsoft,microsoft ai,google,google deepmind,meta,apple,nvidia,nvidia ai,jpmorganchase,capital one,paypal,visa,mastercard,stripe,plaid,ramp,block,robinhood,coinbase,affirm,chime,databricks,snowflake,datadog,cloudflare,okta,servicenow,openai,anthropic,forter,socure,prove,sentilink,american express,bank of america,citi,wells fargo,goldman sachs,morgan stanley,bny,ubs,hsbc,intuit,adobe,airbnb,uber,salesforce,cisco,ebay,blackrock').map(function(s) { return s.toLowerCase(); }).filter(Boolean),
     autoAssignVisa: _splitCsv(settings.AUTO_ASSIGN_VISA || 'Yes (100%),Likely (90%),Possible (70%),Unclear (50%)'),
     autoSkipVisaNo: String(settings.AUTO_SKIP_VISA_NO || 'TRUE').toUpperCase() === 'TRUE',
-    // Which date columns Prune Old Data ages rows out on. Defaults preserve the previous behaviour:
-    // listing age OR time-in-sheet, with first-posted age off.
-    pruneOnListedAt: _parseBooleanSetting(settings.PRUNE_ON_LISTED_AT, true),
-    pruneOnPostedAt: _parseBooleanSetting(settings.PRUNE_ON_POSTED_AT, false),
-    pruneOnImportedAt: _parseBooleanSetting(settings.PRUNE_ON_IMPORTED_AT, true),
     autoAssignExcludeCompanies: _splitCsv(settings.AUTO_ASSIGN_EXCLUDE_COMPANIES || 'hackajob,jobs via dice,trusting social,kompato ai').map(function(s) { return s.toLowerCase(); }).filter(Boolean),
     autoAssignMinScore: parseInt(settings.AUTO_ASSIGN_MIN_SCORE, 10) || 0,
     notifyAssigneeEmail: String(settings.NOTIFY_ASSIGNEE_EMAIL || '').trim()
