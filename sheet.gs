@@ -2933,6 +2933,23 @@ function _isRawRefExpendableStatus(status) {
   return v === 'Submitted' || v === STATUS_CLOSED || v === 'Skip';
 }
 
+// Drops Raw_Data rows two ways, both regardless of age:
+//   ORPHAN   — no Job_Priority row tracks this id, so nothing can ever read the JD back.
+//   TERMINAL — tracked, but at a status no rule can return to scoring (Submitted / Closed / manual
+//              Skip). The Job_Priority row stays; only the payload goes.
+//
+// Crucially this never READS raw_ref. The previous version pulled every column, which meant every
+// stored JD — up to 40k chars each, so a few thousand rows is hundreds of MB and the execution dies
+// long before the 6-minute limit. The keep/drop decision only needs job_id, so only job_id is read.
+//
+// Doomed rows are marked by prefixing their id with '~' (0x7E, which sorts after every digit and
+// letter), pushed to the bottom by one native sort, and removed by one deleteRows. O(1) sheet ops
+// at any size, and the payload column is only ever moved by the server, never through memory.
+// Raw_Data is an unordered lookup, so re-ordering it costs nothing.
+//
+// If execution dies between the marking and the delete, the survivors are untouched and the marked
+// rows simply read as orphans on the next run and are dropped then — the failure mode is a repeat,
+// not corruption.
 function pruneRawData() {
   var sheet = _getRawDataSheet();
   if (!sheet) return 0;
@@ -2940,51 +2957,36 @@ function pruneRawData() {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return 0;
 
-  // One JP scan gives both facts we need per raw row: whether the job is still tracked at all,
-  // and (if so) its status. Key presence = tracked; the value decides whether the JD is still live.
+  // One Job_Priority scan gives both facts needed per raw row: whether the job is still tracked at
+  // all, and (if so) its status. Key presence = tracked; the value decides whether the JD is live.
   var jpStatusById = _getJobPriorityStatusByJobId();
 
   var maxCols = sheet.getMaxColumns();
   var headers = sheet.getRange(1, 1, 1, maxCols).getValues()[0];
   var jobIdColIndex = headers.indexOf('job_id');
-  if (jobIdColIndex === -1) jobIdColIndex = 0;
+  if (jobIdColIndex === -1) jobIdColIndex = RAW_DATA_COLUMNS.indexOf('job_id');
+  var jobIdCol = jobIdColIndex + 1;
 
   var dataRowCount = lastRow - 1;
-  var values = sheet.getRange(2, 1, dataRowCount, maxCols).getValues();
+  var ids = sheet.getRange(2, jobIdCol, dataRowCount, 1).getValues();
 
-  // Two ways a raw row becomes dead weight, both dropped regardless of age:
-  //   ORPHAN   — no JP row tracks this id (its JP row was deleted/pruned, or the scrape never
-  //              landed in JP), so nothing can ever read the JD back.
-  //   TERMINAL — a JP row tracks it, but at a status no rule can return to scoring (Submitted /
-  //              Closed / manual Skip). The JP row itself stays — that is your application history
-  //              and the dedup memory that stops a re-scrape re-adding the job as 'New'. Only the
-  //              JD blob goes, and that blob is up to 40k chars per job (see _serializeRawRef).
-  // Everything else is live backlog and keeps its JD for re-scoring.
-  var keep = values.filter(function(row) {
-    var id = _stringifyField(row[jobIdColIndex]).trim();
-    if (!id) return false;
-    var status = jpStatusById[id];
-    if (!status) return false;
-    return !_isRawRefExpendableStatus(status);
-  });
-
-  var deletedCount = dataRowCount - keep.length;
-  if (deletedCount <= 0) return 0;
-
-  // Bulk rewrite — never per-row deleteRow (that times out on thousands of rows). Overwrite the
-  // survivors at the top in ONE setValues, then remove the trailing block in ONE deleteRows call:
-  // O(1) sheet ops regardless of how many orphans there are. (Raw_Data is an unordered lookup, so
-  // compacting survivors to the top is fine.)
-  if (keep.length) {
-    sheet.getRange(2, 1, keep.length, maxCols).setValues(keep);
-    // Keep job_id as text so large numeric ids are never coerced to dates.
-    sheet.getRange(2, jobIdColIndex + 1, keep.length, 1).setNumberFormat('@');
+  var DOOMED_PREFIX = '~';
+  var deletedCount = 0;
+  for (var i = 0; i < dataRowCount; i++) {
+    var id = _stringifyField(ids[i][0]).trim();
+    var status = id ? jpStatusById[id] : '';
+    if (id && status && !_isRawRefExpendableStatus(status)) continue;
+    ids[i][0] = DOOMED_PREFIX + id;
+    deletedCount += 1;
   }
-  var firstTrailingRow = 2 + keep.length;
-  var trailingCount = lastRow - firstTrailingRow + 1;
-  if (trailingCount > 0) {
-    sheet.deleteRows(firstTrailingRow, trailingCount);
-  }
+
+  if (deletedCount === 0) return 0;
+
+  var idRange = sheet.getRange(2, jobIdCol, dataRowCount, 1);
+  idRange.setNumberFormat('@'); // keep large numeric ids as text so the sort never coerces them
+  idRange.setValues(ids);
+  sheet.getRange(2, 1, dataRowCount, maxCols).sort([{ column: jobIdCol, ascending: true }]);
+  sheet.deleteRows(2 + (dataRowCount - deletedCount), deletedCount);
 
   return deletedCount;
 }
@@ -3026,8 +3028,22 @@ function pruneAssignedRows(days) {
     if (updatedDate < cutoff) rowsToDelete.push(ASSIGNED_DATA_START_ROW + offset);
   });
 
-  for (var i = rowsToDelete.length - 1; i >= 0; i--) {
-    sheet.deleteRow(rowsToDelete[i]);
+  // Collapse the doomed rows into contiguous runs and delete bottom-up, one call per run. The old
+  // loop called deleteRow once per row — the very thing pruneRawData's comment warns against — and
+  // narrowing the Job_Priority keep-list to Submitted + Networking made it worse, since every extra
+  // row pruned there orphans another row here.
+  //
+  // deleteRows rather than a bulk setValues rewrite because job_link on this sheet is RICH TEXT
+  // (see _sortAssignedSheet, which reorders richTextValues alongside the values): rewriting through
+  // getValues/setValues would render every link as plain text.
+  var runs = [];
+  rowsToDelete.forEach(function(row) {
+    var last = runs.length ? runs[runs.length - 1] : null;
+    if (last && last.start + last.count === row) last.count += 1;
+    else runs.push({ start: row, count: 1 });
+  });
+  for (var r = runs.length - 1; r >= 0; r--) {
+    sheet.deleteRows(runs[r].start, runs[r].count);
   }
   return rowsToDelete.length;
 }
