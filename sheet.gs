@@ -927,7 +927,7 @@ function pruneExpiredJobRows(days, options) {
   var importedAts = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.imported_at, numRows, 1).getValues();
   var posteds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.posted, numRows, 1).getValues();
   var jobIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.job_id, numRows, 1).getValues();
-  var sortKeys = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.sort_key, numRows, 1).getValues();
+  var expiredRows = {};
   // Which dates age a row out is chosen by the Settings checkboxes; a row goes when ANY ticked
   // date it actually has is older than the threshold, so ticking more prunes more. A date the row
   // does not carry never contributes — blank is not treated as ancient.
@@ -972,7 +972,7 @@ function pruneExpiredJobRows(days, options) {
     }
 
     if (expired) {
-      sortKeys[i][0] = PRUNE_KEY; // mark to sort to the bottom for a single bulk delete
+      expiredRows[i] = true;
       prunedCount++;
     }
   }
@@ -980,6 +980,16 @@ function pruneExpiredJobRows(days, options) {
   if (prunedCount === 0) {
     return { checkedCount: numRows, prunedCount: 0, remainingCount: numRows };
   }
+
+  // Fresh keys for EVERY kept row, never the stored ones: rows appended since the last Sort & Rank
+  // have a blank sort_key, and Sheets sorts blanks after the marker, which would put kept rows in
+  // the deleted block. A leftover marker from a run that died before its delete is overwritten too.
+  var priorities = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.priority, numRows, 1).getValues();
+  var scores = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, IDX.score, numRows, 1).getValues();
+  var sortKeys = statuses.map(function(statusRow, i) {
+    if (expiredRows[i]) return [PRUNE_KEY]; // sorts to the bottom for a single bulk delete
+    return [_buildJobSortKey(statusRow[0], priorities[i][0], posteds[i][0], importedAts[i][0], scores[i][0])];
+  });
 
   // Write the markers, push pruned rows to the bottom with a native sort (moves rich text + formats
   // with each row — same mechanism as Sort & Rank), then delete the trailing block in ONE deleteRows.
