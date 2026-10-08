@@ -1,4 +1,4 @@
-var APP_VERSION = '0.11.0';  // bump on each release; surfaced in the menu + Validate Config + README
+var APP_VERSION = '0.11.1';  // bump on each release; surfaced in the menu + Validate Config + README
 
 var CRITICAL_FAILURE_RATIO = 0.5;
 var CRITICAL_FAILURE_MIN_COUNT = 5;
@@ -77,6 +77,7 @@ function onOpen() {
       .addItem('Prune Old Data...', 'pruneOldDataPrompt')
       .addItem('Backfill Raw_Data Dates', 'backfillRawDataPostedAtPrompt')
       .addItem('Skip All No-Visa Jobs', 'skipNoVisaJobsPrompt')
+      .addItem('Merge Duplicate Job Rows...', 'mergeDuplicateJobRowsPrompt')
       .addItem('Initialize Sheets', 'setupJobPriorityWorkbook')
       .addItem('Validate Config', 'validateConfiguration'))
     .addToUi();
@@ -145,14 +146,48 @@ function handleSheetEdit(e) {
       }
     } catch (err) { Logger.log(err); }
   } else if (sheetName === ASSIGNED_SHEET_NAME) {
-    if (row < ASSIGNED_DATA_START_ROW) return;
+    var lastRow = e.range.getLastRow();
+    if (lastRow < ASSIGNED_DATA_START_ROW) return;
+    var statusCol = ASSIGNED_COLUMN_INDEX.status;
+    var isMultiCell = e.range.getNumRows() > 1 || e.range.getNumColumns() > 1;
     try {
-      if (col === ASSIGNED_COLUMN_INDEX.status) {
+      if (isMultiCell && col <= statusCol && statusCol <= e.range.getLastColumn()) {
+        _handleAssignedStatusRangeEdit(sheet, Math.max(row, ASSIGNED_DATA_START_ROW), lastRow);
+      } else if (row < ASSIGNED_DATA_START_ROW) {
+        return;
+      } else if (col === statusCol) {
         _handleAssignedStatusEdit(sheet, row, e.value, e.oldValue);
       } else if (col === ASSIGNED_COLUMN_INDEX.notes) {
         _handleAssignedNotesEdit(sheet, row, e.oldValue);
       }
     } catch (err) { Logger.log(err); }
+  }
+}
+
+// Paste, fill-down or multi-cell clear touching the Assigned status column. Apps Script passes no
+// e.value / e.oldValue for a multi-cell edit, so each row's status is re-read from the sheet, and the
+// Job_Priority row index is built once for the range rather than once per row. Sized for pastes of
+// tens of rows: each mirrored row still costs a few single-cell reads/writes.
+function _handleAssignedStatusRangeEdit(sheet, firstRow, lastRow) {
+  var rowCount = lastRow - firstRow + 1;
+  var statuses = sheet.getRange(firstRow, ASSIGNED_COLUMN_INDEX.status, rowCount, 1).getValues();
+  var jobIds = sheet.getRange(firstRow, ASSIGNED_COLUMN_INDEX.job_id, rowCount, 1).getValues();
+  var jobSheet = _getJobPrioritySheet();
+  var jpRowById = _buildJobPriorityRowIndex();
+  var jpLastRow = jobSheet.getLastRow();
+  var jpStatuses = jpLastRow < JOB_PRIORITY_DATA_START_ROW ? [] : jobSheet.getRange(
+    JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.status, jpLastRow - JOB_PRIORITY_DATA_START_ROW + 1, 1
+  ).getValues();
+
+  for (var i = 0; i < rowCount; i++) {
+    var status = _stringifyField(statuses[i][0]);
+    var jpRow = jpRowById[_stringifyField(jobIds[i][0]).trim()];
+    // A wide paste or fill-down also rewrites rows whose status did not change. If Job_Priority
+    // already holds this status there is nothing to mirror, and re-running the handler would
+    // re-stamp applied_at and re-send bounce-back emails.
+    if (jpRow && _stringifyField(jpStatuses[jpRow - JOB_PRIORITY_DATA_START_ROW][0]) === status) continue;
+    // No oldValue: a note-less Flagged reverts to 'New' rather than to the row's previous status.
+    _handleAssignedStatusEdit(sheet, firstRow + i, status, undefined, jpRowById);
   }
 }
 
@@ -188,10 +223,10 @@ function _jobRecordFromJobPriorityRow(sheet, row) {
 // same resolution as _sheetRowToJobRecord. Raw .getValue() must NOT be used for cross-sheet
 // lookups, or the Assigned-sheet match silently fails.
 function _canonicalJobIdFromJpRow(sheet, row) {
-  var rawJobId = _stringifyField(sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue());
-  var jobLinkFormula = sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_link).getFormula() || '';
-  var jobLinkUrl = _extractUrlFromHyperlinkFormula(jobLinkFormula) || '';
-  return _extractLinkedInJobId(rawJobId) || _extractLinkedInJobId(jobLinkUrl) || rawJobId;
+  return _canonicalJobIdFromCells(
+    sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_id).getValue(),
+    sheet.getRange(row, JOB_PRIORITY_COLUMN_INDEX.job_link).getFormula()
+  );
 }
 
 // Owner column edited on Job_Priority: create or remove the assignee's mirror row.
@@ -239,7 +274,8 @@ function _handleJobPriorityActionEdit(sheet, row) {
 }
 
 // Status edited on the Assigned sheet: mirror up, handle bounce-backs and terminal cleanup.
-function _handleAssignedStatusEdit(sheet, row, newValue, oldValue) {
+// jpRowById is optional: a prebuilt _buildJobPriorityRowIndex() when handling many rows at once.
+function _handleAssignedStatusEdit(sheet, row, newValue, oldValue, jpRowById) {
   var jobId = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.job_id).getValue()).trim();
   if (!jobId) return;
 
@@ -257,7 +293,7 @@ function _handleAssignedStatusEdit(sheet, row, newValue, oldValue) {
     return;
   }
 
-  var jpRow = _findJobPriorityRowByJobId(jobId);
+  var jpRow = jpRowById ? (jpRowById[jobId] || null) : _findJobPriorityRowByJobId(jobId);
   var jobSheet = _getJobPrioritySheet();
   var now = _formatNow();
   var action = _stringifyField(sheet.getRange(row, ASSIGNED_COLUMN_INDEX.action).getValue());

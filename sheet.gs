@@ -370,6 +370,15 @@ function getExistingJobIndex() {
     byJobId[jobId] = _mergeDuplicateJobRecordsByJobId(groupedByJobId[jobId]);
   });
 
+  // A re-post id lives only in the older row's merged_job_ids. Index it to that row too, so when the
+  // re-post is scraped again the import updates the row instead of appending a second copy of the job.
+  // A primary id wins over an alias: if some row already carries the id as job_id, that row is it.
+  records.forEach(function(record) {
+    _parseMergedJobIds(record.mergedJobIds).forEach(function(alias) {
+      if (!byJobId[alias]) byJobId[alias] = byJobId[record.jobId] || record;
+    });
+  });
+
   // Index SCORED rows by JD-content fingerprint so the import path can recognize a re-post (same JD,
   // new job_id) BEFORE scoring it and reuse the stored score via the merge — instead of paying to
   // re-score a role already in the sheet. Only rows with a scoring payload are indexed, so a match
@@ -3330,8 +3339,9 @@ function _pushJobsToAssignedSheet(jobs) {
   // flavor (esp. rules' 'Assignee (auto)'); only stamp plain 'Assignee' when it wasn't assigned
   // yet (e.g. the "Assign Selected Rows" menu, where owner was empty/Me — a manual delegation).
   var jobSheet = _getJobPrioritySheet();
+  var jpRowById = _buildJobPriorityRowIndex();
   toAdd.forEach(function(job) {
-    var rowNum = _findJobPriorityRowByJobId(_stringifyField(job.jobId));
+    var rowNum = jpRowById[_stringifyField(job.jobId).trim()];
     if (rowNum) {
       jobSheet.getRange(rowNum, JOB_PRIORITY_COLUMN_INDEX.owner)
         .setValue(_isAssignee(job.owner) ? job.owner : 'Assignee');
@@ -3433,27 +3443,12 @@ function _removeFromAssignedSheet(assignedSheet, jobId) {
   assignedSheet.deleteRow(rowNum);
 }
 
+// Single lookup by primary or merged id; a date-corrupted job_id cell still matches via its job_link
+// formula. Callers resolving many ids should build _buildJobPriorityRowIndex() once instead.
 function _findJobPriorityRowByJobId(jobId) {
   var id = _stringifyField(jobId).trim();
   if (!id) return null;
-  var sheet = _getJobPrioritySheet();
-  var lastRow = sheet.getLastRow();
-  if (lastRow < JOB_PRIORITY_DATA_START_ROW) return null;
-  var rowCount = lastRow - JOB_PRIORITY_DATA_START_ROW + 1;
-  // First pass: exact match on canonical job_id
-  var primaryIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.job_id, rowCount, 1).getValues();
-  for (var i = 0; i < primaryIds.length; i++) {
-    if (_stringifyField(primaryIds[i][0]).trim() === id) return JOB_PRIORITY_DATA_START_ROW + i;
-  }
-  // Second pass: check merged_job_ids in case the ID was retired during a merge
-  var mergedIds = sheet.getRange(JOB_PRIORITY_DATA_START_ROW, JOB_PRIORITY_COLUMN_INDEX.merged_job_ids, rowCount, 1).getValues();
-  for (var j = 0; j < mergedIds.length; j++) {
-    var parts = _stringifyField(mergedIds[j][0]).split(',');
-    for (var k = 0; k < parts.length; k++) {
-      if (parts[k].trim() === id) return JOB_PRIORITY_DATA_START_ROW + j;
-    }
-  }
-  return null;
+  return _buildJobPriorityRowIndex()[id] || null;
 }
 
 function _protectSheetsForAssignee(spreadsheet) {

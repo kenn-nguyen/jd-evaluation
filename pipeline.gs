@@ -198,11 +198,16 @@ function importAndScoreJobs(config, existingIndex, progressCallback) {
     }
 
     var job = _buildCandidateJob(normalizedJob, existing);
+    // An id found only in a row's merged_job_ids resolves to that row, and job.jobId becomes the row's
+    // primary id. Refresh the row but never re-score it (forceRescore targets primary ids), and mark the
+    // SCRAPED id handled: handledJobIds is counted against the scraped total, so marking the primary
+    // instead would leave the run's hasMore true forever.
+    var isMergedAlias = existing && _stringifyField(existing.jobId) !== _stringifyField(normalizedJob.jobId);
 
-    if (existing && !config.forceRescore) {
+    if (existing && (!config.forceRescore || isMergedAlias)) {
       rowsToWriteWithoutScoring.push(job);
-      handledThisExecution.push(job.jobId);
-      handledJobIdsMap[job.jobId] = true;
+      handledThisExecution.push(normalizedJob.jobId);
+      handledJobIdsMap[normalizedJob.jobId] = true;
       return;
     }
 
